@@ -366,15 +366,10 @@ export const uploadAttachment = asyncHandler(async (req: Request, res: Response)
 export const editMessage = asyncHandler(async (req: Request, res: Response) => {
   const { userId } = req.user!;
   const msgId = parseInt(req.params.id, 10);
-  const { body } = req.body as { body: string };
+  const { body, subject, attachmentFilename } = req.body as { body?: string; subject?: string; attachmentFilename?: string | null };
 
   if (isNaN(msgId)) {
     notFound(res, 'Messaggio non trovato');
-    return;
-  }
-
-  if (!body || !body.trim()) {
-    badRequest(res, 'Il testo del messaggio è obbligatorio', 'MISSING_FIELDS');
     return;
   }
 
@@ -393,12 +388,18 @@ export const editMessage = asyncHandler(async (req: Request, res: Response) => {
     return;
   }
 
+  const newBody = body !== undefined ? body.trim() : null;
+  const newSubject = subject !== undefined ? (subject.trim() || null) : null;
+  const newAttachment = attachmentFilename !== undefined ? (attachmentFilename || null) : null;
+
   const updated = await queryOne<any>(
     `UPDATE messages 
-     SET body = $1
-     WHERE id = $2 
+     SET body = COALESCE($1, body),
+         subject = $2,
+         attachment_filename = $3
+     WHERE id = $4 
      RETURNING id, company_id, subject, body, is_read, created_at, sender_id, recipient_id, attachment_filename`,
-    [body.trim(), msgId],
+    [newBody, newSubject, newAttachment, msgId],
   );
 
   if (updated) {

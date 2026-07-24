@@ -19,6 +19,7 @@ import {
   deleteDocumentUnified,
   getDeletedDocuments,
   restoreDocument,
+  permanentlyDeleteDocument,
 } from './documents.service';
 import { resolveAllowedCompanyIds } from '../../utils/companyScope';
 import { query, queryOne, pool } from '../../config/database';
@@ -1706,6 +1707,40 @@ router.post(
     }
 
     notFound(res, 'Documento non trovato nel cestino o già ripristinato');
+  }),
+);
+
+// ---------------------------------------------------------------------------
+// DELETE /api/documents/:id/permanent — permanently delete document (admin only)
+// ---------------------------------------------------------------------------
+
+router.delete(
+  '/:id/permanent',
+  authenticate,
+  requireRole('admin'),
+  asyncHandler(async (req: Request, res: Response) => {
+    const user = req.user!;
+    const allowedCompanyIds = await resolveAllowedCompanyIds(user);
+    if (!user.is_super_admin && allowedCompanyIds.length === 0) {
+      res.status(403).json({ success: false, error: 'Accesso negato: nessuna azienda autorizzata', code: 'COMPANY_MISMATCH' });
+      return;
+    }
+
+    const id = parseInt(req.params.id, 10);
+    if (Number.isNaN(id)) {
+      badRequest(res, 'ID documento non valido', 'BAD_REQUEST');
+      return;
+    }
+
+    const source = req.query.source as 'documents' | 'employee_documents' | undefined;
+
+    const deleted = await permanentlyDeleteDocument(id, allowedCompanyIds, source);
+    if (deleted) {
+      ok(res, { id }, 'Documento eliminato definitivamente');
+      return;
+    }
+
+    notFound(res, 'Documento non trovato o non autorizzato');
   }),
 );
 
