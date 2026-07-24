@@ -1359,3 +1359,84 @@ export async function deleteDocumentUnified(id: number, allowedCompanyIds: numbe
     client.release();
   }
 }
+
+export async function permanentlyDeleteDocument(
+  id: number,
+  allowedCompanyIds: number[],
+  sourceTable?: 'documents' | 'employee_documents'
+): Promise<boolean> {
+  const { pool } = await import('../../config/database');
+  const fs = await import('fs');
+  const path = await import('path');
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    let storagePath: string | null = null;
+    let mainCompanyId: number | null = null;
+
+    if (sourceTable === 'documents') {
+      const genDoc = await client.query(`SELECT file_url as storage_path, company_id FROM documents WHERE id = $1`, [id]);
+      if (genDoc.rows[0]) {
+        storagePath = genDoc.rows[0].storage_path;
+        mainCompanyId = genDoc.rows[0].company_id;
+      }
+    } else if (sourceTable === 'employee_documents') {
+      const empDoc = await client.query(`SELECT storage_path, company_id FROM employee_documents WHERE id = $1`, [id]);
+      if (empDoc.rows[0]) {
+        storagePath = empDoc.rows[0].storage_path;
+        mainCompanyId = empDoc.rows[0].company_id;
+      }
+    }
+
+    if (!storagePath || !mainCompanyId) {
+      const genDoc = await client.query(`SELECT file_url as storage_path, company_id FROM documents WHERE id = $1`, [id]);
+      if (genDoc.rows[0]) {
+        storagePath = genDoc.rows[0].storage_path;
+        mainCompanyId = genDoc.rows[0].company_id;
+      } else {
+        const empDoc = await client.query(`SELECT storage_path, company_id FROM employee_documents WHERE id = $1`, [id]);
+        if (empDoc.rows[0]) {
+          storagePath = empDoc.rows[0].storage_path;
+          mainCompanyId = empDoc.rows[0].company_id;
+        }
+      }
+    }
+
+    if (!mainCompanyId || !allowedCompanyIds.includes(mainCompanyId)) {
+      await client.query('ROLLBACK');
+      return false;
+    }
+
+    if (storagePath) {
+      await client.query(`DELETE FROM documents WHERE file_url = $1 OR id = $2`, [storagePath, id]);
+      await client.query(`DELETE FROM employee_documents WHERE storage_path = $1 OR id = $2`, [storagePath, id]);
+    } else {
+      await client.query(`DELETE FROM documents WHERE id = $1`, [id]);
+      await client.query(`DELETE FROM employee_documents WHERE id = $1`, [id]);
+    }
+
+    await client.query('COMMIT');
+
+    if (storagePath) {
+      try {
+        const absPath = path.resolve(storagePath);
+        if (fs.existsSync(absPath)) {
+          fs.unlinkSync(absPath);
+        }
+      } catch (fileErr) {
+        console.warn('Physical file deletion error (non-fatal):', fileErr);
+      }
+    }
+
+    return true;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('permanentlyDeleteDocument error:', err);
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
