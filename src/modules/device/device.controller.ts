@@ -515,38 +515,57 @@ export const checkDeviceRegistration = asyncHandler(async (req: Request, res: Re
   const registeredUser = await queryOne<{
     name: string;
     surname: string;
+    email: string;
     role: string;
     registered_at: string;
     registered_device_metadata: any;
+    store_name: string | null;
+    store_code: string | null;
   }>(
-    `SELECT name, surname, role, TO_CHAR(registered_device_registered_at, 'YYYY-MM-DD HH24:MI:SS') AS registered_at, registered_device_metadata
-     FROM users
-     WHERE company_id = $1
-       AND device_reset_pending = false
+    `SELECT u.name, u.surname, u.email, u.role,
+            TO_CHAR(u.registered_device_registered_at, 'YYYY-MM-DD HH24:MI:SS') AS registered_at,
+            u.registered_device_metadata,
+            s.name AS store_name,
+            s.code AS store_code
+     FROM users u
+     LEFT JOIN stores s ON s.id = u.store_id
+     WHERE u.company_id = $1
+       AND u.device_reset_pending = false
        AND (
-         registered_device_token = $2
-         OR ($3::text IS NOT NULL AND registered_device_identifier = $3)
-         OR ($4::text IS NOT NULL AND registered_device_token = $4)
-         OR ($5::text IS NOT NULL AND registered_device_identifier = $5)
+         u.registered_device_token = $2
+         OR ($3::text IS NOT NULL AND u.registered_device_identifier = $3)
+         OR ($4::text IS NOT NULL AND u.registered_device_token = $4)
+         OR ($5::text IS NOT NULL AND u.registered_device_identifier = $5)
        )`,
     [manager.company_id, identity.token, identity.identifier, legacyToken, legacyIdentifier]
   );
 
   if (!registeredUser) {
-    ok(res, { found: false, message: 'Nessun dipendente registrato con questo dispositivo in questa azienda.' });
+    // No hardcoded sentence: the client renders this from its own locale files,
+    // so the message follows the language the user selected.
+    ok(res, { found: false, code: 'NO_REGISTRATION_FOUND' });
     return;
   }
 
+  const meta = registeredUser.registered_device_metadata;
   ok(res, {
     found: true,
     details: {
       name: registeredUser.name,
       surname: registeredUser.surname,
+      email: registeredUser.email,
       role: registeredUser.role,
+      // Terminal accounts are named after their store; sending the store
+      // explicitly lets the UI say *which* terminal holds the device.
+      isTerminal: registeredUser.role === 'store_terminal',
+      storeName: registeredUser.store_name,
+      storeCode: registeredUser.store_code,
       registeredAt: registeredUser.registered_at,
-      ipAddress: registeredUser.registered_device_metadata?.ipAddress || 'N/A',
-      browser: registeredUser.registered_device_metadata?.browser?.name || 'N/A',
-      os: registeredUser.registered_device_metadata?.os?.name || 'N/A',
+      ipAddress: meta?.ipAddress || null,
+      browser: meta?.browser?.name || null,
+      browserVersion: meta?.browser?.version || null,
+      os: meta?.os?.name || null,
+      deviceModel: meta?.device?.model || null,
     }
   });
 });
