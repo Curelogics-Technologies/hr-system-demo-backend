@@ -11,9 +11,8 @@ import { sendNotification } from '../notifications/notifications.service';
 import { t } from '../../utils/i18n';
 import { emitToCompany } from '../../config/socket';
 import {
-  getStoredDeviceProfileHash,
-  resolveStableDeviceIdentifier,
-  resolveStableDeviceIdentifierFromFingerprint,
+  matchesRegisteredDevice,
+  resolveDeviceIdentity,
   withDeviceProfileHash,
 } from '../../utils/deviceProfile';
 import { sendLateArrivalAlertAutomation } from '../automations/lateArrivalAlert';
@@ -255,65 +254,61 @@ export const checkin = asyncHandler(async (req: Request, res: Response) => {
       return;
     }
 
-    const secret = process.env.DEVICE_BINDING_SECRET || 'dev-device-binding-secret-change-me';
-    const currentToken = crypto
-      .createHash('sha256')
-      .update(secret)
-      .update(device_fingerprint)
-      .digest('hex');
-    const currentIdentifier = resolveStableDeviceIdentifier(device_metadata, currentToken)
-      ?? resolveStableDeviceIdentifierFromFingerprint(device_fingerprint, currentToken);
-    const tokenMatches = currentToken === targetUser.registered_device_token;
-    const identifierMatches = !!currentIdentifier && currentIdentifier === targetUser.registered_device_identifier;
+    const mergedDeviceMetadata = withDeviceProfileHash(device_metadata ?? {});
+    const identity = resolveDeviceIdentity(device_fingerprint, mergedDeviceMetadata);
+    const match = matchesRegisteredDevice(targetUser, identity);
 
-    if (!tokenMatches && !identifierMatches) {
-      if (isSameRegisteredDeviceProfile(targetUser.registered_device_metadata, device_metadata)) {
-        const mergedDeviceMetadata = withDeviceProfileHash(device_metadata ?? {});
-        const deviceProfileHash = getStoredDeviceProfileHash(mergedDeviceMetadata);
-        const rebindingIdentifier = resolveStableDeviceIdentifier(mergedDeviceMetadata, currentToken)
-          ?? resolveStableDeviceIdentifierFromFingerprint(device_fingerprint, currentToken);
-        const conflictingBinding = await queryOne<{ id: number }>(
-          `SELECT id
-           FROM users
-           WHERE id <> $1
-             AND device_reset_pending = false
-             AND (
-               registered_device_token = $2
-               OR ($3::text IS NOT NULL AND registered_device_metadata->'deviceProfile'->>'hash' = $3)
-               OR ($4::text IS NOT NULL AND registered_device_identifier = $4)
-             )
-           LIMIT 1`,
-          [user_id, currentToken, deviceProfileHash, rebindingIdentifier],
+    if (match.matched) {
+      if (match.viaLegacy) {
+        // Recognised through the pre-install-id scheme — rewrite the binding onto
+        // the stable identity so a future browser update cannot invalidate it.
+        await query(
+          `UPDATE users
+           SET registered_device_token = $1,
+               registered_device_identifier = $2,
+               updated_at = NOW()
+           WHERE id = $3 AND company_id = $4`,
+          [identity.token, identity.identifier, user_id, companyId],
+        ).catch(() => { /* keep the legacy binding, which still matches */ });
+      }
+    } else if (isSameRegisteredDeviceProfile(targetUser.registered_device_metadata, device_metadata)) {
+      // Same hardware but an identity we do not recognise (storage cleared, or a
+      // binding predating the profile hash). Rebind, but only if nobody else in
+      // the company holds this device.
+      const conflictingBinding = await queryOne<{ id: number }>(
+        `SELECT id
+         FROM users
+         WHERE id <> $1
+           AND company_id = $2
+           AND device_reset_pending = false
+           AND (
+             registered_device_token = $3
+             OR ($4::text IS NOT NULL AND registered_device_identifier = $4)
+           )
+         LIMIT 1`,
+        [user_id, companyId, identity.token, identity.identifier],
+      );
+
+      if (conflictingBinding) {
+        forbidden(
+          res,
+          'Your device is already registered to another account, you will not able to check in, check out, break start, break end',
+          'DEVICE_MISMATCH',
         );
+        return;
+      }
 
-        if (conflictingBinding) {
-          forbidden(
-            res,
-            'Your device is already registered to another account, you will not able to check in, check out, break start, break end',
-            'DEVICE_MISMATCH',
-          );
-          return;
-        }
-
-        try {
-          await query(
-            `UPDATE users
-             SET registered_device_token = $1,
-                 registered_device_identifier = $2,
-                 registered_device_metadata = COALESCE(registered_device_metadata, '{}'::jsonb) || $3::jsonb,
-                 updated_at = NOW()
-             WHERE id = $4 AND company_id = $5`,
-            [currentToken, rebindingIdentifier, JSON.stringify(mergedDeviceMetadata), user_id, companyId],
-          );
-        } catch {
-          forbidden(
-            res,
-            'Your device is different, you will not able to check in, check out, break start, break end',
-            'DEVICE_MISMATCH',
-          );
-          return;
-        }
-      } else {
+      try {
+        await query(
+          `UPDATE users
+           SET registered_device_token = $1,
+               registered_device_identifier = $2,
+               registered_device_metadata = COALESCE(registered_device_metadata, '{}'::jsonb) || $3::jsonb,
+               updated_at = NOW()
+           WHERE id = $4 AND company_id = $5`,
+          [identity.token, identity.identifier, JSON.stringify(mergedDeviceMetadata), user_id, companyId],
+        );
+      } catch {
         forbidden(
           res,
           'Your device is different, you will not able to check in, check out, break start, break end',
@@ -321,6 +316,13 @@ export const checkin = asyncHandler(async (req: Request, res: Response) => {
         );
         return;
       }
+    } else {
+      forbidden(
+        res,
+        'Your device is different, you will not able to check in, check out, break start, break end',
+        'DEVICE_MISMATCH',
+      );
+      return;
     }
   }
 
@@ -811,6 +813,15 @@ export const listAttendanceEvents = asyncHandler(async (req: Request, res: Respo
     extraWhere += ` AND ae.user_id = $${idx}`;
     params.push(uid);
     idx++;
+  }
+  const rawCompanyId = (req.query.company_id || req.query.companyId) as string | undefined;
+  if (rawCompanyId) {
+    const cid = parseInt(rawCompanyId, 10);
+    if (!isNaN(cid) && cid > 0) {
+      extraWhere += ` AND ae.company_id = $${idx}`;
+      params.push(cid);
+      idx++;
+    }
   }
   // store_manager: ignore caller store_id (already scoped to their store above)
   if (store_id && role !== 'store_manager') {
@@ -1360,6 +1371,9 @@ export async function calculateAnomaliesForRange(
   to: string,
   scope: AnomalyScopeOptions = {}
 ): Promise<AnomalyResult[]> {
+  if (!allowedCompanyIds || allowedCompanyIds.length === 0) {
+    return [];
+  }
   const { role, callerStoreId, managedStoreIds, store_id, filterUserId, search } = scope;
 
   // Build store-scope WHERE clause
@@ -1731,7 +1745,17 @@ export const getAnomalies = asyncHandler(async (req: Request, res: Response) => 
     }
   }
 
-  const anomalies = await calculateAnomaliesForRange(allowedCompanyIds, from, to, {
+  const rawCompParam = (req.query.company_id || req.query.companyId) as string | undefined;
+  const targetCompanyIds = rawCompParam && !isNaN(parseInt(rawCompParam, 10)) && parseInt(rawCompParam, 10) > 0
+    ? [parseInt(rawCompParam, 10)]
+    : allowedCompanyIds;
+
+  if (!targetCompanyIds || targetCompanyIds.length === 0) {
+    ok(res, { anomalies: [], total: 0 });
+    return;
+  }
+
+  const anomalies = await calculateAnomaliesForRange(targetCompanyIds, from, to, {
     role,
     callerStoreId,
     managedStoreIds,
@@ -1863,18 +1887,9 @@ export const listMyAttendanceEvents = asyncHandler(async (req: Request, res: Res
     return;
   }
 
-  const secret = process.env.DEVICE_BINDING_SECRET || 'dev-device-binding-secret-change-me';
-  const currentToken = crypto
-    .createHash('sha256')
-    .update(secret)
-    .update(device_fingerprint)
-    .digest('hex');
-  const currentIdentifier = resolveStableDeviceIdentifierFromFingerprint(device_fingerprint, currentToken);
-
-  if (
-    currentToken !== deviceRow.registered_device_token
-    && (!currentIdentifier || currentIdentifier !== deviceRow.registered_device_identifier)
-  ) {
+  // Matches the current identity, and falls back to the pre-install-id scheme so
+  // a device registered before the rework is still recognised here.
+  if (!matchesRegisteredDevice(deviceRow, resolveDeviceIdentity(device_fingerprint)).matched) {
     forbidden(
       res,
       'Your device is different, you will not able to check in, check out, break start, break end',

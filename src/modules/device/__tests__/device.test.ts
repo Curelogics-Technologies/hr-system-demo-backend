@@ -22,6 +22,19 @@ async function login(email: string, password = 'password123'): Promise<string> {
 
 beforeAll(async () => {
   seeds = await seedTestData();
+
+  // A second company is needed to prove device uniqueness is scoped per company
+  // rather than global — one company's registrations must not block another's.
+  const HASH = '$2a$10$e/ULie.9SQf5MIQSNjkxEO7.xAyc6zv/qysVTE4mVFhZum/BjT5VG'; // password123
+  await testPool.query(
+    `INSERT INTO users (company_id, name, surname, email, password_hash, role, status)
+     VALUES ($1, 'Beta', 'Employee', 'employee.beta@beta-test.com', $2, 'employee', 'active')
+     ON CONFLICT (email) DO UPDATE SET
+       company_id = EXCLUDED.company_id,
+       password_hash = EXCLUDED.password_hash,
+       status = EXCLUDED.status`,
+    [seeds.betaId, HASH]
+  );
 });
 
 afterAll(async () => {
@@ -31,6 +44,18 @@ afterAll(async () => {
 
 describe('Device Registration & Verification', () => {
   const testFingerprint = 'test-fingerprint-unique-id-999';
+
+  // Per-installation ids minted by the web client. Two units of the same model
+  // get different ones; the same unit keeps its own across browser updates.
+  const INSTALL_A = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
+  const INSTALL_B = 'ff00ee11dd22cc33bb44aa5566778899';
+  const LEGACY_PROFILE_HASH = 'b'.repeat(64);
+  const PROFILE_HASH_BEFORE_UPDATE = 'c'.repeat(64);
+  const PROFILE_HASH_AFTER_UPDATE = 'd'.repeat(64);
+
+  const deviceFingerprint = (installId: string, profileHash = LEGACY_PROFILE_HASH) =>
+    `web-device-v2:${installId}:${profileHash}`;
+
   const sharedDeviceMetadata = {
     userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 26_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.2 Mobile/15E148 Safari/604.1',
     browser: { name: 'Mobile Safari', version: '26.2' },
@@ -148,7 +173,12 @@ describe('Device Registration & Verification', () => {
       expect(res.body.data.isDeviceRegistered).toBe(true);
     });
 
-    it('fails to register a second account from the same device profile even with a different fingerprint token', async () => {
+    // Regression: identical hardware in different stores must both be able to
+    // register. The device profile (model/OS/browser/screen/locale) is shared by
+    // every unit of the same model, so using it as an identity key meant only
+    // one terminal in a fleet could ever hold a registration — disabling it was
+    // what freed the slot for the next one.
+    it('allows two identical devices to register to different accounts', async () => {
       await testPool.query(
         `UPDATE users SET device_reset_pending = true WHERE id = $1`,
         [seeds.employee1Id]
@@ -157,7 +187,7 @@ describe('Device Registration & Verification', () => {
       const firstRes = await request
         .post('/api/device/register')
         .set('Authorization', `Bearer ${token1}`)
-        .send({ fingerprint: testFingerprint, metadata: sharedDeviceMetadata });
+        .send({ fingerprint: deviceFingerprint(INSTALL_A), metadata: sharedDeviceMetadata });
 
       expect(firstRes.status).toBe(200);
 
@@ -169,14 +199,122 @@ describe('Device Registration & Verification', () => {
       const res = await request
         .post('/api/device/register')
         .set('Authorization', `Bearer ${token2}`)
-        .send({
-          fingerprint: 'same-device-different-browser-storage-token',
-          metadata: sharedDeviceMetadata
-        });
+        // Same hardware profile, different physical unit → different install id.
+        .send({ fingerprint: deviceFingerprint(INSTALL_B), metadata: sharedDeviceMetadata });
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.data.isDeviceRegistered).toBe(true);
+    });
+
+    it('still blocks a second account registering from the same physical installation', async () => {
+      await testPool.query(
+        `UPDATE users SET device_reset_pending = true WHERE id = $1`,
+        [seeds.employee1Id]
+      );
+      const token1 = await login('employee1@acme-test.com');
+      await request
+        .post('/api/device/register')
+        .set('Authorization', `Bearer ${token1}`)
+        .send({ fingerprint: deviceFingerprint(INSTALL_A), metadata: sharedDeviceMetadata });
+
+      await testPool.query(
+        `UPDATE users SET device_reset_pending = true WHERE id = $1`,
+        [seeds.romaManagerId]
+      );
+      const token2 = await login('manager.roma@acme-test.com');
+      const res = await request
+        .post('/api/device/register')
+        .set('Authorization', `Bearer ${token2}`)
+        .send({ fingerprint: deviceFingerprint(INSTALL_A), metadata: sharedDeviceMetadata });
 
       expect(res.status).toBe(400);
-      expect(res.body.success).toBe(false);
       expect(res.body.code).toBe('DEVICE_ALREADY_REGISTERED');
+    });
+
+    // Regression: the identity must not move when the browser updates. The old
+    // profile hash included the browser version and the full user-agent, so a
+    // routine Chrome update silently locked a device out of its own account.
+    it('keeps a device registered across a browser update', async () => {
+      await testPool.query(
+        `UPDATE users SET device_reset_pending = true WHERE id = $1`,
+        [seeds.employee1Id]
+      );
+      const token = await login('employee1@acme-test.com');
+      await request
+        .post('/api/device/register')
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          fingerprint: deviceFingerprint(INSTALL_A, PROFILE_HASH_BEFORE_UPDATE),
+          metadata: sharedDeviceMetadata,
+        });
+
+      const res = await request
+        .get('/api/device/status')
+        .set('Authorization', `Bearer ${token}`)
+        // Same installation, new browser version → new profile hash.
+        .query({ fingerprint: deviceFingerprint(INSTALL_A, PROFILE_HASH_AFTER_UPDATE) });
+
+      expect(res.status).toBe(200);
+      expect(res.body.data.isDeviceMatched).toBe(true);
+    });
+
+    it('does not let one company\'s registration block another company\'s', async () => {
+      await testPool.query(
+        `UPDATE users SET device_reset_pending = true WHERE id = $1`,
+        [seeds.employee1Id]
+      );
+      const token1 = await login('employee1@acme-test.com');
+      await request
+        .post('/api/device/register')
+        .set('Authorization', `Bearer ${token1}`)
+        .send({ fingerprint: deviceFingerprint(INSTALL_A), metadata: sharedDeviceMetadata });
+
+      const betaToken = await login('employee.beta@beta-test.com');
+      const res = await request
+        .post('/api/device/register')
+        .set('Authorization', `Bearer ${betaToken}`)
+        .send({ fingerprint: deviceFingerprint(INSTALL_A), metadata: sharedDeviceMetadata });
+
+      expect(res.status).toBe(200);
+      expect(res.body.data.isDeviceRegistered).toBe(true);
+    });
+
+    // Devices registered by the previous client stored a token derived from
+    // `web-profile-v1:<hash>`. They must keep working without re-registering.
+    it('recognises and upgrades a registration made by the previous client', async () => {
+      await testPool.query(
+        `UPDATE users SET device_reset_pending = true WHERE id = $1`,
+        [seeds.employee1Id]
+      );
+      const token = await login('employee1@acme-test.com');
+
+      const legacyRes = await request
+        .post('/api/device/register')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ fingerprint: `web-profile-v1:${LEGACY_PROFILE_HASH}`, metadata: sharedDeviceMetadata });
+      expect(legacyRes.status).toBe(200);
+
+      const { rows: [beforeUpgrade] } = await testPool.query(
+        `SELECT registered_device_identifier FROM users WHERE id = $1`,
+        [seeds.employee1Id]
+      );
+      expect(beforeUpgrade.registered_device_identifier).toBe(`profile:${LEGACY_PROFILE_HASH}`);
+
+      // The updated client reports its install id plus the legacy hash.
+      const statusRes = await request
+        .get('/api/device/status')
+        .set('Authorization', `Bearer ${token}`)
+        .query({ fingerprint: deviceFingerprint(INSTALL_A, LEGACY_PROFILE_HASH) });
+
+      expect(statusRes.status).toBe(200);
+      expect(statusRes.body.data.isDeviceMatched).toBe(true);
+
+      const { rows: [afterUpgrade] } = await testPool.query(
+        `SELECT registered_device_identifier FROM users WHERE id = $1`,
+        [seeds.employee1Id]
+      );
+      expect(afterUpgrade.registered_device_identifier).toMatch(/^device:[a-f0-9]{64}$/);
     });
 
     it('fails to register a second account with the same native stable device id even if the profile changes', async () => {

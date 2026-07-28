@@ -5,9 +5,25 @@ import { asyncHandler } from '../../utils/asyncHandler';
 import bcrypt from 'bcryptjs';
 import { resolveAllowedCompanyIds } from '../../utils/companyScope';
 
+/**
+ * Whether the terminal has actually completed device registration.
+ *
+ * This is distinct from `users.status`, which only says whether the account is
+ * enabled for login. A terminal whose credentials were created but which was
+ * never registered on a device is `status = 'active'` yet cannot take any
+ * attendance — reporting it simply as "Active" is what made GRA-01 look ready
+ * when it was not.
+ */
+const REGISTRATION_STATE_SQL = `
+  CASE
+    WHEN u.registered_device_token IS NULL AND u.registered_device_identifier IS NULL THEN 'pending'
+    WHEN u.device_reset_pending THEN 'reset_pending'
+    ELSE 'registered'
+  END`;
+
 export const listTerminals = asyncHandler(async (req: Request, res: Response) => {
   const { role, userId, companyId: callerCompanyId } = req.user!;
-  const { search, status, company_id, store_id, page = '1', limit = '20' } = req.query as Record<string, string>;
+  const { search, status, registration, company_id, store_id, page = '1', limit = '20' } = req.query as Record<string, string>;
 
   const allowedCompanyIds = await resolveAllowedCompanyIds(req.user!);
   
@@ -48,6 +64,15 @@ export const listTerminals = asyncHandler(async (req: Request, res: Response) =>
     where += ` AND u.status = $${params.length}`;
   }
 
+  // Registration filtering ('pending' | 'reset_pending' | 'registered')
+  if (registration) {
+    const states = registration.split(',').map(s => s.trim()).filter(Boolean);
+    if (states.length > 0) {
+      params.push(states);
+      where += ` AND ${REGISTRATION_STATE_SQL} = ANY($${params.length})`;
+    }
+  }
+
   // Search filtering (name or email)
   if (search) {
     params.push(`%${search}%`);
@@ -86,11 +111,18 @@ export const listTerminals = asyncHandler(async (req: Request, res: Response) =>
       u.registered_device_metadata AS device_metadata,
       u.last_seen_ip,
       u.last_seen_at,
+      ${REGISTRATION_STATE_SQL} AS registration_state,
+      u.created_at,
+      u.updated_at,
+      TRIM(CONCAT(cb.name, ' ', cb.surname)) AS created_by_name,
+      TRIM(CONCAT(ub.name, ' ', ub.surname)) AS updated_by_name,
       c.name as company_name,
       s.name as store_name
     FROM users u
     LEFT JOIN companies c ON c.id = u.company_id
     LEFT JOIN stores s ON s.id = u.store_id
+    LEFT JOIN users cb ON cb.id = u.created_by
+    LEFT JOIN users ub ON ub.id = u.updated_by
     WHERE ${where}
     ORDER BY c.name, s.name, u.name
     LIMIT $${params.length - 1} OFFSET $${params.length}
@@ -123,11 +155,13 @@ export const listStoresWithTerminalStatus = asyncHandler(async (req: Request, re
       s.max_staff, 
       s.company_id,
       c.name as company_name,
+      -- Any terminal account at all, regardless of whether it is currently
+      -- enabled. Filtering on status here used to let a store with a disabled
+      -- terminal look terminal-less, so a duplicate could be created for it.
       EXISTS (
-        SELECT 1 FROM users u 
-        WHERE u.store_id = s.id 
-        AND u.role = 'store_terminal' 
-        AND u.status = 'active'
+        SELECT 1 FROM users u
+        WHERE u.store_id = s.id
+        AND u.role = 'store_terminal'
       ) as "hasTerminal"
     FROM stores s
     LEFT JOIN companies c ON c.id = s.company_id
@@ -156,9 +190,11 @@ export const createTerminal = asyncHandler(async (req: Request, res: Response) =
     return badRequest(res, 'Store not found or access denied');
   }
 
-  // Check if terminal already exists
+  // One terminal account per store. Deliberately not filtered by status: a
+  // disabled terminal still occupies the store, and ignoring it allowed a second
+  // account to be created for the same store.
   const existingTerminal = await queryOne(
-    "SELECT id FROM users WHERE store_id = $1 AND role = 'store_terminal' AND status = 'active'",
+    "SELECT id FROM users WHERE store_id = $1 AND role = 'store_terminal'",
     [store_id]
   );
 
@@ -178,15 +214,26 @@ export const createTerminal = asyncHandler(async (req: Request, res: Response) =
   try {
     await client.query('BEGIN');
 
+    // NOTE: `status` stays 'active' because login is gated on it — a terminal
+    // created as 'inactive' could never sign in to complete its registration.
+    // "Has this terminal actually been registered?" is reported separately, via
+    // registration_state, so the list no longer presents an unregistered
+    // terminal as ready to use.
     const terminalRes = await client.query(
       `INSERT INTO users (
-         company_id, store_id, name, surname, email, password_hash, plain_password, role, status
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'store_terminal', 'active') RETURNING id, name, email`,
-      [store.company_id, store.id, store.name, 'Terminale', email, passwordHash, password]
+         company_id, store_id, name, surname, email, password_hash, plain_password, role, status, created_by, updated_by
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'store_terminal', 'active', $8, $8) RETURNING id, name, email, created_at`,
+      [store.company_id, store.id, store.name, 'Terminale', email, passwordHash, password, req.user!.userId]
+    );
+
+    await client.query(
+      `INSERT INTO audit_logs (company_id, user_id, action, entity_type, entity_id, new_data)
+       VALUES ($1, $2, 'TERMINAL_CREATE', 'user', $3, $4)`,
+      [store.company_id, req.user!.userId, terminalRes.rows[0].id, { store_id: store.id, email }]
     );
 
     await client.query('COMMIT');
-    created(res, terminalRes.rows[0], 'Terminal created successfully');
+    created(res, { ...terminalRes.rows[0], registration_state: 'pending' }, 'Terminal created successfully');
   } catch (err) {
     await client.query('ROLLBACK');
     throw err;
@@ -240,11 +287,20 @@ export const updateTerminal = asyncHandler(async (req: Request, res: Response) =
     return ok(res, null, 'No updates performed');
   }
 
+  params.push(req.user!.userId);
+  updates.push(`updated_by = $${params.length}`);
+
   params.push(terminalId);
   await query(
     `UPDATE users SET ${updates.join(', ')}, updated_at = NOW() WHERE id = $${params.length}`,
     params
   );
+
+  query(
+    `INSERT INTO audit_logs (company_id, user_id, action, entity_type, entity_id)
+     VALUES ($1, $2, 'TERMINAL_UPDATE', 'user', $3)`,
+    [terminal.company_id, req.user!.userId, terminalId]
+  ).catch(() => {});
 
   ok(res, null, 'Terminal updated successfully');
 });

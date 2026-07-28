@@ -45,10 +45,8 @@ export async function resolveAutomationRecipientEmails(options: {
     const employee = await queryOne<RecipientRow>(
       `SELECT personal_email, email
        FROM users
-       WHERE id = $1
-         AND company_id = $2
-         AND status = 'active'`,
-      [targetEmployeeId, companyId],
+       WHERE id = $1`,
+      [targetEmployeeId],
     );
     addEmail(employee?.personal_email ?? employee?.email ?? null);
   }

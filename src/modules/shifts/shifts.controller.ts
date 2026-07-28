@@ -345,7 +345,7 @@ async function buildShiftScope(
 // ---------------------------------------------------------------------------
 export const listShifts = asyncHandler(async (req: Request, res: Response) => {
   const { role, userId, storeId } = req.user!;
-  const { week, month, start_date, end_date, store_id, user_id, timezone } = req.query as Record<string, string>;
+  const { week, month, start_date, end_date, store_id, user_id, company_id, timezone } = req.query as Record<string, string>;
   const displayTimezone = normalizeShiftTimezone(timezone, DEFAULT_SHIFT_TIMEZONE);
 
   const allowedCompanyIds = await resolveAllowedCompanyIds(req.user!);
@@ -387,6 +387,13 @@ export const listShifts = asyncHandler(async (req: Request, res: Response) => {
 
   // Optional filters (only for non-employee roles)
   if (role !== 'employee') {
+    if (company_id) {
+      const companyIdNum = parseInt(company_id, 10);
+      if (isNaN(companyIdNum)) { badRequest(res, 'company_id non valido'); return; }
+      extraWhere += ` AND s.company_id = $${idx}`;
+      extra.push(companyIdNum);
+      idx++;
+    }
     if (store_id) {
       const storeIdNum = parseInt(store_id, 10);
       if (isNaN(storeIdNum)) { badRequest(res, 'store_id non valido'); return; }

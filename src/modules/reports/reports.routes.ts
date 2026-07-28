@@ -2,6 +2,7 @@ import { Router } from 'express';
 import {
   getReportConfigurations,
   saveReportConfiguration,
+  sendReportNow,
   downloadLastReport,
   previewReportStructure,
   getReportOwners,
@@ -17,6 +18,7 @@ const router = Router();
 router.get('/owners', authenticate, requireRole('admin', 'hr'), enforceCompany, getReportOwners);
 router.get('/configurations', authenticate, requireRole('admin', 'hr'), enforceCompany, getReportConfigurations);
 router.put('/configurations/:reportId', authenticate, requireRole('admin', 'hr'), enforceCompany, saveReportConfiguration);
+router.post('/configurations/:reportId/send-now', authenticate, requireRole('admin', 'hr'), enforceCompany, sendReportNow);
 router.get('/configurations/:reportId/download-last', authenticate, requireRole('admin', 'hr'), enforceCompany, downloadLastReport);
 router.get('/configurations/:reportId/preview', authenticate, requireRole('admin', 'hr'), enforceCompany, previewReportStructure);
 

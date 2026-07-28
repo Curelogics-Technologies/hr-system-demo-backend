@@ -29,6 +29,9 @@ interface StoreRow {
   max_staff: number;
   is_active: boolean;
   created_at: string;
+  updated_at?: string | null;
+  created_by_name?: string | null;
+  updated_by_name?: string | null;
   employee_count?: number;
 }
 
@@ -119,10 +122,14 @@ export const getStore = asyncHandler(async (req: Request, res: Response) => {
 
   const store = await queryOne<StoreRow>(
     `SELECT s.*, c.name AS company_name, cg.name AS group_name, c.logo_filename AS company_logo_filename,
+            TRIM(CONCAT(cb.name, ' ', cb.surname)) AS created_by_name,
+            TRIM(CONCAT(ub.name, ' ', ub.surname)) AS updated_by_name,
             (SELECT COUNT(*) FROM users u WHERE u.store_id = s.id AND u.status = 'active' AND u.role != 'store_terminal')::int AS employee_count
      FROM stores s
      JOIN companies c ON c.id = s.company_id
      LEFT JOIN company_groups cg ON cg.id = c.group_id
+     LEFT JOIN users cb ON cb.id = s.created_by
+     LEFT JOIN users ub ON ub.id = s.updated_by
      WHERE s.id = $1 AND s.company_id = ANY($2)`,
     [storeId, allowedCompanyIds]
   );
@@ -392,9 +399,11 @@ export const createStore = asyncHandler(async (req: Request, res: Response) => {
          country,
          phone,
          timezone,
-         max_staff
+         max_staff,
+         created_by,
+         updated_by
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)
        RETURNING *`,
       [
         targetCompanyId,
@@ -408,6 +417,7 @@ export const createStore = asyncHandler(async (req: Request, res: Response) => {
         phone || null,
         normalizedTimezone,
         max_staff || 0,
+        req.user!.userId,
       ]
     );
     const store = storeRes.rows[0];
@@ -417,9 +427,9 @@ export const createStore = asyncHandler(async (req: Request, res: Response) => {
       const passwordHash = await bcrypt.hash(terminal.password, 12);
       await client.query(
         `INSERT INTO users (
-           company_id, store_id, name, surname, email, password_hash, role, status
-         ) VALUES ($1, $2, $3, $4, $5, $6, 'store_terminal', 'active')`,
-        [targetCompanyId, store.id, store.name, 'Terminale', terminal.email, passwordHash]
+           company_id, store_id, name, surname, email, password_hash, role, status, created_by, updated_by
+         ) VALUES ($1, $2, $3, $4, $5, $6, 'store_terminal', 'active', $7, $7)`,
+        [targetCompanyId, store.id, store.name, 'Terminale', terminal.email, passwordHash, req.user!.userId]
       );
     }
 
@@ -476,7 +486,9 @@ export const updateStore = asyncHandler(async (req: Request, res: Response) => {
          country = $7,
          phone = $8,
          timezone = $9,
-         max_staff = $10
+         max_staff = $10,
+         updated_at = NOW(),
+         updated_by = $13
      WHERE id = $11 AND company_id = $12
      RETURNING *`,
     [
@@ -492,6 +504,7 @@ export const updateStore = asyncHandler(async (req: Request, res: Response) => {
       max_staff || 0,
       storeId,
       targetCompanyId,
+      req.user!.userId,
     ]
   );
   if (!store) { notFound(res, 'Negozio non trovato'); return; }

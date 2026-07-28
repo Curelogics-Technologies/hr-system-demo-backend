@@ -892,6 +892,13 @@ export const listLeaveRequests = asyncHandler(async (req: Request, res: Response
   if (store_id) {
     extraWhere += ` AND lr.store_id = $${paramIdx}`; extraParams.push(parseInt(store_id, 10)); paramIdx++;
   }
+  const company_id_param = (req.query.company_id || req.query.companyId) as string | undefined;
+  if (company_id_param) {
+    const cid = parseInt(company_id_param, 10);
+    if (!isNaN(cid) && cid > 0) {
+      extraWhere += ` AND lr.company_id = $${paramIdx}`; extraParams.push(cid); paramIdx++;
+    }
+  }
 
   const allParams = [...scopeParams, ...extraParams];
 
