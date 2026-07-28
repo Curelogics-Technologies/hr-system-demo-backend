@@ -22,6 +22,7 @@ export type NotificationEventType =
   | 'leave.approved'
   | 'leave.rejected'
   | 'document.uploaded'
+  | 'document.assigned'
   | 'document.signature_required'
   | 'document.signed'
   | 'document.expiring'
