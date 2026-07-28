@@ -52,7 +52,10 @@ const DETAIL_FIELDS = `
   u.contract_type, u.probation_months,
   u.device_reset_pending,
   ((u.registered_device_token IS NOT NULL) OR (u.registered_device_identifier IS NOT NULL)) AS device_registered,
-  u.registered_device_registered_at AS device_registered_at
+  u.registered_device_registered_at AS device_registered_at,
+  u.updated_at,
+  TRIM(CONCAT(cb.name, ' ', cb.surname)) AS created_by_name,
+  TRIM(CONCAT(ub.name, ' ', ub.surname)) AS updated_by_name
 `;
 
 // Extended detail fields including company name (for exporting sensitive data by authorized managers)
@@ -68,6 +71,13 @@ const BASE_JOINS = `
   FROM users u
   LEFT JOIN stores s ON s.id = u.store_id
   LEFT JOIN users sup ON sup.id = u.supervisor_id
+`;
+
+// Resolves created_by/updated_by to names. Only appended when DETAIL_FIELDS is
+// selected — the list and count paths must not pay for joins they never read.
+const AUDIT_JOINS = `
+  LEFT JOIN users cb ON cb.id = u.created_by
+  LEFT JOIN users ub ON ub.id = u.updated_by
 `;
 
 // Base joins with company (for super admin cross-company view)
@@ -318,8 +328,10 @@ export const listEmployees = asyncHandler(async (req: Request, res: Response) =>
   }
 
   const allParams = [...params, ...extraParams];
-  const selectFields = (includeSensitive && canSeeSensitive) ? DETAIL_FIELDS_WITH_COMPANY : LIST_FIELDS_WITH_COMPANY;
+  const wantsDetail = includeSensitive && canSeeSensitive;
+  const selectFields = wantsDetail ? DETAIL_FIELDS_WITH_COMPANY : LIST_FIELDS_WITH_COMPANY;
   const joins = BASE_JOINS_WITH_COMPANY;
+  const selectJoins = wantsDetail ? `${joins} ${AUDIT_JOINS}` : joins;
 
 
   const countResult = await queryOne<{ count: string }>(
@@ -329,7 +341,7 @@ export const listEmployees = asyncHandler(async (req: Request, res: Response) =>
   const total = parseInt(countResult?.count ?? '0', 10);
 
   const employees = await query(
-    `SELECT ${selectFields} ${joins} WHERE ${where}${extraWhere} ORDER BY u.surname, u.name LIMIT $${paramIdx} OFFSET $${paramIdx + 1}`,
+    `SELECT ${selectFields} ${selectJoins} WHERE ${where}${extraWhere} ORDER BY u.surname, u.name LIMIT $${paramIdx} OFFSET $${paramIdx + 1}`,
     [...allParams, limitNum, offset],
   );
 
@@ -352,13 +364,14 @@ export const getEmployee = asyncHandler(async (req: Request, res: Response) => {
   const canSeeSensitive = role === 'admin' || role === 'hr' || role === 'area_manager' || userId === empId;
 
   const fields = canSeeSensitive ? DETAIL_FIELDS : LIST_FIELDS;
+  const joins = canSeeSensitive ? `${BASE_JOINS} ${AUDIT_JOINS}` : BASE_JOINS;
 
   // For cross-company callers, fetch the employee and then verify company membership.
   // For single-company callers, scope directly by company_id for efficiency.
   const employee = await queryOne<Record<string, any>>(
     hasCrossCompanyAccess
-      ? `SELECT ${fields}, c.name AS company_name ${BASE_JOINS} LEFT JOIN companies c ON c.id = u.company_id WHERE u.id = $1`
-      : `SELECT ${fields}, c.name AS company_name ${BASE_JOINS} LEFT JOIN companies c ON c.id = u.company_id WHERE u.id = $1 AND u.company_id = $2`,
+      ? `SELECT ${fields}, c.name AS company_name ${joins} LEFT JOIN companies c ON c.id = u.company_id WHERE u.id = $1`
+      : `SELECT ${fields}, c.name AS company_name ${joins} LEFT JOIN companies c ON c.id = u.company_id WHERE u.id = $1 AND u.company_id = $2`,
     hasCrossCompanyAccess ? [empId] : [empId, companyId],
   );
 
@@ -940,15 +953,15 @@ export const createEmployee = asyncHandler(async (req: Request, res: Response) =
       working_type, weekly_hours, off_days, personal_email, date_of_birth, nationality,
       gender, iban, address, cap, first_aid_flag, marital_status, status,
       contract_type, probation_months, termination_type, termination_date, phone,
-      country, state, city
+      country, state, city, created_by, updated_by
     ) VALUES (
       $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30,
-      $31, $32, $33
+      $31, $32, $33, $34, $34
     ) RETURNING id, company_id, name, surname, email, role, store_id, supervisor_id, unique_id, department,
         hire_date, contract_end_date, working_type, weekly_hours, off_days, personal_email, date_of_birth,
         nationality, gender, iban, address, cap, first_aid_flag, marital_status, status,
         contract_type, probation_months, termination_type, termination_date, phone,
-        country, state, city`,
+        country, state, city, created_at`,
     [
       companyId,
       body.store_id ?? null,
@@ -983,6 +996,7 @@ export const createEmployee = asyncHandler(async (req: Request, res: Response) =
       body.country ?? null,
       body.state ?? null,
       body.city ?? null,
+      req.user!.userId,
     ],
   );
   // Check Welcome Email Automation (Background task, non-blocking)
@@ -1116,12 +1130,13 @@ export const updateEmployee = asyncHandler(async (req: Request, res: Response) =
       contract_type = $28, probation_months = $29,
       termination_date = $30, termination_type = $31,
       password_hash = COALESCE($32, password_hash),
-      updated_at = NOW()
+      updated_at = NOW(),
+      updated_by = $34
     WHERE id = $33
     RETURNING id, company_id, name, surname, email, role, store_id, supervisor_id, unique_id, department,
         hire_date, contract_end_date, working_type, weekly_hours, off_days, personal_email, date_of_birth,
         nationality, gender, iban, address, cap, country, state, city, phone, first_aid_flag, marital_status, status,
-        contract_type, probation_months, termination_date, termination_type`,
+        contract_type, probation_months, termination_date, termination_type, created_at, updated_at`,
     [
       targetCompanyId,
       body.store_id ?? null,
@@ -1156,6 +1171,7 @@ export const updateEmployee = asyncHandler(async (req: Request, res: Response) =
       body.termination_type ?? null,
       passwordHash,
       empId,
+      req.user!.userId,
     ],
   );
 
