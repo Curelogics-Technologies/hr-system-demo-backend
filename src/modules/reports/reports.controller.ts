@@ -180,6 +180,13 @@ export const saveReportConfiguration = asyncHandler(async (req: Request, res: Re
     }
   }
 
+  let finalRecipients = recipients;
+  if (status === 'attivo' && (!finalRecipients || (Array.isArray(finalRecipients) && finalRecipients.length === 0))) {
+    if (req.user?.email) {
+      finalRecipients = [req.user.email];
+    }
+  }
+
   const result = await queryOne<ReportConfigRow>(
     `INSERT INTO report_configurations
        (company_id, report_id, owner_user_id, store_id, day, time, recipients, sections, status,
@@ -209,7 +216,7 @@ export const saveReportConfiguration = asyncHandler(async (req: Request, res: Re
       storeId,
       day !== undefined ? day : null,
       time || null,
-      recipients ? JSON.stringify(recipients) : null,
+      finalRecipients ? JSON.stringify(finalRecipients) : null,
       sections ? JSON.stringify(sections) : null,
       status || null,
       thresholds ? JSON.stringify(thresholds) : null,
@@ -220,11 +227,117 @@ export const saveReportConfiguration = asyncHandler(async (req: Request, res: Re
   );
 
   if (!result) {
-    badRequest(res, 'Failed to save configuration');
+    badRequest(res, 'Impossibile salvare la configurazione del report.');
     return;
   }
 
   ok(res, mapConfigRow(result));
+});
+
+// POST /api/reports/configurations/:reportId/send-now
+export const sendReportNow = asyncHandler(async (req: Request, res: Response) => {
+  const explicit = req.body?.company_id ?? req.query?.company_id ?? req.params?.company_id;
+  const targetCompanyId = explicit !== undefined ? parseInt(String(explicit), 10) : req.user!.companyId;
+
+  if (!targetCompanyId) {
+    notFound(res, 'Company not found');
+    return;
+  }
+
+  const { reportId } = req.params;
+  if (!canAccessReport(req.user?.role, reportId)) {
+    forbidden(res, 'Non hai i permessi per questo report.');
+    return;
+  }
+
+  const ownerUserId = req.body.owner_user_id ?? req.body.ownerUserId ?? (req.user?.role === 'hr' ? req.user.userId : null);
+
+  let config = await queryOne<ReportConfigRow>(
+    `SELECT ${CONFIG_COLUMNS} FROM report_configurations
+      WHERE company_id = $1 AND report_id = $2
+        AND COALESCE(owner_user_id, 0) = COALESCE($3::int, 0)`,
+    [targetCompanyId, reportId, ownerUserId],
+  );
+
+  if (!config) {
+    const def = getReportDefinition(reportId);
+    if (!def) {
+      notFound(res, 'Report non trovato');
+      return;
+    }
+    config = {
+      id: 0,
+      company_id: targetCompanyId,
+      report_id: reportId,
+      owner_user_id: ownerUserId,
+      status: 'attivo',
+      day: def.defaultDay,
+      time: def.defaultTime,
+      recipients: JSON.stringify(req.user?.email ? [req.user.email] : []),
+      sections: JSON.stringify(def.defaultSections),
+      thresholds: {},
+      max_pages: 12,
+      max_rows_per_section: 20,
+      retention_count: 24,
+      run_count: 0,
+      last_generated: null,
+      period: 'weekly',
+      custom_start: null,
+      custom_end: null,
+      store_id: req.user?.storeId ?? null,
+    } as any;
+  }
+
+  let parsedRecipients: string[] = [];
+  try {
+    parsedRecipients = typeof config.recipients === 'string' ? JSON.parse(config.recipients as string) : config.recipients;
+  } catch {
+    parsedRecipients = [];
+  }
+
+  if (!parsedRecipients || parsedRecipients.length === 0) {
+    if (req.user?.email) {
+      parsedRecipients = [req.user.email];
+    } else {
+      badRequest(res, 'Nessun destinatario configurato per l\'invio delle email.');
+      return;
+    }
+  }
+
+  let parsedSections: string[] = [];
+  try {
+    parsedSections = typeof config.sections === 'string' ? JSON.parse(config.sections as string) : config.sections;
+  } catch {
+    parsedSections = [];
+  }
+
+  const now = new Date();
+  const pdfBuffer = await generateReport(targetCompanyId, {
+    recipients: parsedRecipients,
+    sections: parsedSections,
+    reportId,
+    storeId: config.store_id ?? null,
+    thresholds: config.thresholds,
+    maxPages: config.max_pages,
+    maxRowsPerSection: config.max_rows_per_section,
+  }, now);
+
+  if (!pdfBuffer) {
+    badRequest(res, 'Impossibile generare il report.');
+    return;
+  }
+
+  await query(
+    `UPDATE report_configurations
+        SET run_count = run_count + 1,
+            last_generated = CURRENT_TIMESTAMP,
+            recipients = COALESCE($4::jsonb, recipients)
+      WHERE company_id = $1 AND report_id = $2
+        AND COALESCE(owner_user_id, 0) = COALESCE($3::int, 0)`,
+    [targetCompanyId, reportId, ownerUserId, JSON.stringify(parsedRecipients)]
+  );
+
+  ok(res, { sentTo: parsedRecipients }, 'Report inviato con successo!');
 });
 
 // GET /api/reports/configurations/:reportId/download-last

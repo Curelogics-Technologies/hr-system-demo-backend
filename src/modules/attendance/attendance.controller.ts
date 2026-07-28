@@ -814,6 +814,15 @@ export const listAttendanceEvents = asyncHandler(async (req: Request, res: Respo
     params.push(uid);
     idx++;
   }
+  const rawCompanyId = (req.query.company_id || req.query.companyId) as string | undefined;
+  if (rawCompanyId) {
+    const cid = parseInt(rawCompanyId, 10);
+    if (!isNaN(cid) && cid > 0) {
+      extraWhere += ` AND ae.company_id = $${idx}`;
+      params.push(cid);
+      idx++;
+    }
+  }
   // store_manager: ignore caller store_id (already scoped to their store above)
   if (store_id && role !== 'store_manager') {
     const sid = parseInt(store_id, 10);
@@ -1362,6 +1371,9 @@ export async function calculateAnomaliesForRange(
   to: string,
   scope: AnomalyScopeOptions = {}
 ): Promise<AnomalyResult[]> {
+  if (!allowedCompanyIds || allowedCompanyIds.length === 0) {
+    return [];
+  }
   const { role, callerStoreId, managedStoreIds, store_id, filterUserId, search } = scope;
 
   // Build store-scope WHERE clause
@@ -1733,7 +1745,17 @@ export const getAnomalies = asyncHandler(async (req: Request, res: Response) => 
     }
   }
 
-  const anomalies = await calculateAnomaliesForRange(allowedCompanyIds, from, to, {
+  const rawCompParam = (req.query.company_id || req.query.companyId) as string | undefined;
+  const targetCompanyIds = rawCompParam && !isNaN(parseInt(rawCompParam, 10)) && parseInt(rawCompParam, 10) > 0
+    ? [parseInt(rawCompParam, 10)]
+    : allowedCompanyIds;
+
+  if (!targetCompanyIds || targetCompanyIds.length === 0) {
+    ok(res, { anomalies: [], total: 0 });
+    return;
+  }
+
+  const anomalies = await calculateAnomaliesForRange(targetCompanyIds, from, to, {
     role,
     callerStoreId,
     managedStoreIds,

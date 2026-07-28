@@ -178,7 +178,7 @@ export function requireModulePermission(moduleName: string, _action: 'read' | 'w
 
     const homeCompanyId = req.user.companyId;
     const canUseHomeCompanyFallback =
-      (role === 'hr' || role === 'area_manager') &&
+      (role === 'admin' || role === 'hr' || role === 'area_manager') &&
       homeCompanyId != null &&
       homeCompanyId !== targetCompanyId &&
       allowedCompanyIds.includes(homeCompanyId);

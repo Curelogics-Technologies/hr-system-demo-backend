@@ -268,15 +268,12 @@ export async function performAutoAssign(
   let companyFilterSql = '';
   let params: any[] = [];
 
-  if (options?.companyId) {
-    companyFilterSql = 'AND company_id = $1';
-    params = [options.companyId];
-  } else if (!isGlobalSearch) {
-    companyFilterSql = 'AND company_id = ANY($1)';
+  if (!isGlobalSearch && allowedCompanyIds && allowedCompanyIds.length > 0) {
+    companyFilterSql = 'AND (company_id = ANY($1) OR company_id IS NULL)';
     params = [allowedCompanyIds];
   }
 
-  // Fetch active employees (filtered by allowed company IDs unless global search for super admin)
+  // Fetch employees in allowed company scope (or all active/pending users for global search)
   const employees = await query<{
     id: number;
     name: string;
@@ -284,12 +281,16 @@ export async function performAutoAssign(
     unique_id: string | null;
     company_id: number;
   }>(
-    `SELECT id, name, surname, unique_id, company_id FROM users WHERE status = 'active' ${companyFilterSql}`,
+    `SELECT id, name, surname, unique_id, company_id 
+       FROM users 
+      WHERE (status = 'active' OR status IS NULL OR status = 'pending')
+        AND role NOT IN ('admin', 'store_terminal')
+        ${companyFilterSql}`,
     params,
   );
 
   // Normalize filename for matching: remove extension and trim
-  const cleanBaseName = filename.replace(/\.(pdf|zip|jpg|jpeg|png|webp|bin|docx|xlsx)$/i, '').trim();
+  const cleanBaseName = filename.replace(/\.[^.]+$/i, '').trim();
   const normalizedFile = cleanBaseName.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
   const tokens = normalizedFile.split(/[_\s.-]+/).filter(Boolean);
   const filenameAlphaOnly = normalizedFile.replace(/[^a-z0-9]/g, '');
@@ -298,41 +299,60 @@ export async function performAutoAssign(
   let matches: typeof employees = [];
 
   for (const emp of employees) {
-    const name = emp.name.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
-    const surname = emp.surname.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
+    if (!emp.name && !emp.surname) continue;
+
+    const name = (emp.name || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
+    const surname = (emp.surname || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
     const cleanName = name.replace(/[^a-z0-9]/g, '');
     const cleanSurname = surname.replace(/[^a-z0-9]/g, '');
     const uid = emp.unique_id?.toLowerCase().trim();
 
     let score = 0;
+    const companyBonus = options?.companyId && emp.company_id === options.companyId ? 10 : 0;
 
-    // Level 1: Unique ID match (highest priority)
-    if (uid && tokens.includes(uid)) {
-      score = 200;
+    // 1. Unique ID match (highest priority)
+    if (uid && (tokens.includes(uid) || filenameAlphaOnly.includes(uid.replace(/[^a-z0-9]/g, '')))) {
+      score = 300 + companyBonus;
     }
-    else if (cleanName && cleanSurname) {
-      const nameSim = getFuzzySubstringSimilarity(filenameAlphaOnly, cleanName);
-      const surnameSim = getFuzzySubstringSimilarity(filenameAlphaOnly, cleanSurname);
-
-      if (nameSim >= 0.75 && surnameSim >= 0.75) {
-        // Level 2: Exact adjacent match
-        if (filenameAlphaOnly.includes(cleanName + cleanSurname) || filenameAlphaOnly.includes(cleanSurname + cleanName)) {
-          score = 100;
-        } else {
-          // Level 2.5: Both match but not adjacent or fuzzy
-          const averageSim = (nameSim + surnameSim) / 2;
-          score = Math.round(averageSim * 100) - 10; // score between 65 and 90
-        }
-      }
+    // 2. Full Name Exact Concat Match (e.g. "zainabbasi" or "abbasizain")
+    else if (cleanName && cleanSurname && (filenameAlphaOnly === cleanName + cleanSurname || filenameAlphaOnly === cleanSurname + cleanName)) {
+      score = 250 + companyBonus;
     }
+    // 3. Full Name Substring Concat Match (e.g. "zainabbasi_contract")
+    else if (cleanName && cleanSurname && (filenameAlphaOnly.includes(cleanName + cleanSurname) || filenameAlphaOnly.includes(cleanSurname + cleanName))) {
+      score = 240 + companyBonus;
+    }
+    // 4. Both Name and Surname present as tokens (e.g. "Zain Abbasi.pdf")
+    else if (cleanName && cleanSurname && tokens.includes(cleanName) && tokens.includes(cleanSurname)) {
+      score = 220 + companyBonus;
+    }
+    // 5. Token match for first name or last name
     else {
-      // Fallback for single-name records in DB
-      const nameSim = cleanName ? getFuzzySubstringSimilarity(filenameAlphaOnly, cleanName) : 0;
-      const surnameSim = cleanSurname ? getFuzzySubstringSimilarity(filenameAlphaOnly, cleanSurname) : 0;
-      const maxSim = Math.max(nameSim, surnameSim);
+      const nameMatch = cleanName && cleanName.length >= 3 && tokens.includes(cleanName);
+      const surnameMatch = cleanSurname && cleanSurname.length >= 3 && tokens.includes(cleanSurname);
 
-      if (maxSim >= 0.75) {
-        score = Math.round(maxSim * 100) - 50; // lower score for single-field match
+      if (nameMatch && surnameMatch) {
+        score = 200 + companyBonus;
+      } else if (nameMatch || surnameMatch) {
+        score = 150 + companyBonus;
+      } else {
+        // 6. Substring match fallback for single field (e.g., "Ahmed.pdf")
+        const nameInFile = cleanName && cleanName.length >= 3 && filenameAlphaOnly.includes(cleanName);
+        const surnameInFile = cleanSurname && cleanSurname.length >= 3 && filenameAlphaOnly.includes(cleanSurname);
+
+        if (nameInFile && surnameInFile) {
+          score = 120 + companyBonus;
+        } else if (nameInFile || surnameInFile) {
+          score = 100 + companyBonus;
+        } else {
+          // 7. Fuzzy matching fallback
+          const nameSim = cleanName ? getFuzzySubstringSimilarity(filenameAlphaOnly, cleanName) : 0;
+          const surnameSim = cleanSurname ? getFuzzySubstringSimilarity(filenameAlphaOnly, cleanSurname) : 0;
+          const maxSim = Math.max(nameSim, surnameSim);
+          if (maxSim >= 0.8) {
+            score = Math.round(maxSim * 80) + companyBonus;
+          }
+        }
       }
     }
 
@@ -358,8 +378,25 @@ export async function performAutoAssign(
   let matchedEmp: typeof employees[0] | null = null;
 
   if (providedEmpId === null) {
-    if (matches.length === 1) {
-      matchedEmp = matches[0];
+    if (bestScore >= 200) {
+      // Full name or Unique ID match
+      if (matches.length === 1) {
+        matchedEmp = matches[0];
+      } else if (matches.length > 1) {
+        if (options?.companyId) {
+          const sameCompMatches = matches.filter(m => m.company_id === options.companyId);
+          if (sameCompMatches.length === 1) {
+            matchedEmp = sameCompMatches[0];
+          }
+        }
+      }
+    } else if (bestScore >= 100) {
+      // Single token match (e.g. "Ahmed.pdf")
+      // Auto-assign ONLY if the name/surname token matches exactly ONE employee.
+      // If multiple users share that name/surname, leave as unassigned.
+      if (matches.length === 1) {
+        matchedEmp = matches[0];
+      }
     }
   }
 
@@ -370,7 +407,6 @@ export async function performAutoAssign(
     finalEmpId = matchedEmp.id;
     finalCompanyId = matchedEmp.company_id;
   } else if (providedEmpId) {
-    // If ID was provided but no match found in our search list, resolve its company explicitly
     const empInfo = await queryOne<{ company_id: number }>(
       `SELECT company_id FROM users WHERE id = $1`,
       [providedEmpId]
@@ -411,20 +447,17 @@ export async function performAutoAssign(
     const empId = finalEmpId;
     const targetCompanyId = finalCompanyId;
 
-    // 1. Update the generic document as assigned AND set the correct company_id
     await query(
       `UPDATE documents SET employee_id = $1, company_id = $2 WHERE id = $3`,
       [empId, targetCompanyId, documentId]
     );
 
-    // 2. Fetch origin doc info to migrate to employee_documents
     const doc = await queryOne<{ file_url: string; mime_type?: string }>(
       `SELECT file_url FROM documents WHERE id = $1`,
       [documentId]
     );
 
     if (doc) {
-      // 3. Fetch first active category for the company automatically
       const categoryRow = await queryOne<{ id: number; name: string }>(
         `SELECT id, name FROM document_categories WHERE company_id = $1 AND is_active = true ORDER BY created_at ASC LIMIT 1`,
         [targetCompanyId]
@@ -432,12 +465,10 @@ export async function performAutoAssign(
       const autoCategoryId = categoryRow?.id || null;
       const autoCategoryName = categoryRow?.name || null;
 
-      // Update the generic document with category name if found
       if (autoCategoryName) {
         await query('UPDATE documents SET category = $1 WHERE id = $2', [autoCategoryName, documentId]);
       }
 
-      // Map extension to mime type
       const ext = path.extname(filename).toLowerCase();
       const mimeMap: Record<string, string> = {
         '.pdf': 'application/pdf',
@@ -451,55 +482,36 @@ export async function performAutoAssign(
       };
       const mimeType = mimeMap[ext] ?? 'application/octet-stream';
 
-      // Insert into employee_documents (the "rich" table)
-      await queryOne<{ id: number }>(
-        `INSERT INTO employee_documents (
-            company_id, employee_id, category_id, file_name, storage_path, mime_type,
-            uploaded_by_user_id, requires_signature, expires_at, is_visible_to_roles
-          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-          RETURNING id`,
-        [
-          targetCompanyId,
-          empId,
-          autoCategoryId,
-          filename,
-          doc.file_url,
-          mimeType,
-          options?.uploadedBy || null,
-          options?.requiresSignature || false,
-          options?.expiresAt || null,
-          options?.visibleToRoles || ['admin', 'hr', 'area_manager', 'store_manager', 'employee']
-        ]
+      const existingEmpDoc = await queryOne<{ id: number }>(
+        `SELECT id FROM employee_documents WHERE storage_path = $1 AND deleted_at IS NULL`,
+        [doc.file_url]
       );
 
-      if (options?.requiresSignature) {
-        const empRow = await queryOne<{ locale?: string }>(`SELECT locale FROM users WHERE id = $1`, [empId]);
-        const userLocale = empRow?.locale || 'it';
-        const title = t(userLocale, 'notifications.document_signature_required.title');
-        const message = t(userLocale, 'notifications.document_signature_required.message');
-
-        await sendNotification({
-          companyId: targetCompanyId,
-          userId: empId,
-          type: 'document.signature_required',
-          title,
-          message,
-          priority: 'high',
-          channels: ['in_app']
-        });
-
-        sendDocumentSignatureEmailAutomation(
-          targetCompanyId,
-          empId,
-          filename,
-          allowedCompanyIds[0]
-        ).catch(err => console.error('[AUTOMATION] Document signature email error:', err));
+      if (!existingEmpDoc) {
+        await query(
+          `INSERT INTO employee_documents (
+            company_id, employee_id, category_id, file_name, storage_path, mime_type,
+            uploaded_by_user_id, is_visible_to_roles, requires_signature, expires_at
+          )
+          SELECT $1, $2, $3, $4, d.file_url, $5, $6, d.is_visible_to_roles, d.requires_signature, d.expires_at
+            FROM documents d WHERE d.id = $7`,
+          [targetCompanyId, empId, autoCategoryId, filename, mimeType, options?.uploadedBy || 0, documentId]
+        );
+      } else {
+        await query(
+          `UPDATE employee_documents
+              SET company_id = $1, employee_id = $2, category_id = $3, file_name = $4, updated_at = NOW()
+            WHERE id = $5`,
+          [targetCompanyId, empId, autoCategoryId, filename, existingEmpDoc.id]
+        );
       }
-
-      return true;
     }
   }
-  return false;
+
+  return {
+    matched: !!finalEmpId,
+    employee: matchedEmp ? { id: matchedEmp.id, name: matchedEmp.name, surname: matchedEmp.surname, companyId: matchedEmp.company_id } : null
+  };
 }
 
 
@@ -544,7 +556,7 @@ router.put(
   requireRole('admin', 'hr'),
   asyncHandler(async (req: Request, res: Response) => {
     const id = parseInt(req.params.id, 10);
-    const { title, employee_id, requires_signature, expires_at, visible_to_roles } = req.body;
+    const { title, employee_id, requires_signature, expires_at, visible_to_roles, company_id } = req.body;
 
     if (!title) {
       badRequest(res, 'Il titolo è obbligatorio', 'MISSING_TITLE');
@@ -588,7 +600,7 @@ router.put(
       // 3. Update DB
       let autoCategoryName: string | null = null;
       let autoCategoryId: number | null = null;
-      let targetCompanyId = req.user!.companyId; // Existing company by default
+      let targetCompanyId = company_id || req.user!.companyId; // Company from body or user company default
 
       if (employee_id) {
         // Resolve company and category for the employee
@@ -693,18 +705,20 @@ router.put(
             );
           }
 
-          if (finalRequiresSignature) {
+          const shouldNotify = req.body.notify === true || req.body.notify === 'true' || req.body.confirm === true || req.body.confirm === 'true';
+
+          if (shouldNotify) {
             const empRow = await queryOne<{ locale?: string }>(`SELECT locale FROM users WHERE id = $1`, [employee_id]);
             const userLocale = empRow?.locale || 'it';
-            const title = t(userLocale, 'notifications.document_signature_required.title');
-            const message = t(userLocale, 'notifications.document_signature_required.message');
+            const notificationTitle = t(userLocale, finalRequiresSignature ? 'notifications.document_signature_required.title' : 'notifications.document_signature_required.title');
+            const notificationMessage = t(userLocale, finalRequiresSignature ? 'notifications.document_signature_required.message' : 'notifications.document_signature_required.message');
 
             await sendNotification({
               companyId: emp.company_id,
               userId: employee_id,
-              type: 'document.signature_required',
-              title,
-              message,
+              type: finalRequiresSignature ? 'document.signature_required' : 'document.assigned',
+              title: notificationTitle,
+              message: notificationMessage,
               priority: 'high',
               channels: ['in_app']
             });
@@ -882,13 +896,24 @@ router.post(
         zip.extractAllTo(extractDir, true);
 
         const entries = zip.getEntries();
+        const extractedFiles: Array<{
+          documentId: number;
+          fileName: string;
+          matched: boolean;
+          employee: any;
+        }> = [];
+
         for (const entry of entries) {
           if (entry.isDirectory) continue;
+          const entryBasename = entry.name ? entry.name.trim() : '';
+          if (!entryBasename || entryBasename.startsWith('.') || entry.entryName.includes('__MACOSX')) {
+            continue;
+          }
 
           const filePath = path.join(extractDir, entry.entryName);
           const doc = await createGenericDocument({
-            companyId: baseCompanyId || 0, // Fallback to 0 if still null, though auto-assign will correct it if matched
-            title: entry.name,
+            companyId: baseCompanyId || 0,
+            title: entryBasename,
             fileUrl: filePath,
             uploadedBy: req.user!.userId,
             requiresSignature: options.requiresSignature,
@@ -896,16 +921,32 @@ router.post(
             isVisibleToRoles: options.visibleToRoles,
           });
 
-          // Rule based auto-assignment
-          await performAutoAssign(doc.id, entry.name, allowedCompanyIds, options);
+          // Rule based auto-assignment (simulated so wizard user can review and confirm assignment)
+          const autoAssignResult = await performAutoAssign(doc.id, entryBasename, allowedCompanyIds, {
+            ...options,
+            simulate: true
+          });
+
+          extractedFiles.push({
+            documentId: doc.id,
+            fileName: entryBasename,
+            matched: autoAssignResult.matched,
+            employee: autoAssignResult.employee
+          });
         }
 
-        ok(res, { success: true, message: 'ZIP extracted and files saved successfully' });
+        ok(res, {
+          isZip: true,
+          totalExtracted: extractedFiles.length,
+          files: extractedFiles,
+          message: `${extractedFiles.length} file(s) extracted from ZIP`
+        });
       } catch (err: any) {
-        badRequest(res, 'ZIP processing failed', 'ZIP_ERROR');
+        badRequest(res, 'ZIP processing failed: ' + (err.message || ''), 'ZIP_ERROR');
       } finally {
-        // Clean up temp zip file
-        if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+        if (fs.existsSync(tempPath)) {
+          try { fs.unlinkSync(tempPath); } catch { /* ignore */ }
+        }
       }
     } else {
       // Handle Single File
