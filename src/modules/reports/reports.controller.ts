@@ -285,7 +285,9 @@ export const sendReportNow = asyncHandler(async (req: Request, res: Response) =>
       custom_start: null,
       custom_end: null,
       store_id: req.user?.storeId ?? null,
-    } as any;
+      // Cast to the row type, not `any`: assigning `any` to a `T | null`
+      // variable leaves it nullable, so every later `config.x` read errors.
+    } as ReportConfigRow;
   }
 
   let parsedRecipients: string[] = [];
