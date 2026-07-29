@@ -470,7 +470,7 @@ export async function listJobs(
 export async function getPublishedJobsForFeed(identifier: string): Promise<{ company: FeedCompany | null; jobs: FeedJob[] }> {
   const normalizedIdentifier = identifier.trim().toLowerCase();
 
-  if (normalizedIdentifier === '1' || normalizedIdentifier === 'all') {
+  if (normalizedIdentifier === 'all') {
     const rows = await query<Record<string, unknown>>(
       `SELECT j.*,
               c.name AS company_name,

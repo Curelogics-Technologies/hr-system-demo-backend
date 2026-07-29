@@ -10,6 +10,9 @@ import {
   deleteEmployeePermanently,
   activateEmployee,
   resetEmployeeDevice,
+  getImportTemplates,
+  saveImportTemplate,
+  deleteImportTemplate,
 } from './employees.controller';
 import { authenticate, requireRole, enforceCompany, requireModulePermission } from '../../middleware/auth';
 import { validate } from '../../middleware/validate';
@@ -174,6 +177,34 @@ router.delete(
   enforceCompany,
   requireRole('admin', 'hr', 'area_manager', 'store_manager', 'employee'),
   deleteAvatar,
+);
+
+// Import templates routes
+router.get(
+  '/import-templates',
+  authenticate,
+  enforceCompany,
+  requireRole('admin', 'hr'),
+  requireModulePermission('dipendenti', 'read'),
+  getImportTemplates,
+);
+
+router.post(
+  '/import-templates',
+  authenticate,
+  enforceCompany,
+  requireRole('admin', 'hr'),
+  requireModulePermission('dipendenti', 'write'),
+  saveImportTemplate,
+);
+
+router.delete(
+  '/import-templates/:id',
+  authenticate,
+  enforceCompany,
+  requireRole('admin', 'hr'),
+  requireModulePermission('dipendenti', 'write'),
+  deleteImportTemplate,
 );
 
 export default router;
