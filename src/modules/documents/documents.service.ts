@@ -733,8 +733,8 @@ export async function restoreDocument(
          SET is_deleted = false, 
              deleted_at = NULL,
              restored_at = NOW(), restored_by = $2, updated_at = NOW()
-       WHERE file_url = $1 AND is_deleted = true
-    `, [storagePath, restoredBy]);
+       WHERE (file_url = $1 OR id = $3) AND is_deleted = true
+    `, [storagePath, restoredBy, id]);
 
     // Table: employee_documents
     await client.query(`
@@ -742,8 +742,8 @@ export async function restoreDocument(
          SET is_deleted = false, 
              deleted_at = NULL,
              restored_at = NOW(), restored_by = $2, updated_at = NOW()
-       WHERE storage_path = $1 AND is_deleted = true
-    `, [storagePath, restoredBy]);
+       WHERE (storage_path = $1 OR id = $3) AND is_deleted = true
+    `, [storagePath, restoredBy, id]);
 
     await client.query('COMMIT');
     return true;
