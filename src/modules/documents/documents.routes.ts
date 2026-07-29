@@ -1733,7 +1733,7 @@ router.delete(
 router.get(
   '/trash',
   authenticate,
-  requireRole('admin', 'hr'),
+  requireModulePermission('documenti', 'read'),
   asyncHandler(async (req: Request, res: Response) => {
     const user = req.user!;
     const allowedCompanyIds = await resolveAllowedCompanyIds(user);
