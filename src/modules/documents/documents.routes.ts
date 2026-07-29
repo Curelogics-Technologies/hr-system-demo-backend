@@ -22,6 +22,8 @@ import {
   permanentlyDeleteDocument,
 } from './documents.service';
 import { resolveAllowedCompanyIds } from '../../utils/companyScope';
+import { matchEmployeeByFilename, MatchableEmployee, MatchCandidate, MatchOutcome, MatchReason } from './employeeMatcher';
+import { isSupportedDocumentFile, mimeTypeForFilename, isArchiveNoise } from './documentFileTypes';
 import { query, queryOne, pool } from '../../config/database';
 import multer from 'multer';
 import path from 'path';
@@ -158,22 +160,9 @@ const genericStorage = multer.diskStorage({
 const uploadUnifiedMulter = multer({
   storage: genericStorage,
   limits: { fileSize: 100 * 1024 * 1024 }, // 100 MB
-  fileFilter: (_req, file, cb) => {
-    const allowed = [
-      ...allowedDocMime,
-      'application/zip',
-      'application/x-zip-compressed',
-      'application/rar',
-      'application/x-rar-compressed',
-      'application/x-7z-compressed',
-      'application/octet-stream'
-    ];
-    const ext = path.extname(file.originalname).toLowerCase();
-    if (allowed.includes(file.mimetype) || ['.zip', '.rar', '.7z'].includes(ext)) {
-      cb(null, true);
-    } else {
-      cb(new Error('INVALID_FILE_TYPE'));
-    }
+  fileFilter: (_req, _file, cb) => {
+    // Accept any file; format validation happens gracefully inside the route handler
+    cb(null, true);
   },
 }).single('file');
 
@@ -184,69 +173,37 @@ const uploadUnifiedMiddleware = (req: Request, res: Response, next: NextFunction
       badRequest(res, 'File too large (max 100MB)', 'FILE_TOO_LARGE');
       return;
     }
-    if (err.message === 'INVALID_FILE_TYPE') {
-      badRequest(res, 'Unsupported file type. Use PDF, JPG, PNG, ZIP, RAR or 7Z', 'INVALID_FILE_TYPE');
-      return;
-    }
     next(err);
   });
 };
 
-// Helper for fuzzy string matching (Levenshtein distance)
-function getLevenshteinDistance(a: string, b: string): number {
-  const matrix = Array.from({ length: a.length + 1 }, () => Array(b.length + 1).fill(0));
-  for (let i = 0; i <= a.length; i++) matrix[i][0] = i;
-  for (let j = 0; j <= b.length; j++) matrix[0][j] = j;
-
-  for (let i = 1; i <= a.length; i++) {
-    for (let j = 1; j <= b.length; j++) {
-      if (a[i - 1] === b[j - 1]) {
-        matrix[i][j] = matrix[i - 1][j - 1];
-      } else {
-        matrix[i][j] = Math.min(
-          matrix[i - 1][j] + 1, // deletion
-          matrix[i][j - 1] + 1, // insertion
-          matrix[i - 1][j - 1] + 1 // substitution
-        );
-      }
-    }
-  }
-  return matrix[a.length][b.length];
-}
-
-// Sliding window similarity check to find fuzzy substrings of any order
-function getFuzzySubstringSimilarity(filename: string, pattern: string): number {
-  if (!filename || !pattern) return 0;
-  if (filename.includes(pattern)) return 1.0;
-
-  let maxSim = 0;
-  const windowSize = pattern.length;
-
-  for (let i = 0; i <= filename.length - windowSize; i++) {
-    const sub = filename.substring(i, i + windowSize);
-    const dist = getLevenshteinDistance(sub, pattern);
-    const sim = 1 - dist / windowSize;
-    if (sim > maxSim) {
-      maxSim = sim;
-    }
-  }
-
-  for (let w = Math.max(3, windowSize - 2); w <= Math.min(filename.length, windowSize + 2); w++) {
-    for (let i = 0; i <= filename.length - w; i++) {
-      const sub = filename.substring(i, i + w);
-      const dist = getLevenshteinDistance(sub, pattern);
-      const maxLen = Math.max(sub.length, pattern.length);
-      const sim = 1 - dist / maxLen;
-      if (sim > maxSim) {
-        maxSim = sim;
-      }
-    }
-  }
-
-  return maxSim;
-}
-
 // --- Step 2 Auto-assignment Logic ---
+//
+// Matching itself lives in ./employeeMatcher. The rule, agreed with the client:
+// auto-assign only on an unambiguous match of BOTH first name and surname;
+// anything else stays unassigned for the operator to resolve by hand.
+
+export interface AutoAssignResult {
+  matched: boolean;
+  outcome: MatchOutcome;
+  reason: MatchReason;
+  employee: { id: number; name: string; surname: string; companyId: number | null } | null;
+  /** Ranked suggestions for the manual step. Never written to the database. */
+  suggestions: Array<{
+    id: number;
+    name: string;
+    surname: string;
+    companyId: number | null;
+    reason: MatchReason;
+  }>;
+}
+
+const toEmployeeRef = (emp: MatchableEmployee) => ({
+  id: emp.id,
+  name: emp.name || '',
+  surname: emp.surname || '',
+  companyId: emp.company_id,
+});
 
 export async function performAutoAssign(
   documentId: number,
@@ -262,7 +219,7 @@ export async function performAutoAssign(
     companyId?: number | null;
     simulate?: boolean;
   },
-): Promise<any> {
+): Promise<AutoAssignResult> {
   const isGlobalSearch = options?.isSuperAdmin || !allowedCompanyIds || allowedCompanyIds.length === 0;
 
   let companyFilterSql = '';
@@ -273,175 +230,63 @@ export async function performAutoAssign(
     params = [allowedCompanyIds];
   }
 
-  // Fetch employees in allowed company scope (or all active/pending users for global search)
-  const employees = await query<{
-    id: number;
-    name: string;
-    surname: string;
-    unique_id: string | null;
-    company_id: number;
-  }>(
-    `SELECT id, name, surname, unique_id, company_id 
-       FROM users 
-      WHERE (status = 'active' OR status IS NULL OR status = 'pending')
-        AND role NOT IN ('admin', 'store_terminal')
+  // Candidate pool: real people only. Terminals and admins never hold payslips.
+  const employees = await query<MatchableEmployee>(
+    `SELECT id, name, surname, unique_id, company_id
+       FROM users
+      WHERE (status = 'active' OR status IS NULL)
+        AND role NOT IN ('admin', 'store_terminal', 'system_admin')
         ${companyFilterSql}`,
     params,
   );
 
-  // Normalize filename for matching: remove extension and trim
-  const cleanBaseName = filename.replace(/\.[^.]+$/i, '').trim();
-  const normalizedFile = cleanBaseName.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-  const tokens = normalizedFile.split(/[_\s.-]+/).filter(Boolean);
-  const filenameAlphaOnly = normalizedFile.replace(/[^a-z0-9]/g, '');
+  const match = matchEmployeeByFilename(filename, employees, {
+    // The company chosen in the wizard is a hard gate, not a tie-breaker.
+    companyId: options?.companyId ?? null,
+  });
 
-  let bestScore = 0;
-  let matches: typeof employees = [];
-
-  for (const emp of employees) {
-    if (!emp.name && !emp.surname) continue;
-
-    const name = (emp.name || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
-    const surname = (emp.surname || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
-    const cleanName = name.replace(/[^a-z0-9]/g, '');
-    const cleanSurname = surname.replace(/[^a-z0-9]/g, '');
-    const uid = emp.unique_id?.toLowerCase().trim();
-
-    let score = 0;
-    const companyBonus = options?.companyId && emp.company_id === options.companyId ? 10 : 0;
-
-    // 1. Unique ID match (highest priority)
-    if (uid && (tokens.includes(uid) || filenameAlphaOnly.includes(uid.replace(/[^a-z0-9]/g, '')))) {
-      score = 300 + companyBonus;
-    }
-    // 2. Full Name Exact Concat Match (e.g. "zainabbasi" or "abbasizain")
-    else if (cleanName && cleanSurname && (filenameAlphaOnly === cleanName + cleanSurname || filenameAlphaOnly === cleanSurname + cleanName)) {
-      score = 250 + companyBonus;
-    }
-    // 3. Full Name Substring Concat Match (e.g. "zainabbasi_contract")
-    else if (cleanName && cleanSurname && (filenameAlphaOnly.includes(cleanName + cleanSurname) || filenameAlphaOnly.includes(cleanSurname + cleanName))) {
-      score = 240 + companyBonus;
-    }
-    // 4. Both Name and Surname present as tokens (e.g. "Zain Abbasi.pdf")
-    else if (cleanName && cleanSurname && tokens.includes(cleanName) && tokens.includes(cleanSurname)) {
-      score = 220 + companyBonus;
-    }
-    // 5. Token match for first name or last name
-    else {
-      const nameMatch = cleanName && cleanName.length >= 3 && tokens.includes(cleanName);
-      const surnameMatch = cleanSurname && cleanSurname.length >= 3 && tokens.includes(cleanSurname);
-
-      if (nameMatch && surnameMatch) {
-        score = 200 + companyBonus;
-      } else if (nameMatch || surnameMatch) {
-        score = 150 + companyBonus;
-      } else {
-        // 6. Substring match fallback for single field (e.g., "Ahmed.pdf")
-        const nameInFile = cleanName && cleanName.length >= 3 && filenameAlphaOnly.includes(cleanName);
-        const surnameInFile = cleanSurname && cleanSurname.length >= 3 && filenameAlphaOnly.includes(cleanSurname);
-
-        if (nameInFile && surnameInFile) {
-          score = 120 + companyBonus;
-        } else if (nameInFile || surnameInFile) {
-          score = 100 + companyBonus;
-        } else {
-          // 7. Fuzzy matching fallback
-          const nameSim = cleanName ? getFuzzySubstringSimilarity(filenameAlphaOnly, cleanName) : 0;
-          const surnameSim = cleanSurname ? getFuzzySubstringSimilarity(filenameAlphaOnly, cleanSurname) : 0;
-          const maxSim = Math.max(nameSim, surnameSim);
-          if (maxSim >= 0.8) {
-            score = Math.round(maxSim * 80) + companyBonus;
-          }
-        }
-      }
-    }
-
-    if (score > 0) {
-      if (score > bestScore) {
-        bestScore = score;
-        matches = [emp];
-      } else if (score === bestScore) {
-        matches.push(emp);
-      }
-    }
-  }
-
-  // Parse provided employee ID safely
+  // An explicit employee chosen by the operator always wins over automation.
   let providedEmpId: number | null = null;
   if (options?.employeeId !== undefined && options?.employeeId !== null) {
     const parsed = Number(options.employeeId);
-    if (Number.isFinite(parsed) && parsed > 0) {
-      providedEmpId = parsed;
-    }
+    if (Number.isFinite(parsed) && parsed > 0) providedEmpId = parsed;
   }
 
-  let matchedEmp: typeof employees[0] | null = null;
-
-  if (providedEmpId === null) {
-    if (bestScore >= 200) {
-      // Full name or Unique ID match
-      if (matches.length === 1) {
-        matchedEmp = matches[0];
-      } else if (matches.length > 1) {
-        if (options?.companyId) {
-          const sameCompMatches = matches.filter(m => m.company_id === options.companyId);
-          if (sameCompMatches.length === 1) {
-            matchedEmp = sameCompMatches[0];
-          }
-        }
-      }
-    } else if (bestScore >= 100) {
-      // Single token match (e.g. "Ahmed.pdf")
-      // Auto-assign ONLY if the name/surname token matches exactly ONE employee.
-      // If multiple users share that name/surname, leave as unassigned.
-      if (matches.length === 1) {
-        matchedEmp = matches[0];
-      }
-    }
-  }
+  const suggestions = match.candidates.slice(0, 8).map((c: MatchCandidate) => ({
+    ...toEmployeeRef(c.employee),
+    reason: c.reason,
+  }));
 
   let finalEmpId: number | null = providedEmpId;
   let finalCompanyId: number | null = null;
+  let resolvedEmployee: { id: number; name: string; surname: string; companyId: number | null } | null = null;
 
-  if (matchedEmp) {
-    finalEmpId = matchedEmp.id;
-    finalCompanyId = matchedEmp.company_id;
-  } else if (providedEmpId) {
-    const empInfo = await queryOne<{ company_id: number }>(
-      `SELECT company_id FROM users WHERE id = $1`,
-      [providedEmpId]
+  if (providedEmpId !== null) {
+    const empInfo = await queryOne<{ id: number; name: string; surname: string; company_id: number }>(
+      `SELECT id, name, surname, company_id FROM users WHERE id = $1`,
+      [providedEmpId],
     );
-    finalCompanyId = empInfo?.company_id || (allowedCompanyIds.length > 0 ? allowedCompanyIds[0] : 0);
+    if (empInfo) {
+      resolvedEmployee = { id: empInfo.id, name: empInfo.name, surname: empInfo.surname, companyId: empInfo.company_id };
+      finalCompanyId = empInfo.company_id;
+    } else {
+      finalCompanyId = options?.companyId ?? (allowedCompanyIds.length > 0 ? allowedCompanyIds[0] : null);
+    }
+  } else if (match.outcome === 'assigned' && match.employee) {
+    finalEmpId = match.employee.id;
+    finalCompanyId = match.employee.company_id;
+    resolvedEmployee = toEmployeeRef(match.employee);
   }
 
-  if (options?.simulate) {
-    let returnEmp = null;
-    if (matchedEmp) {
-      returnEmp = {
-        id: matchedEmp.id,
-        name: matchedEmp.name,
-        surname: matchedEmp.surname,
-        companyId: matchedEmp.company_id
-      };
-    } else if (finalEmpId) {
-      const emp = await queryOne<{ id: number; name: string; surname: string; company_id: number }>(
-        `SELECT id, name, surname, company_id FROM users WHERE id = $1`,
-        [finalEmpId]
-      );
-      if (emp) {
-        returnEmp = {
-          id: emp.id,
-          name: emp.name,
-          surname: emp.surname,
-          companyId: emp.company_id
-        };
-      }
-    }
-    return {
-      matched: !!finalEmpId,
-      employee: returnEmp
-    };
-  }
+  const result: AutoAssignResult = {
+    matched: !!finalEmpId,
+    outcome: providedEmpId !== null ? 'assigned' : match.outcome,
+    reason: match.reason,
+    employee: resolvedEmployee,
+    suggestions,
+  };
+
+  if (options?.simulate) return result;
 
   if (finalEmpId && finalCompanyId) {
     const empId = finalEmpId;
@@ -449,18 +294,18 @@ export async function performAutoAssign(
 
     await query(
       `UPDATE documents SET employee_id = $1, company_id = $2 WHERE id = $3`,
-      [empId, targetCompanyId, documentId]
+      [empId, targetCompanyId, documentId],
     );
 
-    const doc = await queryOne<{ file_url: string; mime_type?: string }>(
+    const doc = await queryOne<{ file_url: string }>(
       `SELECT file_url FROM documents WHERE id = $1`,
-      [documentId]
+      [documentId],
     );
 
     if (doc) {
       const categoryRow = await queryOne<{ id: number; name: string }>(
         `SELECT id, name FROM document_categories WHERE company_id = $1 AND is_active = true ORDER BY created_at ASC LIMIT 1`,
-        [targetCompanyId]
+        [targetCompanyId],
       );
       const autoCategoryId = categoryRow?.id || null;
       const autoCategoryName = categoryRow?.name || null;
@@ -469,22 +314,11 @@ export async function performAutoAssign(
         await query('UPDATE documents SET category = $1 WHERE id = $2', [autoCategoryName, documentId]);
       }
 
-      const ext = path.extname(filename).toLowerCase();
-      const mimeMap: Record<string, string> = {
-        '.pdf': 'application/pdf',
-        '.jpg': 'image/jpeg',
-        '.jpeg': 'image/jpeg',
-        '.png': 'image/png',
-        '.webp': 'image/webp',
-        '.bin': 'application/octet-stream',
-        '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-        '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-      };
-      const mimeType = mimeMap[ext] ?? 'application/octet-stream';
+      const mimeType = mimeTypeForFilename(filename);
 
       const existingEmpDoc = await queryOne<{ id: number }>(
         `SELECT id FROM employee_documents WHERE storage_path = $1 AND deleted_at IS NULL`,
-        [doc.file_url]
+        [doc.file_url],
       );
 
       if (!existingEmpDoc) {
@@ -495,23 +329,20 @@ export async function performAutoAssign(
           )
           SELECT $1, $2, $3, $4, d.file_url, $5, $6, d.is_visible_to_roles, d.requires_signature, d.expires_at
             FROM documents d WHERE d.id = $7`,
-          [targetCompanyId, empId, autoCategoryId, filename, mimeType, options?.uploadedBy || 0, documentId]
+          [targetCompanyId, empId, autoCategoryId, filename, mimeType, options?.uploadedBy || 0, documentId],
         );
       } else {
         await query(
           `UPDATE employee_documents
               SET company_id = $1, employee_id = $2, category_id = $3, file_name = $4, updated_at = NOW()
             WHERE id = $5`,
-          [targetCompanyId, empId, autoCategoryId, filename, existingEmpDoc.id]
+          [targetCompanyId, empId, autoCategoryId, filename, existingEmpDoc.id],
         );
       }
     }
   }
 
-  return {
-    matched: !!finalEmpId,
-    employee: matchedEmp ? { id: matchedEmp.id, name: matchedEmp.name, surname: matchedEmp.surname, companyId: matchedEmp.company_id } : null
-  };
+  return result;
 }
 
 
@@ -556,7 +387,7 @@ router.put(
   requireRole('admin', 'hr'),
   asyncHandler(async (req: Request, res: Response) => {
     const id = parseInt(req.params.id, 10);
-    const { title, employee_id, requires_signature, expires_at, visible_to_roles, company_id } = req.body;
+    const { title, employee_id, requires_signature, expires_at, visible_to_roles, company_id, category } = req.body;
 
     if (!title) {
       badRequest(res, 'Il titolo è obbligatorio', 'MISSING_TITLE');
@@ -616,13 +447,33 @@ router.put(
 
         if (emp) {
           targetCompanyId = emp.company_id; // Sync document to employee's company
-          const categoryRow = await queryOne<{ id: number; name: string }>(
-            `SELECT id, name FROM document_categories WHERE company_id = $1 AND is_active = true ORDER BY created_at ASC LIMIT 1`,
-            [emp.company_id]
-          );
-          autoCategoryId = categoryRow?.id || null;
-          autoCategoryName = categoryRow?.name || null;
         }
+      }
+
+      // An explicit category always wins. Only fall back to "the company's
+      // first category" when the caller did not choose one - otherwise a
+      // company with several categories could never keep the operator's pick.
+      const requestedCategory = typeof category === 'string' ? category.trim() : '';
+      if (requestedCategory) {
+        const categoryRow = await queryOne<{ id: number; name: string }>(
+          `SELECT id, name FROM document_categories
+            WHERE company_id = $1 AND is_active = true AND LOWER(TRIM(name)) = LOWER($2)
+            LIMIT 1`,
+          [targetCompanyId, requestedCategory],
+        );
+        if (!categoryRow) {
+          badRequest(res, `Categoria non valida per questa azienda: "${requestedCategory}"`, 'INVALID_CATEGORY');
+          return;
+        }
+        autoCategoryId = categoryRow.id;
+        autoCategoryName = categoryRow.name;
+      } else if (employee_id && targetCompanyId) {
+        const categoryRow = await queryOne<{ id: number; name: string }>(
+          `SELECT id, name FROM document_categories WHERE company_id = $1 AND is_active = true ORDER BY created_at ASC LIMIT 1`,
+          [targetCompanyId],
+        );
+        autoCategoryId = categoryRow?.id || null;
+        autoCategoryName = categoryRow?.name || null;
       }
 
       // Sync metadata from body if provided, otherwise keep existing
@@ -639,6 +490,8 @@ router.put(
         }
       }
 
+      const isConfirming = req.body.confirm === true || req.body.confirm === 'true';
+
       await query(
         `UPDATE documents
             SET title = $1,
@@ -648,16 +501,16 @@ router.put(
                 company_id = $5,
                 requires_signature = $6,
                 expires_at = $7,
-                is_visible_to_roles = $8
+                is_visible_to_roles = $8,
+                is_confirmed = (is_confirmed = true OR $10::boolean)
           WHERE id = $9`,
-        [newTitle, newPath, employee_id || null, autoCategoryName, targetCompanyId || 0, finalRequiresSignature, finalExpiresAt, finalVisibleToRolesArr, id]
+        [newTitle, newPath, employee_id || null, autoCategoryName, targetCompanyId || 0, finalRequiresSignature, finalExpiresAt, finalVisibleToRolesArr, id, isConfirming]
       );
 
-      // 4. Migration/Sync to employee_documents
-      // We look for existing record using the OLD path (doc.file_url) 
+      // 4. Migration/Sync to employee_documents ONLY when confirming
       const existing = await queryOne<{ id: number }>(`SELECT id FROM employee_documents WHERE storage_path = $1 AND deleted_at IS NULL`, [doc.file_url]);
 
-      if (employee_id) {
+      if (employee_id && isConfirming) {
         // Fetch companyId of the employee to ensure multi-tenant safety
         const emp = await queryOne<{ company_id: number }>(
           `SELECT company_id FROM users WHERE id = $1`,
@@ -899,15 +752,37 @@ router.post(
         const extractedFiles: Array<{
           documentId: number;
           fileName: string;
+          size: number;
+          mimeType: string;
           matched: boolean;
+          outcome: MatchOutcome;
+          reason: MatchReason;
           employee: any;
+          suggestions: any[];
         }> = [];
+        // Entries we deliberately did not import, reported in the summary so a
+        // companion .xml no longer silently becomes a "document".
+        const skippedFiles: Array<{ fileName: string; size: number; reason: 'unsupported_format' }> = [];
+        const seenNames = new Map<string, number>();
+        const duplicateFiles: Array<{ fileName: string; firstDocumentId: number }> = [];
 
         for (const entry of entries) {
           if (entry.isDirectory) continue;
           const entryBasename = entry.name ? entry.name.trim() : '';
-          if (!entryBasename || entryBasename.startsWith('.') || entry.entryName.includes('__MACOSX')) {
+          if (isArchiveNoise(entry.entryName, entryBasename)) continue;
+
+          const size = entry.header?.size ?? 0;
+
+          if (!isSupportedDocumentFile(entryBasename)) {
+            skippedFiles.push({ fileName: entryBasename, size, reason: 'unsupported_format' });
             continue;
+          }
+
+          // Same filename twice in one archive: import both, but flag it - two
+          // payslips with the same name usually means a packaging mistake.
+          const previous = seenNames.get(entryBasename.toLowerCase());
+          if (previous !== undefined) {
+            duplicateFiles.push({ fileName: entryBasename, firstDocumentId: previous });
           }
 
           const filePath = path.join(extractDir, entry.entryName);
@@ -921,7 +796,10 @@ router.post(
             isVisibleToRoles: options.visibleToRoles,
           });
 
-          // Rule based auto-assignment (simulated so wizard user can review and confirm assignment)
+          if (previous === undefined) seenNames.set(entryBasename.toLowerCase(), doc.id);
+
+          // Simulated so the wizard user reviews and confirms before anything is
+          // written to the employee's personal area.
           const autoAssignResult = await performAutoAssign(doc.id, entryBasename, allowedCompanyIds, {
             ...options,
             simulate: true
@@ -930,15 +808,30 @@ router.post(
           extractedFiles.push({
             documentId: doc.id,
             fileName: entryBasename,
+            size,
+            mimeType: mimeTypeForFilename(entryBasename),
             matched: autoAssignResult.matched,
-            employee: autoAssignResult.employee
+            outcome: autoAssignResult.outcome,
+            reason: autoAssignResult.reason,
+            employee: autoAssignResult.employee,
+            suggestions: autoAssignResult.suggestions
           });
         }
 
         ok(res, {
           isZip: true,
+          totalEntries: extractedFiles.length + skippedFiles.length,
           totalExtracted: extractedFiles.length,
           files: extractedFiles,
+          skipped: skippedFiles,
+          duplicates: duplicateFiles,
+          summary: {
+            assigned: extractedFiles.filter(f => f.outcome === 'assigned').length,
+            ambiguous: extractedFiles.filter(f => f.outcome === 'ambiguous').length,
+            unmatched: extractedFiles.filter(f => f.outcome === 'unmatched').length,
+            skipped: skippedFiles.length,
+            duplicates: duplicateFiles.length,
+          },
           message: `${extractedFiles.length} file(s) extracted from ZIP`
         });
       } catch (err: any) {
@@ -950,6 +843,22 @@ router.post(
       }
     } else {
       // Handle Single File
+      if (!isSupportedDocumentFile(originalname)) {
+        if (fs.existsSync(tempPath)) {
+          try { fs.unlinkSync(tempPath); } catch { /* ignore */ }
+        }
+        ok(res, {
+          isZip: false,
+          totalEntries: 1,
+          totalExtracted: 0,
+          files: [],
+          skipped: [{ fileName: originalname, size: req.file.size ?? 0, reason: 'unsupported_format' }],
+          duplicates: [],
+          message: `File ${originalname} non supportato ed è stato ignorato`
+        });
+        return;
+      }
+
       const destPath = path.join(DOCUMENTS_SINGLE_DIR, req.file.filename);
       fs.renameSync(tempPath, destPath);
 
@@ -973,10 +882,107 @@ router.post(
         matched: autoAssignResult.matched,
         documentId: doc.id,
         fileName: originalname,
-        employee: autoAssignResult.employee
+        size: req.file.size ?? 0,
+        mimeType: mimeTypeForFilename(originalname),
+        outcome: autoAssignResult.outcome,
+        reason: autoAssignResult.reason,
+        employee: autoAssignResult.employee,
+        suggestions: autoAssignResult.suggestions
       });
     }
 
+  }),
+);
+
+// ---------------------------------------------------------------------------
+// POST /api/documents/cleanup-drafts
+// ---------------------------------------------------------------------------
+
+router.post(
+  '/cleanup-drafts',
+  authenticate,
+  requireRole('admin', 'hr'),
+  asyncHandler(async (req: Request, res: Response) => {
+    const { documentIds } = req.body as { documentIds?: number[] };
+    if (Array.isArray(documentIds) && documentIds.length > 0) {
+      await query(
+        `DELETE FROM documents WHERE id = ANY($1) AND (is_confirmed = false OR is_confirmed IS NULL)`,
+        [documentIds]
+      );
+    }
+    ok(res, { success: true });
+  })
+);
+
+// ---------------------------------------------------------------------------
+// POST /api/documents/match-preview
+//
+// Re-evaluate document matching against a company without persisting
+// anything. Needed because the company chosen in step 2 is a hard gate on
+// auto-assignment: if the operator changes company after the files were
+// uploaded, the matches computed at upload time are no longer valid.
+// ---------------------------------------------------------------------------
+
+router.post(
+  '/match-preview',
+  authenticate,
+  requireRole('admin', 'hr'),
+  asyncHandler(async (req: Request, res: Response) => {
+    const { files, company_id } = req.body as {
+      files?: Array<{ documentId?: number; fileName?: string }>;
+      company_id?: number | string | null;
+    };
+
+    if (!Array.isArray(files) || files.length === 0) {
+      badRequest(res, 'Nessun file da analizzare', 'NO_FILES');
+      return;
+    }
+
+    const companyId =
+      company_id !== undefined && company_id !== null && String(company_id) !== 'null'
+        ? parseInt(String(company_id), 10)
+        : null;
+
+    const allowedCompanyIds = await resolveAllowedCompanyIds(req.user!);
+    const isGlobalSearch = req.user!.is_super_admin || allowedCompanyIds.length === 0;
+
+    const employees = await query<MatchableEmployee>(
+      `SELECT id, name, surname, unique_id, company_id
+         FROM users
+        WHERE (status = 'active' OR status IS NULL)
+          AND role NOT IN ('admin', 'store_terminal', 'system_admin')
+          ${isGlobalSearch ? '' : 'AND (company_id = ANY($1) OR company_id IS NULL)'}`,
+      isGlobalSearch ? [] : [allowedCompanyIds],
+    );
+
+    const results = files.map((f) => {
+      const fileName = String(f?.fileName ?? '');
+      const match = matchEmployeeByFilename(fileName, employees, { companyId });
+      return {
+        documentId: f?.documentId ?? null,
+        fileName,
+        matched: match.outcome === 'assigned',
+        outcome: match.outcome,
+        reason: match.reason,
+        employee: match.employee
+          ? {
+              id: match.employee.id,
+              name: match.employee.name || '',
+              surname: match.employee.surname || '',
+              companyId: match.employee.company_id,
+            }
+          : null,
+        suggestions: match.candidates.slice(0, 8).map((c) => ({
+          id: c.employee.id,
+          name: c.employee.name || '',
+          surname: c.employee.surname || '',
+          companyId: c.employee.company_id,
+          reason: c.reason,
+        })),
+      };
+    });
+
+    ok(res, { files: results });
   }),
 );
 
@@ -1035,25 +1041,51 @@ router.post(
       return;
     }
 
-    try {
-      const existing = await queryOne(`SELECT id FROM document_categories WHERE company_id = $1`, [targetCompanyId]);
-      if (existing) {
-        conflict(res, 'Questa azienda ha già una categoria. Puoi solo modificarla.', 'CATEGORY_EXISTS');
-        return;
-      }
+    const trimmedName = name.trim();
 
-      const category = await createCategory(targetCompanyId, name.trim());
+    // A company may have as many categories as it likes; what it may not have
+    // is two categories with the same name. The previous check tested only
+    // `company_id`, so once a company had any category at all, creating another
+    // one always failed with "this company already has a category".
+    const duplicate = await queryOne<{ id: number; name: string; is_active: boolean }>(
+      `SELECT id, name, is_active
+         FROM document_categories
+        WHERE company_id = $1
+          AND LOWER(TRIM(name)) = LOWER($2)
+        LIMIT 1`,
+      [targetCompanyId, trimmedName],
+    );
 
-      // Retroactive assignment:
-      // 1. Update employee_documents
-      await query(
-        `UPDATE employee_documents 
-            SET category_id = $1 
-          WHERE company_id = $2 AND category_id IS NULL AND deleted_at IS NULL`,
-        [category.id, targetCompanyId]
+    if (duplicate) {
+      conflict(
+        res,
+        duplicate.is_active
+          ? `Esiste già una categoria chiamata "${duplicate.name}" per questa azienda. Scegli un nome diverso.`
+          : `Esiste già una categoria chiamata "${duplicate.name}" per questa azienda, ma è disattivata. Riattivala invece di crearne una nuova.`,
+        'CATEGORY_NAME_EXISTS',
       );
+      return;
+    }
 
-      // 2. Update generic documents table for consistency
+    // Was this company's first category? If so - and only then - adopt the
+    // documents that have no category yet, which is what the original
+    // behaviour intended. Doing this for every new category would sweep
+    // unrelated documents into whatever was created last.
+    const existingCount = await queryOne<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM document_categories WHERE company_id = $1`,
+      [targetCompanyId],
+    );
+    const isFirstCategory = Number(existingCount?.count ?? '0') === 0;
+
+    const category = await createCategory(targetCompanyId, trimmedName);
+
+    if (isFirstCategory) {
+      await query(
+        `UPDATE employee_documents
+            SET category_id = $1
+          WHERE company_id = $2 AND category_id IS NULL AND deleted_at IS NULL`,
+        [category.id, targetCompanyId],
+      );
       await query(
         `UPDATE documents d
             SET category = $1
@@ -1061,13 +1093,11 @@ router.post(
           WHERE d.employee_id = u.id
             AND u.company_id = $2
             AND d.category IS NULL`,
-        [category.name, targetCompanyId]
+        [category.name, targetCompanyId],
       );
-
-      created(res, category, 'Categoria creata con successo');
-    } catch (err: any) {
-      throw err;
     }
+
+    created(res, category, 'Categoria creata con successo');
   }),
 );
 
@@ -1117,33 +1147,74 @@ router.patch(
       return;
     }
 
-    try {
-      const updated = await updateCategory(id, sourceCompanyId, {
-        name: name !== undefined ? name.trim() : undefined,
-        isActive: is_active,
-        companyId: destinationCompanyId,
-      });
+    // The category being changed, so we know its old name and can reject a
+    // rename that would collide with another category of the same company.
+    const before = await queryOne<{ name: string; company_id: number }>(
+      `SELECT name, company_id FROM document_categories WHERE id = $1 AND company_id = $2`,
+      [id, sourceCompanyId],
+    );
 
-      if (!updated) {
-        notFound(res, 'Categoria non trovata per l\'azienda specificata', 'NOT_FOUND');
+    if (!before) {
+      notFound(res, 'Categoria non trovata per l\'azienda specificata', 'NOT_FOUND');
+      return;
+    }
+
+    if (name !== undefined) {
+      const targetCompany = destinationCompanyId ?? before.company_id;
+      const clash = await queryOne<{ name: string }>(
+        `SELECT name FROM document_categories
+          WHERE company_id = $1
+            AND LOWER(TRIM(name)) = LOWER($2)
+            AND id <> $3
+          LIMIT 1`,
+        [targetCompany, name.trim(), id],
+      );
+      if (clash) {
+        conflict(
+          res,
+          `Esiste già una categoria chiamata "${clash.name}" per questa azienda. Scegli un nome diverso.`,
+          'CATEGORY_NAME_EXISTS',
+        );
         return;
       }
-
-      if (name !== undefined) {
-        await query(
-          `UPDATE documents d
-               SET category = $1 
-              FROM users u
-             WHERE d.employee_id = u.id
-               AND u.company_id = $2`,
-          [updated.name, updated.companyId]
-        );
-      }
-
-      ok(res, updated, 'Categoria aggiornata con successo');
-    } catch (err: any) {
-      throw err;
     }
+
+    const updated = await updateCategory(id, sourceCompanyId, {
+      name: name !== undefined ? name.trim() : undefined,
+      isActive: is_active,
+      companyId: destinationCompanyId,
+    });
+
+    if (!updated) {
+      notFound(res, 'Categoria non trovata per l\'azienda specificata', 'NOT_FOUND');
+      return;
+    }
+
+    if (name !== undefined && before.name !== updated.name) {
+      // Re-label only the documents that were in THIS category. The previous
+      // query matched every document of the company, so renaming one category
+      // silently relabelled all the others too.
+      await query(
+        `UPDATE documents d
+             SET category = $1
+            FROM users u
+           WHERE d.employee_id = u.id
+             AND u.company_id = $2
+             AND d.category = $3`,
+        [updated.name, updated.companyId, before.name],
+      );
+      // Documents not linked to an employee are scoped by company_id instead.
+      await query(
+        `UPDATE documents
+             SET category = $1
+           WHERE employee_id IS NULL
+             AND company_id = $2
+             AND category = $3`,
+        [updated.name, updated.companyId, before.name],
+      );
+    }
+
+    ok(res, updated, 'Categoria aggiornata con successo');
   }),
 );
 
@@ -1229,68 +1300,41 @@ router.post(
       let matchedFiles = 0;
       let unmatchedFiles = 0;
       const unmatchedFileNames: string[] = [];
+      const skippedFileNames: string[] = [];
+
+      // Single source of truth for matching - this route used to carry its own
+      // exact-match implementation ending in LIMIT 1, which silently picked one
+      // of several homonyms. It now shares the engine used by /upload.
+      const candidatePool = await query<MatchableEmployee>(
+        `SELECT id, name, surname, unique_id, company_id
+           FROM users
+          WHERE (status = 'active' OR status IS NULL)
+            AND role NOT IN ('admin', 'store_terminal', 'system_admin')
+            AND company_id = ANY($1)`,
+        [allowedCompanyIds],
+      );
 
       for (const entry of entries) {
         const origName = entry.entryName.split('/').pop() ?? entry.entryName;
-        const stem = origName.replace(/\.[^.]+$/, '');
 
-        // Normalize: lowercase, strip accents, replace non-alpha with _
-        const normalized = stem
-          .normalize('NFD')
-          .replace(/[\u0300-\u036f]/g, '')
-          .toLowerCase()
-          .replace(/[^a-z0-9]/g, '_');
+        if (isArchiveNoise(entry.entryName, origName)) continue;
 
-        // Attempt to find a matching employee
-        let matchedEmployeeId: number | null = null;
-
-        // Pattern 3: unique_id prefix (UNIQUEID_...)
-        const uniqueIdPart = normalized.split('_')[0];
-        if (!matchedEmployeeId && uniqueIdPart) {
-          // Try exact unique_id match with the first segment (also try full stem for UNIQUEID only files)
-          const tryIds = Array.from(new Set([uniqueIdPart, normalized.replace(/_/g, '-')]));
-          for (const tryId of tryIds) {
-            const row = await queryOne<{ id: number; company_id: number }>(
-              `SELECT id, company_id FROM users WHERE LOWER(unique_id) = $1 AND company_id = ANY($2) LIMIT 1`,
-              [tryId, allowedCompanyIds],
-            );
-            if (row) { matchedEmployeeId = row.id; break; }
-          }
+        if (!isSupportedDocumentFile(origName)) {
+          await queryOne<{ id: number }>(
+            `INSERT INTO bulk_document_files
+               (bulk_upload_id, original_file_name, status, error_message)
+             VALUES ($1, $2, 'skipped', 'unsupported_format')
+             RETURNING id`,
+            [uploadId, origName],
+          );
+          skippedFileNames.push(origName);
+          continue;
         }
 
-        // Pattern 1: SURNAME_NAME
-        if (!matchedEmployeeId) {
-          const parts = normalized.split('_').filter(Boolean);
-          if (parts.length >= 2) {
-            const surname = parts[0];
-            const name = parts.slice(1).join('_');
-            const row = await queryOne<{ id: number }>(
-              `SELECT id FROM users
-                WHERE LOWER(surname) = $1 AND LOWER(name) = $2
-                  AND company_id = ANY($3)
-               LIMIT 1`,
-              [surname, name, allowedCompanyIds],
-            );
-            if (row) matchedEmployeeId = row.id;
-          }
-        }
-
-        // Pattern 2: NAME_SURNAME
-        if (!matchedEmployeeId) {
-          const parts = normalized.split('_').filter(Boolean);
-          if (parts.length >= 2) {
-            const name = parts[0];
-            const surname = parts.slice(1).join('_');
-            const row = await queryOne<{ id: number }>(
-              `SELECT id FROM users
-                WHERE LOWER(name) = $1 AND LOWER(surname) = $2
-                  AND company_id = ANY($3)
-               LIMIT 1`,
-              [name, surname, allowedCompanyIds],
-            );
-            if (row) matchedEmployeeId = row.id;
-          }
-        }
+        const match = matchEmployeeByFilename(origName, candidatePool, { companyId: user.companyId });
+        // Ambiguous and partial matches deliberately fall through to unmatched.
+        const matchedEmployeeId: number | null =
+          match.outcome === 'assigned' && match.employee ? match.employee.id : null;
 
         if (matchedEmployeeId !== null) {
           // Extract and save file
@@ -1299,16 +1343,7 @@ router.post(
           const destPath = path.join(DOCUMENTS_UPLOAD_DIR, destFileName);
           fs.writeFileSync(destPath, fileBytes);
 
-          // Determine mime type from extension
-          const ext = path.extname(origName).toLowerCase();
-          const mimeMap: Record<string, string> = {
-            '.pdf': 'application/pdf',
-            '.jpg': 'image/jpeg',
-            '.jpeg': 'image/jpeg',
-            '.png': 'image/png',
-            '.webp': 'image/webp',
-          };
-          const mimeType = mimeMap[ext] ?? 'application/octet-stream';
+          const mimeType = mimeTypeForFilename(origName);
 
           // Fetch company_id for the matched employee
           const empRow = await queryOne<{ company_id: number }>(
@@ -1336,13 +1371,14 @@ router.post(
 
           matchedFiles++;
         } else {
-          // Unmatched
+          // Unmatched, ambiguous, or matched only on one field - all of which
+          // require a human decision rather than a guess.
           await queryOne<{ id: number }>(
             `INSERT INTO bulk_document_files
-               (bulk_upload_id, original_file_name, employee_identifier, status)
-             VALUES ($1, $2, $3, 'unmatched')
+               (bulk_upload_id, original_file_name, employee_identifier, status, error_message)
+             VALUES ($1, $2, $3, 'unmatched', $4)
              RETURNING id`,
-            [uploadId, origName, normalized],
+            [uploadId, origName, match.candidates[0] ? String(match.candidates[0].employee.id) : null, match.reason],
           );
           unmatchedFiles++;
           unmatchedFileNames.push(origName);
@@ -1361,7 +1397,15 @@ router.post(
         [uploadId, totalFiles, matchedFiles, unmatchedFiles],
       );
 
-      ok(res, { uploadId, totalFiles, matchedFiles, unmatchedFiles, unmatchedFileNames });
+      ok(res, {
+        uploadId,
+        totalFiles,
+        matchedFiles,
+        unmatchedFiles,
+        unmatchedFileNames,
+        skippedFiles: skippedFileNames.length,
+        skippedFileNames,
+      });
     } catch (err: any) {
       await queryOne<{ id: number }>(
         `UPDATE bulk_document_uploads

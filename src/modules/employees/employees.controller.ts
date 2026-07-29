@@ -1378,3 +1378,92 @@ export const resetEmployeeDevice = asyncHandler(async (req: Request, res: Respon
 
   ok(res, employee, 'Reset dispositivo richiesto');
 });
+
+// ---------------------------------------------------------------------------
+// Employee Import Mapping Templates
+// ---------------------------------------------------------------------------
+
+export const getImportTemplates = asyncHandler(async (req: Request, res: Response) => {
+  const companyId = req.user!.companyId;
+  if (!companyId) {
+    badRequest(res, 'Azienda non specificata');
+    return;
+  }
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS employee_import_templates (
+      id SERIAL PRIMARY KEY,
+      company_id INT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      name VARCHAR(255) NOT NULL,
+      mapping_json JSONB NOT NULL,
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+      updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    )
+  `).catch(() => {});
+
+  const templates = await query(
+    `SELECT id, company_id as "companyId", name, mapping_json as "mappingJson", created_at as "createdAt"
+       FROM employee_import_templates
+      WHERE company_id = $1
+      ORDER BY name ASC`,
+    [companyId]
+  );
+
+  ok(res, templates);
+});
+
+export const saveImportTemplate = asyncHandler(async (req: Request, res: Response) => {
+  const companyId = req.user!.companyId;
+  const { name, mappingJson } = req.body;
+
+  if (!companyId) {
+    badRequest(res, 'Azienda non specificata');
+    return;
+  }
+  if (!name || !mappingJson) {
+    badRequest(res, 'Nome e mappatura obbligatori');
+    return;
+  }
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS employee_import_templates (
+      id SERIAL PRIMARY KEY,
+      company_id INT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      name VARCHAR(255) NOT NULL,
+      mapping_json JSONB NOT NULL,
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+      updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    )
+  `).catch(() => {});
+
+  const template = await queryOne(
+    `INSERT INTO employee_import_templates (company_id, name, mapping_json)
+     VALUES ($1, $2, $3)
+     RETURNING id, company_id as "companyId", name, mapping_json as "mappingJson", created_at as "createdAt"`,
+    [companyId, name, JSON.stringify(mappingJson)]
+  );
+
+  ok(res, template, 'Template di mappatura salvato con successo');
+});
+
+export const deleteImportTemplate = asyncHandler(async (req: Request, res: Response) => {
+  const companyId = req.user!.companyId;
+  const id = parseInt(req.params.id, 10);
+  if (isNaN(id)) {
+    badRequest(res, 'ID non valido');
+    return;
+  }
+
+  const deleted = await queryOne(
+    `DELETE FROM employee_import_templates WHERE id = $1 AND company_id = $2 RETURNING id`,
+    [id, companyId]
+  );
+
+  if (!deleted) {
+    notFound(res, 'Template non trovato');
+    return;
+  }
+
+  ok(res, { id }, 'Template eliminato');
+});
+

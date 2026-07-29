@@ -291,4 +291,18 @@ describe('jobFeedHandler — Indeed feed compliance', () => {
   it('omits <salary> entirely when no amount is set', async () => {
     expect(await feedSalary(createMockJob({ salaryMin: null, salaryMax: null }))).toBeNull();
   });
+
+  it('passes requested slug (numeric id "1" or "all") directly to getPublishedJobsForFeed', async () => {
+    mockGetPublishedJobsForFeed.mockResolvedValue({ company: { ...mockCompany, id: 1, name: 'FUSARO UOMO', slug: 'fusaro-uomo' }, jobs: [] });
+
+    const reqCompany1 = { ...req, params: { slug: '1' } };
+    await jobFeedHandler(reqCompany1 as unknown as Request, res as Response);
+    expect(mockGetPublishedJobsForFeed).toHaveBeenCalledWith('1');
+
+    jest.clearAllMocks();
+    mockGetPublishedJobsForFeed.mockResolvedValue({ company: { id: 1, name: 'All Published Jobs', slug: 'all', city: null, state: null, country: null, address: null, companyEmail: 'recruitment@veylohr.com' }, jobs: [] });
+    const reqAll = { ...req, params: { slug: 'all' } };
+    await jobFeedHandler(reqAll as unknown as Request, res as Response);
+    expect(mockGetPublishedJobsForFeed).toHaveBeenCalledWith('all');
+  });
 });

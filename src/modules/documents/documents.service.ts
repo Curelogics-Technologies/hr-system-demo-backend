@@ -12,6 +12,8 @@ export interface DocumentCategory {
   isActive: boolean;
   createdAt: string;
   updatedAt: string;
+  /** How many documents currently sit in this category. */
+  documentCount?: number;
 }
 
 function mapCategory(row: {
@@ -43,15 +45,29 @@ export async function getCategories(
     is_active: boolean;
     created_at: string;
     updated_at: string;
+    document_count: string;
   }>(
-    `SELECT id, company_id, name, is_active, created_at, updated_at
-       FROM document_categories
-      WHERE company_id = ANY($1)
-        ${includeInactive ? '' : 'AND is_active = true'}
-      ORDER BY name ASC`,
+    // document_count powers the "N documents" badge in the categories manager,
+    // so an operator can see what a category actually holds before renaming or
+    // deactivating it. Counts both storage tables and ignores deleted rows.
+    `SELECT c.id, c.company_id, c.name, c.is_active, c.created_at, c.updated_at,
+            (
+              COALESCE((
+                SELECT COUNT(*) FROM employee_documents ed
+                 WHERE ed.category_id = c.id AND ed.is_deleted = false
+              ), 0)
+              + COALESCE((
+                SELECT COUNT(*) FROM documents d
+                 WHERE d.company_id = c.company_id AND d.category = c.name AND d.is_deleted = false
+              ), 0)
+            ) AS document_count
+       FROM document_categories c
+      WHERE c.company_id = ANY($1)
+        ${includeInactive ? '' : 'AND c.is_active = true'}
+      ORDER BY c.name ASC`,
     [companyIds],
   );
-  return rows.map(mapCategory);
+  return rows.map(row => ({ ...mapCategory(row), documentCount: Number(row.document_count) || 0 }));
 }
 
 export async function createCategory(companyId: number, name: string): Promise<DocumentCategory> {
@@ -279,6 +295,8 @@ export interface DocumentRecord {
   updatedAt: string;
   sourceTable?: 'documents' | 'employee_documents';
   employeeName?: string;
+  employeeSurname?: string;
+  employeeAvatarFilename?: string;
   employeeRole?: string;
 }
 
@@ -307,6 +325,8 @@ function mapDocumentRecord(row: {
   restored_by: number | null;
   created_at: string;
   updated_at: string;
+  employee_surname?: string;
+  employee_avatar_filename?: string;
   employee_role?: string;
 } | any): DocumentRecord {
   return {
@@ -335,6 +355,8 @@ function mapDocumentRecord(row: {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     employeeName: row.employee_name,
+    employeeSurname: row.employee_surname,
+    employeeAvatarFilename: row.employee_avatar_filename,
     employeeRole: row.employee_role,
     sourceTable: 'employee_documents',
   };
@@ -346,6 +368,9 @@ const DOC_SELECT = `
          d.employee_id,
          e.company_id AS employee_company_id,
          CONCAT(e.name, ' ', e.surname) AS employee_name,
+         e.name AS employee_first_name,
+         e.surname AS employee_surname,
+         e.avatar_filename AS employee_avatar_filename,
          e.role AS employee_role,
          d.category_id,
          c.name AS category_name,
@@ -781,6 +806,9 @@ export async function getDeletedDocuments(
   const genRows = await query<any>(
     `SELECT d.*, 
             CONCAT(e.name, ' ', e.surname) AS employee_name,
+         e.name AS employee_first_name,
+         e.surname AS employee_surname,
+         e.avatar_filename AS employee_avatar_filename,
             e.company_id AS employee_company_id
        FROM documents d
        LEFT JOIN users e ON e.id = d.employee_id
@@ -816,6 +844,8 @@ export async function getDeletedDocuments(
     updatedAt: r.created_at,
     sourceTable: 'documents',
     employeeName: r.employee_name && r.employee_name.trim() !== '' ? r.employee_name : undefined,
+    employeeSurname: r.employee_surname || undefined,
+    employeeAvatarFilename: r.employee_avatar_filename || undefined,
   }));
 
   // 3. Deduplicate by storage path, PRIORITIZING records that have an employee assigned
@@ -962,6 +992,13 @@ export interface GenericDocument {
   employeeRole?: string;
 }
 
+(async () => {
+  try {
+    await query(`ALTER TABLE documents ADD COLUMN IF NOT EXISTS is_confirmed BOOLEAN DEFAULT false;`);
+    await query(`UPDATE documents SET is_confirmed = true WHERE is_confirmed IS NULL;`);
+  } catch { /* ignore initialization */ }
+})();
+
 export async function createGenericDocument(data: {
   companyId: number;
   title: string;
@@ -972,7 +1009,9 @@ export async function createGenericDocument(data: {
   requiresSignature?: boolean;
   expiresAt?: string | null;
   isVisibleToRoles?: string[];
+  isConfirmed?: boolean;
 }): Promise<GenericDocument> {
+  const isConfirmed = data.isConfirmed ?? false;
   const row = await queryOne<{
     id: number;
     company_id: number;
@@ -990,8 +1029,8 @@ export async function createGenericDocument(data: {
     restored_by: number | null;
     created_at: string;
   }>(
-    `INSERT INTO documents (company_id, title, file_url, category, employee_id, uploaded_by, requires_signature, expires_at, is_visible_to_roles)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    `INSERT INTO documents (company_id, title, file_url, category, employee_id, uploaded_by, requires_signature, expires_at, is_visible_to_roles, is_confirmed)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
      RETURNING id, company_id, title, file_url, category, employee_id, uploaded_by, requires_signature, expires_at, is_visible_to_roles, created_at`,
     [
       data.companyId,
@@ -1002,7 +1041,8 @@ export async function createGenericDocument(data: {
       data.uploadedBy,
       data.requiresSignature || false,
       data.expiresAt || null,
-      data.isVisibleToRoles || ['admin', 'hr', 'area_manager', 'store_manager', 'employee']
+      data.isVisibleToRoles || ['admin', 'hr', 'area_manager', 'store_manager', 'employee'],
+      isConfirmed
     ],
   );
 
@@ -1178,15 +1218,20 @@ export async function getGenericDocuments(options: {
     deleted_at: string | null;
     restored_at: string | null;
     restored_by: number | null;
+    employee_surname?: string;
+    employee_avatar_filename?: string;
     employee_role?: string;
   }>(
     `SELECT d.*, CONCAT(e.name, ' ', e.surname) AS employee_name,
+         e.name AS employee_first_name,
+         e.surname AS employee_surname,
+         e.avatar_filename AS employee_avatar_filename,
             e.company_id AS employee_company_id,
             COALESCE(d.signed_at, (SELECT max(ed.signed_at) FROM employee_documents ed WHERE ed.storage_path = d.file_url AND ed.employee_id = d.employee_id AND ed.is_deleted = false)) as signed_at_combined
        FROM documents d
        LEFT JOIN users e ON e.id = d.employee_id
        LEFT JOIN users u_up ON u_up.id = d.uploaded_by
-      WHERE ${where} AND d.is_deleted = false
+       WHERE ${where} AND d.is_deleted = false AND (d.is_confirmed = true OR d.is_confirmed IS NULL)
       ORDER BY d.created_at DESC`,
     params,
   );
@@ -1208,6 +1253,8 @@ export async function getGenericDocuments(options: {
     isVisibleToRoles: r.is_visible_to_roles,
     createdAt: r.created_at,
     employeeName: r.employee_name || undefined,
+    employeeSurname: r.employee_surname || undefined,
+    employeeAvatarFilename: r.employee_avatar_filename || undefined,
     employeeRole: r.employee_role,
     isDeleted: r.is_deleted,
     deletedAt: r.deleted_at,
