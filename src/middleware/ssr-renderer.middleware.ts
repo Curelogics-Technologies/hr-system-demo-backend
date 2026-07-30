@@ -7,6 +7,7 @@ import {
   mapPublicJob
 } from '../modules/publicCareers/publicCareers.routes';
 import { salaryPeriodItalianLabel } from '../utils/salaryPeriod';
+import { queryOne } from '../config/database';
 
 // In-memory cache for rendered HTML pages
 interface CacheEntry {
@@ -49,7 +50,18 @@ function escapeHtml(unsafe: string): string {
 }
 
 // Generate premium, responsive HTML template wrapper
-function wrapPageTemplate(title: string, content: string): string {
+/**
+ * Platform identity for pages that are not scoped to a single company.
+ *
+ * These pages must never fall back to a tenant's name: this is a multi-company
+ * platform, and showing one client's identity on a shared page misattributes it.
+ * The platform name is read from legal_documents (set by a super admin in the
+ * Legal Documents screen); when it is absent we render nothing rather than
+ * inventing a default.
+ */
+const PLATFORM_FALLBACK_NAME = 'Veylo HR';
+
+function wrapPageTemplate(title: string, content: string, brandName = ''): string {
   return `<!DOCTYPE html>
 <html lang="it">
 <head>
@@ -230,13 +242,13 @@ function wrapPageTemplate(title: string, content: string): string {
 </head>
 <body>
   <header>
-    <h1>Fusaro Uomo <span>Careers</span></h1>
+    <h1>${brandName ? `${escapeHtml(brandName)} <span>Careers</span>` : '<span>Careers</span>'}</h1>
   </header>
   <main class="container">
     ${content}
   </main>
   <footer>
-    <p>&copy; ${new Date().getFullYear()} Fusaro Uomo. All rights reserved.</p>
+    <p>&copy; ${new Date().getFullYear()}${brandName ? ` ${escapeHtml(brandName)}.` : ''} All rights reserved.</p>
     <p>
       <a href="/privacy">Privacy Policy</a>
       <a href="/terms">Terms of Service</a>
@@ -247,77 +259,70 @@ function wrapPageTemplate(title: string, content: string): string {
 </html>`;
 }
 
-// Standard policy text pages
-function getPrivacyPolicyHtml(): string {
-  return `
-    <div class="card">
-      <h2>Privacy Policy / Informativa sulla Privacy</h2>
-      <div class="rich-text">
-        <p><strong>Ultimo aggiornamento: 4 Giugno 2026</strong></p>
-        <p>Questa informativa descrive come trattiamo i dati personali dei candidati che applicano alle posizioni aperte presso Fusaro Uomo. Ci impegniamo a garantire la riservatezza e la sicurezza dei dati forniti, in piena conformità al Regolamento Generale sulla Protezione dei Dati (GDPR - Regolamento UE 2016/679).</p>
-        
-        <h3>1. Dati Raccolti</h3>
-        <p>Raccogliamo le seguenti categorie di dati nel contesto delle candidature:</p>
-        <ul>
-          <li>Nome, cognome, indirizzo email, recapito telefonico.</li>
-          <li>CV/Resume, lettere di presentazione e referenze professionali.</li>
-          <li>Precedenti esperienze lavorative, livello di istruzione e competenze.</li>
-          <li>Disponibilità lavorativa, aspettative salariali e preferenze di sede.</li>
-        </ul>
+// ── Platform legal pages ─────────────────────────────────────────────────────
+//
+// Sourced from the same legal_documents rows the admin Legal Documents screen
+// writes and the SPA renders, so this text exists in one place rather than two.
+// The previous hardcoded Italian copy named a single tenant and silently drifted
+// out of step with whatever the admin had actually published.
 
-        <h3>2. Finalità del Trattamento</h3>
-        <p>I dati raccolti vengono utilizzati esclusivamente per scopi legati al processo di recruiting, inclusa la valutazione del profilo per la posizione selezionata o per future opportunità lavorative all'interno del gruppo.</p>
+type LegalDocKey = 'privacy' | 'terms' | 'cookie';
 
-        <h3>3. Conservazione dei Dati</h3>
-        <p>I dati dei candidati saranno conservati per un periodo massimo di 24 mesi dall'ultimo contatto o dall'invio della candidatura, dopodiché verranno eliminati o resi anonimi in modo sicuro.</p>
+const LEGAL_PATHS: Record<string, LegalDocKey> = {
+  '/privacy': 'privacy',
+  '/terms': 'terms',
+  '/cookie-policy': 'cookie',
+};
 
-        <h3>4. I Tuoi Diritti</h3>
-        <p>Ai sensi del GDPR, hai il diritto di accedere ai tuoi dati personali, richiederne la rettifica o la cancellazione, limitarne il trattamento, o opporti allo stesso inviando una email al nostro team di risorse umane.</p>
-      </div>
-    </div>
-  `;
+interface PlatformLegalDoc {
+  title: string;
+  content: string;
+  platform_company_name: string | null;
+  platform_company_email: string | null;
 }
 
-function getTermsHtml(): string {
-  return `
-    <div class="card">
-      <h2>Terms of Service / Termini di Servizio</h2>
-      <div class="rich-text">
-        <p><strong>Ultimo aggiornamento: 4 Giugno 2026</strong></p>
-        <p>Benvenuto nel portale Careers di Fusaro Uomo. Utilizzando questo portale per consultare gli annunci di lavoro e inviare la tua candidatura, accetti i presenti Termini di Servizio.</p>
-        
-        <h3>1. Utilizzo del Portale</h3>
-        <p>Il portale è destinato a candidati reali in cerca di impiego presso Fusaro Uomo. È vietato l'invio di dati falsi, incompleti o fuorvianti. È vietato qualsiasi tentativo di alterare il funzionamento tecnico del sistema.</p>
-
-        <h3>2. Candidature</h3>
-        <p>L'invio di una candidatura non costituisce alcuna offerta formale di impiego né garantisce un colloquio conoscitivo. Il team recruiting valuterà le risposte a propria discrezione.</p>
-
-        <h3>3. Proprietà Intellettuale</h3>
-        <p>Tutti i contenuti presenti sul portale (loghi, testi, descrizioni delle posizioni) sono di proprietà esclusiva di Fusaro Uomo e non possono essere riutilizzati o diffusi senza autorizzazione.</p>
-      </div>
-    </div>
-  `;
+async function loadPlatformLegalDoc(
+  key: LegalDocKey,
+  lang: 'it' | 'en',
+): Promise<PlatformLegalDoc | null> {
+  return queryOne<PlatformLegalDoc>(
+    `SELECT title, content, platform_company_name, platform_company_email
+       FROM legal_documents
+      WHERE document_key = $1 AND language = $2`,
+    [key, lang],
+  );
 }
 
-function getCookiePolicyHtml(): string {
+/**
+ * Fills the {{companyName}} / {{companyEmail}} placeholders.
+ *
+ * These are platform-level pages with no company in the path, so the only
+ * correct substitution is the platform identity. An unset field resolves to an
+ * empty string — deliberately blank rather than defaulted to any tenant's name.
+ */
+function renderPlatformLegalHtml(doc: PlatformLegalDoc): string {
+  const name = doc.platform_company_name ?? '';
+  const email = doc.platform_company_email ?? '';
+
+  const body = (doc.content ?? '')
+    .replace(/\{\{companyName\}\}/g, escapeHtml(name))
+    .replace(/\{\{companyEmail\}\}/g, escapeHtml(email));
+
+  // Stored content may be HTML or plain text/markdown-ish; only the latter needs
+  // wrapping in paragraphs.
+  const looksLikeHtml = /<[a-z][\s\S]*>/i.test(body);
+  const rendered = looksLikeHtml
+    ? body
+    : body
+        .split(/\n{2,}/)
+        .map((para) => `<p>${escapeHtml(para).replace(/\n/g, '<br />')}</p>`)
+        .join('\n');
+
   return `
     <div class="card">
-      <h2>Cookie Policy / Politica sui Cookie</h2>
+      <h2>${escapeHtml(doc.title ?? '')}</h2>
       <div class="rich-text">
-        <p><strong>Ultimo aggiornamento: 4 Giugno 2026</strong></p>
-        <p>Il portale Careers di Fusaro Uomo utilizza cookie e tecnologie simili per migliorare l'esperienza di navigazione ed analizzare l'uso del nostro portale.</p>
-        
-        <h3>1. Cosa sono i Cookie</h3>
-        <p>I cookie sono piccoli file di testo salvati sul tuo dispositivo durante la visita del sito. Consentono di memorizzare preferenze di navigazione (come la lingua selezionata) e informazioni sulle sessioni.</p>
-
-        <h3>2. Cookie Utilizzati</h3>
-        <ul>
-          <li><strong>Cookie Tecnici Essenziali:</strong> Necessari per il funzionamento di base del portale (es. gestione delle sessioni di candidatura).</li>
-          <li><strong>Cookie Analitici:</strong> Utilizzati in forma anonima per monitorare le statistiche di visita del sito (es. quante visite riceve un annuncio).</li>
-        </ul>
-
-        <h3>3. Gestione dei Cookie</h3>
-        <p>Puoi scegliere di disabilitare o bloccare i cookie tramite le impostazioni del tuo browser web, ma questo potrebbe compromettere la corretta compilazione ed invio del modulo di candidatura.</p>
+${rendered}
       </div>
     </div>
   `;
@@ -347,24 +352,25 @@ export const ssrRendererMiddleware = async (req: Request, res: Response, next: N
     return;
   }
 
-  // Handle static legal compliance pages for both bots and humans
-  if (path === '/privacy' || path === '/terms' || path === '/cookie-policy') {
-    let content = '';
-    let title = '';
-    
-    if (path === '/privacy') {
-      title = 'Privacy Policy | Fusaro Uomo Careers';
-      content = getPrivacyPolicyHtml();
-    } else if (path === '/terms') {
-      title = 'Terms of Service | Fusaro Uomo Careers';
-      content = getTermsHtml();
-    } else {
-      title = 'Cookie Policy | Fusaro Uomo Careers';
-      content = getCookiePolicyHtml();
-    }
+  // Platform legal pages (no company in the path).
+  //
+  // Humans fall through to the SPA redirect below, which renders these from the
+  // database already — keeping one rendering path avoids the two copies drifting
+  // apart. Only crawlers (and /ssr/ probes) get server-rendered HTML here, built
+  // from the same legal_documents row.
+  const legalKey = LEGAL_PATHS[path];
+  if (legalKey && (isBot || isSsrPrefix)) {
+    const lang = (req.query.lang as string) === 'en' ? 'en' : 'it';
+    const doc = await loadPlatformLegalDoc(legalKey, lang);
+
+    // Nothing published yet: serve an empty document rather than inventing a
+    // Data Controller. Fabricating one would be worse than an incomplete page.
+    const brandName = doc?.platform_company_name ?? '';
+    const heading = doc?.title ?? '';
+    const title = [heading, brandName || PLATFORM_FALLBACK_NAME].filter(Boolean).join(' | ');
 
     res.setHeader('Content-Type', 'text/html; charset=UTF-8');
-    res.send(wrapPageTemplate(title, content));
+    res.send(wrapPageTemplate(title, doc ? renderPlatformLegalHtml(doc) : '', brandName));
     return;
   }
 
@@ -464,7 +470,9 @@ export const ssrRendererMiddleware = async (req: Request, res: Response, next: N
         salaryHtml = `<p>Stipendio: ${job.salary_min}${maxPart}${periodPart}</p>`;
       }
 
-      const companySlugForUrl = companySlug || job.company_slug || 'fusaro-uomo';
+      // Never fall back to a specific tenant's slug — a wrong slug here would
+      // emit a canonical URL pointing at another company's careers page.
+      const companySlugForUrl = companySlug || job.company_slug || '';
 
       const html = `<!DOCTYPE html>
 <html lang="it">

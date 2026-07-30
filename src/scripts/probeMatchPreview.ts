@@ -16,9 +16,10 @@ const SCOPE = process.argv[3] === 'null' ? null : Number(process.argv[3] ?? 1);
 const BASE = `http://localhost:${process.env.PORT || 3001}`;
 
 const FILES = [
-  '_Barbieri_Matteo_09.pdf', 'COSTA__Francesca_0921.pdf', 'Giulia_Barbieri_67.pdf',
-  'marco_lombardi-resume.pdf', 'mattiaLombardi.pdf', 'Giulia De Luca.pdf',
-  'COSTA_Stefano34.pdf', 'Lorenzo.Fontana_Report.pdf', 'AURORA_.GALLO.pdf',
+  "Giulia_Barbieri_67.pdf", "_Barbieri_Matteo_09.pdf", "Roberto.Barbieri.pdf",
+  "Aurora-Bianchi-CV.pdf", "_Stefano_Bianchi_Invoice.pdf", "29-07-2026_Francesco_Bruno.pdf",
+  "COSTA_Stefano34.pdf", "ELENA_ROSSI.pdf", "EmmaRomano.pdf",
+  "Giulia Greco.pdf", "Lorenzo&Rossi.pdf", "Lorenzo.Fontana_Report.pdf",
 ];
 
 async function main() {
@@ -45,7 +46,7 @@ async function main() {
   const res = await fetch(`${BASE}/api/documents/match-preview`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-    body: JSON.stringify({ files: FILES.map(f => ({ fileName: f })), company_id: SCOPE }),
+    body: JSON.stringify({ files: FILES.map((f, i) => ({ document_id: 1000 + i, file_name: f })), company_id: SCOPE }),
   });
 
   console.log(`POST /api/documents/match-preview (company_id=${SCOPE}) -> ${res.status}`);

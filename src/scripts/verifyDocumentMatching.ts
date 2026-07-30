@@ -68,7 +68,9 @@ const ARCHIVE: Expectation[] = [
   { file: 'sepearita.pdf', expect: 'unmatched', note: 'typo in a no-separator name: must not fuzzy-match' },
 
   // --- Not documents at all. ----------------------------------------------
-  { file: '2643_CEDOLINO.xml', expect: 'skipped', note: 'payroll data file, must be skipped and reported' },
+  // XML is not an accepted document format: it is skipped and reported in the
+  // summary rather than imported, and must not disturb the other entries.
+  { file: '2643_CEDOLINO.xml', expect: 'skipped', note: 'payroll data file: skipped and reported' },
   { file: '000123.pdf', expect: 'unmatched', note: 'no alphabetic content; matches nobody' },
 ];
 

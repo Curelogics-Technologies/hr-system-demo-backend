@@ -9,6 +9,20 @@ import { ok, created, badRequest, forbidden, notFound } from '../../utils/respon
 import { buildSalaryText, canonicalizeSalaryPeriod } from '../../utils/salaryPeriod';
 import { sendEmailForCompany } from '../../services/email.service';
 import { query, queryOne } from '../../config/database';
+import { runCandidateRetentionJob } from '../../jobs/candidate-retention.job';
+
+/**
+ * Interview types accepted by the API. Must stay in step with the
+ * interviews_interview_type_check constraint (migration 123) — an unknown value
+ * here would be coerced silently, which previously turned a user's "Video"
+ * choice into "In-Person" without any error.
+ */
+const INTERVIEW_TYPES = ['phone', 'in_person', 'video'] as const;
+type InterviewTypeValue = (typeof INTERVIEW_TYPES)[number];
+
+function isInterviewType(value: unknown): value is InterviewTypeValue {
+  return typeof value === 'string' && (INTERVIEW_TYPES as readonly string[]).includes(value);
+}
 import {
   listJobs, getJob, createJob, updateJob, deleteJob,
   publishJobToIndeed, syncIndeedApplications,
@@ -1365,7 +1379,7 @@ export const createInterviewHandler = asyncHandler(async (req: Request, res: Res
     return;
   }
 
-  const normalizedInterviewType = interview_type === 'phone' || interview_type === 'in_person'
+  const normalizedInterviewType = isInterviewType(interview_type)
     ? interview_type
     : 'in_person';
   const normalizedDescription =
@@ -1596,7 +1610,8 @@ export const updateInterviewHandler = asyncHandler(async (req: Request, res: Res
   const storeIds = resolveStoreIds(req.user);
   const updated = await updateInterview(id, companyId, {
     scheduledAt:   typeof scheduled_at === 'string' ? new Date(scheduled_at).toISOString() : undefined,
-    interviewType: interview_type === 'phone' || interview_type === 'in_person' ? interview_type : undefined,
+    interviewType: isInterviewType(interview_type)
+    ? interview_type : undefined,
     location:      typeof location === 'string' ? location : undefined,
     description:   typeof description === 'string' ? description : undefined,
     notes:         typeof notes === 'string' ? notes : undefined,
@@ -2294,10 +2309,17 @@ export const jobFeedHandler = async (req: Request, res: Response): Promise<void>
           `    <url>${wrapCdata(jobUrl)}</url>`,
           `    <company>${wrapCdata(job.companyName || company.name)}</company>`,
           `    <sourcename>${wrapCdata(job.companyGroupName || job.companyName || company.name)}</sourcename>`,
-          `    <email>${wrapCdata(job.companyEmail || company.companyEmail || 'recruitment@fusarouomo.it')}</email>`,
           `    <indeed-apply-data>${wrapCdata(indeedApplyData)}</indeed-apply-data>`,
           `    <city>${wrapCdata(city)}</city>`,
         ];
+
+        // Emitted only when the company actually has an address on record.
+        // Previously this fell back to a hardcoded tenant address, which
+        // published one client's contact email against every other client's jobs.
+        const feedEmail = job.companyEmail || company.companyEmail;
+        if (feedEmail) {
+          xmlFields.splice(-2, 0, `    <email>${wrapCdata(feedEmail)}</email>`);
+        }
 
         if (state) {
           xmlFields.push(`    <state>${wrapCdata(state)}</state>`);
@@ -3377,4 +3399,98 @@ export const deleteScreenerQuestionHandler = asyncHandler(async (req: Request, r
     [qId, jobId, companyId]
   );
   ok(res, { success: true });
+});
+
+// ---------------------------------------------------------------------------
+// GDPR candidate retention
+//
+// The public privacy notice promises candidate data is erased or anonymised
+// after a maximum retention window. These endpoints let an admin see the
+// current policy, preview exactly which records the nightly sweep would touch,
+// and turn enforcement on. Preview is deliberately available while the policy
+// is disabled so the impact can be inspected before committing to it.
+// ---------------------------------------------------------------------------
+
+export const getCandidateRetentionHandler = asyncHandler(async (req: Request, res: Response) => {
+  const companyId = await resolveAtsCompanyId(req);
+  if (!companyId) { forbidden(res, 'Nessuna azienda valida selezionata'); return; }
+
+  const settings = await queryOne(
+    `SELECT enabled, retention_months, include_hired, last_run_at, last_run_count
+       FROM candidate_retention_settings
+      WHERE company_id = $1`,
+    [companyId],
+  );
+
+  // A company created before migration 122 ran has no row yet; report the
+  // documented default rather than a null policy.
+  const effective = settings ?? {
+    enabled: false,
+    retention_months: 24,
+    include_hired: false,
+    last_run_at: null,
+    last_run_count: 0,
+  };
+
+  const preview = await runCandidateRetentionJob(companyId, true);
+
+  ok(res, {
+    settings: effective,
+    pendingCount: preview.eligible,
+  });
+});
+
+export const updateCandidateRetentionHandler = asyncHandler(async (req: Request, res: Response) => {
+  const companyId = await resolveAtsCompanyId(req);
+  if (!companyId) { forbidden(res, 'Nessuna azienda valida selezionata'); return; }
+
+  const { enabled, retention_months, include_hired } = req.body ?? {};
+
+  if (typeof enabled !== 'boolean') {
+    badRequest(res, 'Il campo "enabled" deve essere booleano');
+    return;
+  }
+
+  const months = retention_months === undefined ? 24 : Number(retention_months);
+  if (!Number.isInteger(months) || months < 1 || months > 120) {
+    badRequest(res, 'Il periodo di conservazione deve essere tra 1 e 120 mesi');
+    return;
+  }
+
+  const includeHired = include_hired === undefined ? false : Boolean(include_hired);
+
+  const saved = await queryOne(
+    `INSERT INTO candidate_retention_settings (company_id, enabled, retention_months, include_hired, updated_at)
+     VALUES ($1, $2, $3, $4, NOW())
+     ON CONFLICT (company_id) DO UPDATE
+       SET enabled          = EXCLUDED.enabled,
+           retention_months = EXCLUDED.retention_months,
+           include_hired    = EXCLUDED.include_hired,
+           updated_at       = NOW()
+     RETURNING enabled, retention_months, include_hired, last_run_at, last_run_count`,
+    [companyId, enabled, months, includeHired],
+  );
+
+  ok(res, { settings: saved });
+});
+
+/**
+ * Read-only preview of the next sweep. Returns the candidate list so an admin
+ * can eyeball it — never mutates, regardless of whether the policy is enabled.
+ */
+export const previewCandidateRetentionHandler = asyncHandler(async (req: Request, res: Response) => {
+  const companyId = await resolveAtsCompanyId(req);
+  if (!companyId) { forbidden(res, 'Nessuna azienda valida selezionata'); return; }
+
+  const preview = await runCandidateRetentionJob(companyId, true);
+
+  ok(res, {
+    eligible: preview.eligible,
+    candidates: preview.candidates.map((c) => ({
+      id: c.id,
+      fullName: c.full_name,
+      lastContact: c.last_contact,
+      hasCv: Boolean(c.cv_path || c.resume_path),
+    })),
+  });
 });

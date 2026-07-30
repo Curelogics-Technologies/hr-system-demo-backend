@@ -164,7 +164,7 @@ export interface Interview {
   candidateId: number;
   interviewerId: number | null;
   storeId: number | null;
-  interviewType: 'phone' | 'in_person';
+  interviewType: 'phone' | 'in_person' | 'video';
   scheduledAt: string;
   location: string | null;
   description: string | null;
@@ -354,7 +354,7 @@ function mapInterview(row: Record<string, unknown>): Interview {
     candidateId: row.candidate_id as number,
     interviewerId: row.interviewer_id as number | null,
     storeId: row.store_id as number | null,
-    interviewType: (row.interview_type as 'phone' | 'in_person') || 'in_person',
+    interviewType: (row.interview_type as 'phone' | 'in_person' | 'video') || 'in_person',
     scheduledAt: row.scheduled_at as string,
     location: row.location as string | null,
     description: row.description as string | null,
@@ -1249,7 +1249,7 @@ export async function createInterview(
   companyId: number,
   data: {
     interviewerId?: number;
-    interviewType?: 'phone' | 'in_person';
+    interviewType?: 'phone' | 'in_person' | 'video';
     scheduledAt: string;
     location?: string;
     description?: string;
@@ -1291,7 +1291,7 @@ export async function updateInterview(
   companyId: number,
   data: {
     scheduledAt?: string;
-    interviewType?: 'phone' | 'in_person';
+    interviewType?: 'phone' | 'in_person' | 'video';
     location?: string;
     description?: string;
     notes?: string;
