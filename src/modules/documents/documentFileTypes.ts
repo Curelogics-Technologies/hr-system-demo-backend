@@ -25,9 +25,6 @@ const MIME_BY_EXTENSION: Record<string, string> = {
   '.odt': 'application/vnd.oasis.opendocument.text',
   '.ods': 'application/vnd.oasis.opendocument.spreadsheet',
   '.p7m': 'application/pkcs7-mime',
-  '.xml': 'application/xml',
-  '.txt': 'text/plain',
-  '.csv': 'text/csv',
 };
 
 /** Extensions accepted as employee documents. */

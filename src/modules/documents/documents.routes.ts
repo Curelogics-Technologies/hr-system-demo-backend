@@ -18,10 +18,11 @@ import {
   updateGenericDocumentEmployee,
   deleteDocumentUnified,
   getDeletedDocuments,
+  getOrphanEmployeeDocuments,
   restoreDocument,
   permanentlyDeleteDocument,
 } from './documents.service';
-import { resolveAllowedCompanyIds } from '../../utils/companyScope';
+import { resolveAllowedCompanyIds, resolveCompanyGroupId } from '../../utils/companyScope';
 import { matchEmployeeByFilename, MatchableEmployee, MatchCandidate, MatchOutcome, MatchReason } from './employeeMatcher';
 import { isSupportedDocumentFile, mimeTypeForFilename, isArchiveNoise } from './documentFileTypes';
 import { query, queryOne, pool } from '../../config/database';
@@ -220,14 +221,33 @@ export async function performAutoAssign(
     simulate?: boolean;
   },
 ): Promise<AutoAssignResult> {
-  const isGlobalSearch = options?.isSuperAdmin || !allowedCompanyIds || allowedCompanyIds.length === 0;
+  // Candidate pool, narrowed to the selected company's group when one is given.
+  // Auto-assignment is gated on the company anyway; keeping the pool aligned
+  // with the suggestions shown in the wizard means the two can never disagree.
+  let poolCompanyIds: number[] = allowedCompanyIds ?? [];
+  if (options?.companyId != null) {
+    const groupId = await resolveCompanyGroupId(options.companyId);
+    if (groupId == null) {
+      poolCompanyIds = [options.companyId];
+    } else {
+      const siblings = await query<{ id: number }>(
+        `SELECT id FROM companies WHERE group_id = $1`,
+        [groupId],
+      );
+      const groupIds = siblings.map(r => r.id);
+      poolCompanyIds = (allowedCompanyIds && allowedCompanyIds.length > 0)
+        ? groupIds.filter(id => allowedCompanyIds.includes(id))
+        : groupIds;
+      if (!poolCompanyIds.includes(options.companyId)) poolCompanyIds.push(options.companyId);
+    }
+  }
 
   let companyFilterSql = '';
   let params: any[] = [];
 
-  if (!isGlobalSearch && allowedCompanyIds && allowedCompanyIds.length > 0) {
+  if (poolCompanyIds.length > 0) {
     companyFilterSql = 'AND (company_id = ANY($1) OR company_id IS NULL)';
-    params = [allowedCompanyIds];
+    params = [poolCompanyIds];
   }
 
   // Candidate pool: real people only. Terminals and admins never hold payslips.
@@ -262,14 +282,26 @@ export async function performAutoAssign(
   let resolvedEmployee: { id: number; name: string; surname: string; companyId: number | null } | null = null;
 
   if (providedEmpId !== null) {
-    const empInfo = await queryOne<{ id: number; name: string; surname: string; company_id: number }>(
-      `SELECT id, name, surname, company_id FROM users WHERE id = $1`,
+    // An explicitly chosen employee still has to be someone this caller is
+    // allowed to file documents for, and must not be an admin or a terminal.
+    // Without this check an employee_id from the request body could put a
+    // payslip into any company on the platform.
+    const empInfo = await queryOne<{ id: number; name: string; surname: string; company_id: number; role: string; status: string | null }>(
+      `SELECT id, name, surname, company_id, role, status FROM users WHERE id = $1`,
       [providedEmpId],
     );
-    if (empInfo) {
+
+    const inScope = !!empInfo
+      && empInfo.company_id != null
+      && (allowedCompanyIds.length === 0 || allowedCompanyIds.includes(empInfo.company_id));
+    const assignableRole = !!empInfo && !['admin', 'store_terminal', 'system_admin'].includes(empInfo.role);
+
+    if (empInfo && inScope && assignableRole) {
       resolvedEmployee = { id: empInfo.id, name: empInfo.name, surname: empInfo.surname, companyId: empInfo.company_id };
       finalCompanyId = empInfo.company_id;
     } else {
+      // Refuse the assignment rather than guessing a company for it.
+      finalEmpId = null;
       finalCompanyId = options?.companyId ?? (allowedCompanyIds.length > 0 ? allowedCompanyIds[0] : null);
     }
   } else if (match.outcome === 'assigned' && match.employee) {
@@ -280,7 +312,9 @@ export async function performAutoAssign(
 
   const result: AutoAssignResult = {
     matched: !!finalEmpId,
-    outcome: providedEmpId !== null ? 'assigned' : match.outcome,
+    // Only claim "assigned" when an employee actually survived the checks -
+    // a refused employee_id must not be reported as a successful assignment.
+    outcome: finalEmpId ? 'assigned' : match.outcome,
     reason: match.reason,
     employee: resolvedEmployee,
     suggestions,
@@ -402,12 +436,32 @@ router.put(
       is_visible_to_roles: string[];
       requires_signature: boolean;
       expires_at: string | null;
+      company_id: number | null;
+      employee_company_id: number | null;
     }>(
-      `SELECT id, file_url, title, is_visible_to_roles, requires_signature, expires_at FROM documents WHERE id = $1`,
+      `SELECT d.id, d.file_url, d.title, d.is_visible_to_roles, d.requires_signature, d.expires_at,
+              d.company_id, e.company_id AS employee_company_id
+         FROM documents d
+         LEFT JOIN users e ON e.id = d.employee_id
+        WHERE d.id = $1`,
       [id],
     );
 
     if (!doc) {
+      notFound(res, 'Documento non trovato', 'NOT_FOUND');
+      return;
+    }
+
+    // The caller must already have access to the document they are editing.
+    // Without this any admin/HR could edit any document on the platform simply
+    // by guessing its id.
+    const callerCompanyIds = await resolveAllowedCompanyIds(req.user!);
+    const docCompanyId = doc.employee_company_id ?? doc.company_id;
+    if (
+      callerCompanyIds.length > 0
+      && docCompanyId != null
+      && !callerCompanyIds.includes(docCompanyId)
+    ) {
       notFound(res, 'Documento non trovato', 'NOT_FOUND');
       return;
     }
@@ -434,20 +488,42 @@ router.put(
       let targetCompanyId = company_id || req.user!.companyId; // Company from body or user company default
 
       if (employee_id) {
-        // Resolve company and category for the employee
+        // Resolve company and role for the employee
         const emp = await queryOne<{ company_id: number; role: string }>(
           `SELECT company_id, role FROM users WHERE id = $1`,
           [employee_id]
         );
 
-        if (emp && emp.role === 'admin') {
-          badRequest(res, 'I documenti non possono essere assegnati agli amministratori', 'FORBIDDEN_ASSIGNMENT');
+        if (!emp) {
+          badRequest(res, 'Dipendente non trovato', 'EMPLOYEE_NOT_FOUND');
           return;
         }
 
-        if (emp) {
-          targetCompanyId = emp.company_id; // Sync document to employee's company
+        // Terminals and administrator accounts never hold personal documents.
+        if (['admin', 'store_terminal', 'system_admin'].includes(emp.role)) {
+          badRequest(res, 'I documenti non possono essere assegnati a questo tipo di utente', 'FORBIDDEN_ASSIGNMENT');
+          return;
         }
+
+        // The target employee must be in a company the caller administers.
+        if (callerCompanyIds.length > 0 && !callerCompanyIds.includes(emp.company_id)) {
+          badRequest(res, 'Il dipendente selezionato appartiene a un\'azienda non accessibile', 'EMPLOYEE_OUT_OF_SCOPE');
+          return;
+        }
+
+        // The document must not silently migrate to another company: if a
+        // company was chosen explicitly, the employee has to belong to it.
+        const requestedCompanyId = company_id ? parseInt(String(company_id), 10) : null;
+        if (requestedCompanyId && emp.company_id !== requestedCompanyId) {
+          badRequest(
+            res,
+            'Il dipendente selezionato non appartiene all\'azienda scelta per il documento',
+            'EMPLOYEE_COMPANY_MISMATCH',
+          );
+          return;
+        }
+
+        targetCompanyId = emp.company_id; // Sync document to employee's company
       }
 
       // An explicit category always wins. Only fall back to "the company's
@@ -647,6 +723,29 @@ router.get(
       isSuperAdmin: is_super_admin,
       tab,
     });
+
+    // Documents written only into employee_documents (legacy /bulk-upload) are
+    // invisible to the query above. Admin, HR and super admin manage the whole
+    // company, so for them the team list has to include those too - otherwise
+    // part of the platform's documents can never be seen or managed.
+    if (tab === 'team' && (role === 'admin' || role === 'hr' || is_super_admin)) {
+      const scope = allowedCompanyIds.length > 0
+        ? allowedCompanyIds
+        : (companyId ? [companyId] : []);
+      const orphans = await getOrphanEmployeeDocuments({
+        companyIds: scope,
+        excludeEmployeeId: userId,
+      });
+      if (orphans.length > 0) {
+        // Key by source + id: the two tables have independent id sequences.
+        const seen = new Set(docs.map((d: any) => `${d.sourceTable ?? 'documents'}:${d.id}`));
+        for (const orphan of orphans) {
+          const key = `employee_documents:${orphan.id}`;
+          if (!seen.has(key)) { docs.push(orphan as any); seen.add(key); }
+        }
+      }
+    }
+
     ok(res, docs);
   }),
 );
@@ -763,6 +862,8 @@ router.post(
         // Entries we deliberately did not import, reported in the summary so a
         // companion .xml no longer silently becomes a "document".
         const skippedFiles: Array<{ fileName: string; size: number; reason: 'unsupported_format' }> = [];
+        // Entries that blew up on their own; reported, never fatal to the batch.
+        const failedFiles: Array<{ fileName: string; size: number; reason: 'processing_error'; message: string }> = [];
         const seenNames = new Map<string, number>();
         const duplicateFiles: Array<{ fileName: string; firstDocumentId: number }> = [];
 
@@ -785,51 +886,66 @@ router.post(
             duplicateFiles.push({ fileName: entryBasename, firstDocumentId: previous });
           }
 
-          const filePath = path.join(extractDir, entry.entryName);
-          const doc = await createGenericDocument({
-            companyId: baseCompanyId || 0,
-            title: entryBasename,
-            fileUrl: filePath,
-            uploadedBy: req.user!.userId,
-            requiresSignature: options.requiresSignature,
-            expiresAt: options.expiresAt,
-            isVisibleToRoles: options.visibleToRoles,
-          });
+          // Each entry is isolated: one unreadable or corrupt file inside the
+          // archive must never fail the other 25. The client explicitly asked
+          // for per-file reporting rather than a single pass/fail.
+          try {
+            const filePath = path.join(extractDir, entry.entryName);
+            const doc = await createGenericDocument({
+              companyId: baseCompanyId || 0,
+              title: entryBasename,
+              fileUrl: filePath,
+              uploadedBy: req.user!.userId,
+              requiresSignature: options.requiresSignature,
+              expiresAt: options.expiresAt,
+              isVisibleToRoles: options.visibleToRoles,
+            });
 
-          if (previous === undefined) seenNames.set(entryBasename.toLowerCase(), doc.id);
+            if (previous === undefined) seenNames.set(entryBasename.toLowerCase(), doc.id);
 
-          // Simulated so the wizard user reviews and confirms before anything is
-          // written to the employee's personal area.
-          const autoAssignResult = await performAutoAssign(doc.id, entryBasename, allowedCompanyIds, {
-            ...options,
-            simulate: true
-          });
+            // Simulated so the wizard user reviews and confirms before anything is
+            // written to the employee's personal area.
+            const autoAssignResult = await performAutoAssign(doc.id, entryBasename, allowedCompanyIds, {
+              ...options,
+              simulate: true
+            });
 
-          extractedFiles.push({
-            documentId: doc.id,
-            fileName: entryBasename,
-            size,
-            mimeType: mimeTypeForFilename(entryBasename),
-            matched: autoAssignResult.matched,
-            outcome: autoAssignResult.outcome,
-            reason: autoAssignResult.reason,
-            employee: autoAssignResult.employee,
-            suggestions: autoAssignResult.suggestions
-          });
+            extractedFiles.push({
+              documentId: doc.id,
+              fileName: entryBasename,
+              size,
+              mimeType: mimeTypeForFilename(entryBasename),
+              matched: autoAssignResult.matched,
+              outcome: autoAssignResult.outcome,
+              reason: autoAssignResult.reason,
+              employee: autoAssignResult.employee,
+              suggestions: autoAssignResult.suggestions
+            });
+          } catch (entryErr: any) {
+            console.error(`[documents] ZIP entry failed: ${entryBasename}`, entryErr);
+            failedFiles.push({
+              fileName: entryBasename,
+              size,
+              reason: 'processing_error',
+              message: entryErr?.message ? String(entryErr.message) : 'unknown error',
+            });
+          }
         }
 
         ok(res, {
           isZip: true,
-          totalEntries: extractedFiles.length + skippedFiles.length,
+          totalEntries: extractedFiles.length + skippedFiles.length + failedFiles.length,
           totalExtracted: extractedFiles.length,
           files: extractedFiles,
           skipped: skippedFiles,
+          failed: failedFiles,
           duplicates: duplicateFiles,
           summary: {
             assigned: extractedFiles.filter(f => f.outcome === 'assigned').length,
             ambiguous: extractedFiles.filter(f => f.outcome === 'ambiguous').length,
             unmatched: extractedFiles.filter(f => f.outcome === 'unmatched').length,
             skipped: skippedFiles.length,
+            failed: failedFiles.length,
             duplicates: duplicateFiles.length,
           },
           message: `${extractedFiles.length} file(s) extracted from ZIP`
@@ -929,7 +1045,7 @@ router.post(
   requireRole('admin', 'hr'),
   asyncHandler(async (req: Request, res: Response) => {
     const { files, company_id } = req.body as {
-      files?: Array<{ documentId?: number; fileName?: string }>;
+      files?: Array<{ documentId?: number; fileName?: string; document_id?: number; file_name?: string }>;
       company_id?: number | string | null;
     };
 
@@ -938,28 +1054,64 @@ router.post(
       return;
     }
 
+    // The web client runs every request body through a camelCase -> snake_case
+    // transform, so what arrives here is { document_id, file_name }. Accept both
+    // spellings: reading only the camelCase form silently produced an empty
+    // filename for every entry, and the matcher then answered "not_a_name".
+    const readEntry = (f: typeof files[number]) => ({
+      documentId: f?.documentId ?? f?.document_id ?? null,
+      fileName: String(f?.fileName ?? f?.file_name ?? ''),
+    });
+
     const companyId =
       company_id !== undefined && company_id !== null && String(company_id) !== 'null'
         ? parseInt(String(company_id), 10)
         : null;
 
     const allowedCompanyIds = await resolveAllowedCompanyIds(req.user!);
-    const isGlobalSearch = req.user!.is_super_admin || allowedCompanyIds.length === 0;
+
+    /**
+     * Candidate pool. Once a company is chosen, suggestions are restricted to
+     * that company's GROUP rather than the whole platform - a super admin can
+     * reach every company, but showing them all of it turns "did you mean" into
+     * noise and invites a mis-assignment across unrelated tenants. Standalone
+     * companies (no group) resolve to themselves alone.
+     */
+    let poolCompanyIds: number[] = allowedCompanyIds;
+    if (companyId != null) {
+      const groupId = await resolveCompanyGroupId(companyId);
+      if (groupId == null) {
+        poolCompanyIds = [companyId];
+      } else {
+        const siblings = await query<{ id: number }>(
+          `SELECT id FROM companies WHERE group_id = $1`,
+          [groupId],
+        );
+        const groupIds = siblings.map(r => r.id);
+        // Never widen beyond what the caller may already see.
+        poolCompanyIds = allowedCompanyIds.length > 0
+          ? groupIds.filter(id => allowedCompanyIds.includes(id))
+          : groupIds;
+        if (!poolCompanyIds.includes(companyId)) poolCompanyIds.push(companyId);
+      }
+    }
+
+    const unscopedPool = poolCompanyIds.length === 0;
 
     const employees = await query<MatchableEmployee>(
       `SELECT id, name, surname, unique_id, company_id
          FROM users
         WHERE (status = 'active' OR status IS NULL)
           AND role NOT IN ('admin', 'store_terminal', 'system_admin')
-          ${isGlobalSearch ? '' : 'AND (company_id = ANY($1) OR company_id IS NULL)'}`,
-      isGlobalSearch ? [] : [allowedCompanyIds],
+          ${unscopedPool ? '' : 'AND (company_id = ANY($1) OR company_id IS NULL)'}`,
+      unscopedPool ? [] : [poolCompanyIds],
     );
 
     const results = files.map((f) => {
-      const fileName = String(f?.fileName ?? '');
+      const { documentId, fileName } = readEntry(f);
       const match = matchEmployeeByFilename(fileName, employees, { companyId });
       return {
-        documentId: f?.documentId ?? null,
+        documentId,
         fileName,
         matched: match.outcome === 'assigned',
         outcome: match.outcome,

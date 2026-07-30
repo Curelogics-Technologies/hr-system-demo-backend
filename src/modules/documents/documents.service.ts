@@ -660,6 +660,44 @@ export async function getEmployeeDocuments(
 }
 
 
+/**
+ * Employee documents that have no counterpart in the `documents` table.
+ *
+ * The legacy /bulk-upload route writes straight into `employee_documents`, so
+ * those files never appeared in the admin/HR document list - which is why a
+ * super admin could not see everything on the platform. They are matched by
+ * storage_path so a document present in both tables is not listed twice.
+ */
+export async function getOrphanEmployeeDocuments(options: {
+  companyIds: number[];
+  excludeEmployeeId?: number | null;
+}): Promise<DocumentRecord[]> {
+  if (!options.companyIds || options.companyIds.length === 0) return [];
+
+  const params: unknown[] = [options.companyIds];
+  let extra = '';
+  if (options.excludeEmployeeId != null) {
+    params.push(options.excludeEmployeeId);
+    extra = `AND (d.employee_id IS NULL OR d.employee_id <> $${params.length})`;
+  }
+
+  const rows = await query<any>(
+    `${DOC_SELECT}
+      WHERE d.company_id = ANY($1)
+        AND d.is_deleted = false
+        AND d.deleted_at IS NULL
+        ${extra}
+        AND NOT EXISTS (
+          SELECT 1 FROM documents g
+           WHERE g.file_url = d.storage_path
+             AND g.is_deleted = false
+        )
+      ORDER BY d.uploaded_at DESC, d.id DESC`,
+    params,
+  );
+  return rows.map(mapDocumentRecord);
+}
+
 export async function softDeleteDocument(
   id: number,
   companyId: number,

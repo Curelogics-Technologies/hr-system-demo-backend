@@ -9,6 +9,7 @@ import { runManagerAlertJob } from './manager-alert.job';
 import { runReportConfigurationsJob } from './reports.job';
 import { runAttendanceAnomalyCheckJob, runNoShowAlertEmailJob } from './attendance-anomaly-check.job';
 import { runShiftApprovalReminderJob } from './shift-approval-reminder.job';
+import { runCandidateRetentionForAllCompanies } from './candidate-retention.job';
 
 type JobKey =
   | 'welcome_email'
@@ -115,6 +116,17 @@ export function startScheduler(): void {
   // Weekly report schedules — every minute
   cron.schedule('* * * * *', () => {
     runReportConfigurationsJob().catch(console.error);
+  });
+
+  // GDPR candidate retention sweep — daily at 03:30 Europe/Rome.
+  // Runs off-peak because it writes to candidates and deletes CV files.
+  // Opt-in per company, so it does its own company filtering rather than
+  // going through runForAllCompanies (which defaults missing settings to on).
+  cron.schedule('30 3 * * *', () => {
+    console.log('[scheduler] candidate-retention');
+    runCandidateRetentionForAllCompanies().catch(console.error);
+  }, {
+    timezone: 'Europe/Rome',
   });
 
   console.log('[scheduler] All cron jobs registered');

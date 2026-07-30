@@ -20,6 +20,9 @@ import {
   createScreenerQuestionHandler,
   updateScreenerQuestionHandler,
   deleteScreenerQuestionHandler,
+  getCandidateRetentionHandler,
+  updateCandidateRetentionHandler,
+  previewCandidateRetentionHandler,
 } from './ats.controller';
 import { optionalInternalResumeUpload } from './atsCvUpload';
 
@@ -50,6 +53,12 @@ router.get('/jobs/:jobId/screener-questions', listScreenerQuestionsHandler);
 router.post('/jobs/:jobId/screener-questions', requireRole('admin', 'hr'), createScreenerQuestionHandler);
 router.put('/jobs/:jobId/screener-questions/:qId', requireRole('admin', 'hr'), updateScreenerQuestionHandler);
 router.delete('/jobs/:jobId/screener-questions/:qId', requireRole('admin', 'hr'), deleteScreenerQuestionHandler);
+
+// GDPR candidate retention policy.
+// Declared before '/candidates/:id' so "retention" is not swallowed as an id.
+router.get('/candidates/retention',          requireRole('admin', 'hr'), getCandidateRetentionHandler);
+router.put('/candidates/retention',          requireRole('admin'), updateCandidateRetentionHandler);
+router.get('/candidates/retention/preview',  requireRole('admin', 'hr'), previewCandidateRetentionHandler);
 
 // Candidates
 router.get('/candidates',         listCandidatesHandler);
