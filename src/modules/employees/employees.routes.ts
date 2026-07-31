@@ -20,6 +20,7 @@ import { auditLog } from '../../middleware/auditLog';
 import trainingsRoutes from './trainings.routes';
 import medicalsRoutes from './medicals.routes';
 import { uploadMiddleware, uploadAvatar, deleteAvatar } from './avatar.controller';
+import { bulkImportEmployees, getImportPrecheck } from './employees.bulkImport.controller';
 
 const router = Router();
 
@@ -177,6 +178,26 @@ router.delete(
   enforceCompany,
   requireRole('admin', 'hr', 'area_manager', 'store_manager', 'employee'),
   deleteAvatar,
+);
+
+// Bulk import — declared before '/import-templates' shares no prefix conflict,
+// but kept with the other import routes for discoverability.
+router.post(
+  '/bulk-import',
+  authenticate,
+  enforceCompany,
+  requireRole('admin', 'hr'),
+  requireModulePermission('dipendenti', 'write'),
+  bulkImportEmployees,
+);
+
+router.get(
+  '/import-precheck',
+  authenticate,
+  enforceCompany,
+  requireRole('admin', 'hr'),
+  requireModulePermission('dipendenti', 'read'),
+  getImportPrecheck,
 );
 
 // Import templates routes
