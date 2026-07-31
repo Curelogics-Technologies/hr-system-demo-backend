@@ -499,6 +499,7 @@ export async function getPublishedJobsForFeed(identifier: string): Promise<{ com
        LEFT JOIN stores s ON s.id = j.store_id
        WHERE c.is_active = true
          AND j.status = 'published'
+         AND (j.expiration_date IS NULL OR j.expiration_date > NOW())
        ORDER BY COALESCE(j.published_at, j.created_at) DESC`,
     );
 
@@ -559,6 +560,7 @@ export async function getPublishedJobsForFeed(identifier: string): Promise<{ com
      LEFT JOIN company_groups cg ON cg.id = c.group_id
      LEFT JOIN stores s ON s.id = j.store_id
      WHERE j.company_id = $1 AND j.status = 'published'
+       AND (j.expiration_date IS NULL OR j.expiration_date > NOW())
      ORDER BY COALESCE(j.published_at, j.created_at) DESC`,
     [company.id],
   );

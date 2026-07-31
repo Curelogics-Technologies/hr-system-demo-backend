@@ -1736,7 +1736,25 @@ export const getIndeedStatsHandler = asyncHandler(async (req: Request, res: Resp
 // ---------------------------------------------------------------------------
 
 function wrapCdata(value: string): string {
-  return `<![CDATA[${value.replace(/\]\]>/g, ']]]]><![CDATA[>')}]]>`;
+  // Trim leading/trailing whitespace so Indeed does not read padded values
+  // like " FUSARO UOMO " (it interprets the surrounding spaces literally).
+  const trimmed = (value ?? '').trim();
+  return `<![CDATA[${trimmed.replace(/\]\]>/g, ']]]]><![CDATA[>')}]]>`;
+}
+
+// Indeed penalises job titles that embed the location, and the city is already
+// carried in the dedicated <city> tag. Remove the city (as a standalone word,
+// optionally after a - – , separator) and collapse any repeated whitespace.
+function cleanFeedTitle(rawTitle: string, city: string): string {
+  let out = (rawTitle ?? '').replace(/\s+/g, ' ').trim();
+  const c = (city ?? '').trim();
+  if (c && c.toLowerCase() !== 'remote') {
+    const escaped = c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    out = out.replace(new RegExp(`\\s*[-–,]?\\s*\\b${escaped}\\b`, 'gi'), ' ');
+  }
+  out = out.replace(/\s+/g, ' ').replace(/[\s\-–,]+$/g, '').trim();
+  // Never return an empty title if the whole thing was the city name.
+  return out || (rawTitle ?? '').replace(/\s+/g, ' ').trim();
 }
 
 function decodeHtmlEntities(input: string): string {
@@ -2220,7 +2238,12 @@ export const jobFeedHandler = async (req: Request, res: Response): Promise<void>
     const { company, jobs } = await getPublishedJobsForFeed(slug);
 
     if (!company) {
-      res.status(404).type('text/plain').send('Company not found');
+      // Respond with a proper 404 AND a valid XML document (not plain text),
+      // so crawlers and clients get a well-formed, correctly-typed response.
+      res
+        .status(404)
+        .type('application/xml; charset=UTF-8')
+        .send('<?xml version="1.0" encoding="UTF-8"?>\n<source>\n  <error code="404">Company not found</error>\n</source>');
       return;
     }
 
@@ -2253,7 +2276,8 @@ export const jobFeedHandler = async (req: Request, res: Response): Promise<void>
         }
 
         const pubDate = new Date(job.publishedAt ?? job.createdAt).toISOString();
-        const title = job.title.trim();
+        // Feed title excludes the location (kept in <city>) and has no double spaces.
+        const title = cleanFeedTitle(job.title, city);
         const descriptionRaw = job.description ?? job.title;
         const description = sanitizeFeedDescription(descriptionRaw) || `<p>${title}</p>`;
 
@@ -2277,28 +2301,38 @@ export const jobFeedHandler = async (req: Request, res: Response): Promise<void>
           : null;
         const companyUpper = company.slug.replace(/-/g, '_').toUpperCase();
         const companySlugShort = company.slug.split('-')[0].toUpperCase(); // e.g. FUSARO
-        const apiToken = process.env[`INDEED_APPLY_API_TOKEN_${companyUpper}`] ||
+        const configuredApiToken = process.env[`INDEED_APPLY_API_TOKEN_${companyUpper}`] ||
                          process.env[`INDEED_APPLY_API_TOKEN_${companySlugShort}`] ||
                          process.env.INDEED_APPLY_API_TOKEN ||
-                         'mock_veylohr_indeed_token_2026';
+                         null;
+        // Native "Apply on Indeed" is advertised ONLY when a real token is configured.
+        // Without one (partnership not signed / placeholder), we omit <indeed-apply-data>
+        // entirely so Indeed routes candidates to the job <url> (the Careers page) rather
+        // than to a channel that would silently reject applications on a fake token.
+        // Re-enabling later is a one-line env change (set INDEED_APPLY_API_TOKEN).
+        const hasRealIndeedApplyToken =
+          !!configuredApiToken && configuredApiToken !== 'mock_veylohr_indeed_token_2026';
 
         const baseUrl = process.env.APP_BASE_URL || 'https://veylohr.com';
-        const indeedApplyParams = new URLSearchParams({
-          'indeed-apply-apiToken': apiToken,
-          'indeed-apply-jobUrl': jobUrl,
-          'indeed-apply-jobTitle': title,
-          'indeed-apply-jobLocation': `${city}, ${country}`,
-          'indeed-apply-jobCompanyName': job.companyName || company.name,
-          'indeed-apply-jobId': String(job.id),
-          'indeed-apply-postUrl': `${baseUrl}/api/public/indeed-apply/${job.companySlug}`,
-          'indeed-apply-name': 'true',
-          'indeed-apply-email': 'true',
-          'indeed-apply-resume': 'true',
-          'indeed-apply-coverletter': 'optional',
-          'indeed-apply-phone': 'optional',
-          'indeed-apply-questions': `${baseUrl}/api/public/indeed-apply-questions/${job.companySlug}/${job.id}`
-        });
-        const indeedApplyData = indeedApplyParams.toString();
+        let indeedApplyData = '';
+        if (hasRealIndeedApplyToken) {
+          const indeedApplyParams = new URLSearchParams({
+            'indeed-apply-apiToken': configuredApiToken as string,
+            'indeed-apply-jobUrl': jobUrl,
+            'indeed-apply-jobTitle': title,
+            'indeed-apply-jobLocation': `${city}, ${country}`,
+            'indeed-apply-jobCompanyName': job.companyName || company.name,
+            'indeed-apply-jobId': String(job.id),
+            'indeed-apply-postUrl': `${baseUrl}/api/public/indeed-apply/${job.companySlug}`,
+            'indeed-apply-name': 'true',
+            'indeed-apply-email': 'true',
+            'indeed-apply-resume': 'true',
+            'indeed-apply-coverletter': 'optional',
+            'indeed-apply-phone': 'optional',
+            'indeed-apply-questions': `${baseUrl}/api/public/indeed-apply-questions/${job.companySlug}/${job.id}`
+          });
+          indeedApplyData = indeedApplyParams.toString();
+        }
 
         const xmlFields: string[] = [
           '  <job>',
@@ -2309,7 +2343,9 @@ export const jobFeedHandler = async (req: Request, res: Response): Promise<void>
           `    <url>${wrapCdata(jobUrl)}</url>`,
           `    <company>${wrapCdata(job.companyName || company.name)}</company>`,
           `    <sourcename>${wrapCdata(job.companyGroupName || job.companyName || company.name)}</sourcename>`,
-          `    <indeed-apply-data>${wrapCdata(indeedApplyData)}</indeed-apply-data>`,
+          ...(indeedApplyData
+            ? [`    <indeed-apply-data>${wrapCdata(indeedApplyData)}</indeed-apply-data>`]
+            : []),
           `    <city>${wrapCdata(city)}</city>`,
         ];
 
