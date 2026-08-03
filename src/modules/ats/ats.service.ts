@@ -447,6 +447,15 @@ export async function listJobs(
             creator.role::text AS created_by_role,
             creator.avatar_filename AS created_by_avatar_filename,
             creator_store.name AS created_by_store_name,
+            -- Explicit raw job-location overrides. j.* already returns these, but
+            -- selecting them explicitly guarantees the edit form gets the true
+            -- per-job value even if this SELECT is ever refactored away from j.*
+            -- (the mapper reads row.job_city/etc, NOT the COALESCE'd aliases below).
+            j.job_city AS job_city,
+            j.job_state AS job_state,
+            j.job_country AS job_country,
+            j.job_postal_code AS job_postal_code,
+            j.job_address AS job_address,
                  COALESCE(j.job_city, c.city) AS city,
                  COALESCE(j.job_state, c.state) AS state,
                  COALESCE(j.job_country, c.country) AS country,
@@ -581,6 +590,13 @@ export async function getJob(id: number, companyId: number): Promise<JobPosting 
             creator.role::text AS created_by_role,
             creator.avatar_filename AS created_by_avatar_filename,
             creator_store.name AS created_by_store_name,
+            -- Explicit raw job-location overrides (see note in listJobs): the edit
+            -- form reads these raw values, so guarantee they are always returned.
+            j.job_city AS job_city,
+            j.job_state AS job_state,
+            j.job_country AS job_country,
+            j.job_postal_code AS job_postal_code,
+            j.job_address AS job_address,
                  COALESCE(j.job_city, c.city) AS city,
                  COALESCE(j.job_state, c.state) AS state,
                  COALESCE(j.job_country, c.country) AS country,
