@@ -215,6 +215,24 @@ describe('GET /api/leave', () => {
     res.body.data.requests.forEach((r: any) => expect(r.leave_type).toBe('vacation'));
   });
 
+  it('includes cross-month leave requests when filtering by date_from and date_to', async () => {
+    const { rows: [crossMonthReq] } = await testPool.query(
+      `INSERT INTO leave_requests (company_id, user_id, store_id, leave_type, start_date, end_date, status, current_approver_role, notes)
+       VALUES ($1, $2, $3, 'vacation', '2026-07-27', '2026-08-09', 'approved', 'admin', 'Cross month vacation')
+       RETURNING id`,
+      [seeds.acmeId, seeds.employee1Id, seeds.romaStoreId]
+    );
+
+    const token = await login('hr@acme-test.com');
+    const res = await request
+      .get('/api/leave')
+      .query({ date_from: '2026-08-01', date_to: '2026-08-31' })
+      .set('Authorization', `Bearer ${token}`);
+    expect(res.status).toBe(200);
+    const found = res.body.data.requests.find((r: any) => r.id === crossMonthReq.id);
+    expect(found).toBeDefined();
+  });
+
   it('returns 401 for unauthenticated request', async () => {
     const res = await request.get('/api/leave');
     expect(res.status).toBe(401);

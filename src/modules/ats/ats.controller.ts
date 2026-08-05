@@ -994,6 +994,10 @@ export const createCandidateHandler = asyncHandler(async (req: Request, res: Res
       ? Number.parseInt(store_id, 10)
       : undefined);
 
+  if (parsedStoreId === undefined && req.user?.role === 'store_manager' && req.user?.storeId) {
+    parsedStoreId = req.user.storeId;
+  }
+
   if (parsedStoreId !== undefined && Number.isNaN(parsedStoreId)) {
     badRequest(res, 'Punto vendita non valido', 'VALIDATION_ERROR');
     return;
@@ -1416,16 +1420,29 @@ export const createInterviewHandler = asyncHandler(async (req: Request, res: Res
 
   if (!interview) { notFound(res, 'Candidato non trovato'); return; }
 
-  const candidateDetails = await queryOne<{ email: string | null; full_name: string | null }>(
-    `SELECT email, full_name FROM candidates WHERE id = $1 LIMIT 1`,
+  const candidateDetails = await queryOne<{
+    email: string | null;
+    full_name: string | null;
+    store_timezone: string | null;
+    store_address: string | null;
+    store_cap: string | null;
+    store_city: string | null;
+    store_name: string | null;
+  }>(
+    `SELECT c.email, c.full_name,
+            st.timezone AS store_timezone, st.address AS store_address, st.cap AS store_cap, st.city AS store_city, st.name AS store_name
+     FROM candidates c
+     LEFT JOIN stores st ON st.id = c.store_id
+     WHERE c.id = $1 LIMIT 1`,
     [candidateId]
   );
+  const targetTimezone = candidateDetails?.store_timezone || 'Europe/Rome';
 
   // Create notification logs for tracking
   const notificationPromises: Promise<void>[] = [];
 
   // Notify the assigned interviewer in their own locale (resolved inside sendNotification from DB)
-  if (typeof interviewer_id === 'number' && interviewer_id !== userId) {
+  if (typeof interviewer_id === 'number') {
     const interviewerRow = await queryOne<{ locale?: string | null; role?: string | null; email?: string | null; name?: string; surname?: string }>(
       `SELECT locale, role, email, name, surname FROM users WHERE id = $1 LIMIT 1`,
       [interviewer_id],
@@ -1447,11 +1464,17 @@ export const createInterviewHandler = asyncHandler(async (req: Request, res: Res
       );
 
       if (interviewerNotifLog) {
-        const scheduledTime = scheduledDate.toLocaleTimeString(dateLocale, { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Rome' });
+        const scheduledTime = scheduledDate.toLocaleTimeString(dateLocale, { hour: '2-digit', minute: '2-digit', timeZone: targetTimezone });
         const candidateName = candidateDetails?.full_name?.trim()
           || (interviewerLocale === 'it' ? 'il candidato' : 'the candidate');
-        const locationSuffix = typeof location === 'string' && location.trim()
-          ? (interviewerLocale === 'it' ? ` presso ${location.trim()}` : ` at ${location.trim()}`)
+        const isInPerson = normalizedInterviewType === 'in_person';
+        const rawStoreAddr = [candidateDetails?.store_address, candidateDetails?.store_cap, candidateDetails?.store_city].filter(Boolean).join(', ');
+        const fallbackAddr = rawStoreAddr || candidateDetails?.store_name || '';
+        const effectiveLocation = isInPerson
+          ? (typeof location === 'string' && location.trim() ? location.trim() : fallbackAddr)
+          : '';
+        const locationSuffix = isInPerson && effectiveLocation
+          ? (interviewerLocale === 'it' ? ` presso ${effectiveLocation}` : ` at ${effectiveLocation}`)
           : '';
 
         notificationPromises.push(
@@ -1463,7 +1486,7 @@ export const createInterviewHandler = asyncHandler(async (req: Request, res: Res
               title:   t(interviewerLocale, 'notifications.ats_interview_invite.title'),
               message: t(interviewerLocale, 'notifications.ats_interview_invite.message', {
                 candidate: candidateName,
-                date: scheduledDate.toLocaleDateString(dateLocale, { timeZone: 'Europe/Rome' }),
+                date: scheduledDate.toLocaleDateString(dateLocale, { timeZone: targetTimezone }),
                 time: scheduledTime,
                 location: locationSuffix,
               }),
@@ -2714,9 +2737,18 @@ export const sendInterviewNotificationHandler = asyncHandler(async (req: Request
     location: string | null;
     description: string | null;
     interview_type: string | null;
+    store_timezone: string | null;
+    store_address: string | null;
+    store_cap: string | null;
+    store_city: string | null;
+    store_name: string | null;
   }>(
-    `SELECT company_id, candidate_id, interviewer_id, scheduled_at, location, description, interview_type
-     FROM interviews WHERE id = $1 LIMIT 1`,
+    `SELECT i.company_id, i.candidate_id, i.interviewer_id, i.scheduled_at, i.location, i.description, i.interview_type,
+            st.timezone AS store_timezone, st.address AS store_address, st.cap AS store_cap, st.city AS store_city, st.name AS store_name
+     FROM interviews i
+     LEFT JOIN candidates c ON c.id = i.candidate_id
+     LEFT JOIN stores st ON st.id = COALESCE(i.store_id, c.store_id)
+     WHERE i.id = $1 LIMIT 1`,
     [interviewId],
   );
   if (!interviewRow) { notFound(res, 'Colloquio non trovato'); return; }
@@ -2882,11 +2914,18 @@ export const sendInterviewNotificationHandler = asyncHandler(async (req: Request
         `SELECT full_name FROM candidates WHERE id = $1 LIMIT 1`,
         [interviewRow.candidate_id],
       );
-      const scheduledTime = scheduledDate.toLocaleTimeString(dateLocale, { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Rome' });
+      const targetTimezone = interviewRow.store_timezone || 'Europe/Rome';
+      const scheduledTime = scheduledDate.toLocaleTimeString(dateLocale, { hour: '2-digit', minute: '2-digit', timeZone: targetTimezone });
       const candidateName = candidateRow?.full_name?.trim()
         || (interviewerLocale === 'it' ? 'il candidato' : 'the candidate');
-      const locationSuffix = interviewRow.location && interviewRow.location.trim()
-        ? (interviewerLocale === 'it' ? ` presso ${interviewRow.location.trim()}` : ` at ${interviewRow.location.trim()}`)
+      const isInPerson = interviewRow.interview_type === 'in_person' || !interviewRow.interview_type;
+      const rawStoreAddr = [interviewRow.store_address, interviewRow.store_cap, interviewRow.store_city].filter(Boolean).join(', ');
+      const fallbackAddr = rawStoreAddr || interviewRow.store_name || '';
+      const effectiveLocation = isInPerson
+        ? (interviewRow.location && interviewRow.location.trim() ? interviewRow.location.trim() : fallbackAddr)
+        : '';
+      const locationSuffix = isInPerson && effectiveLocation
+        ? (interviewerLocale === 'it' ? ` presso ${effectiveLocation}` : ` at ${effectiveLocation}`)
         : '';
 
       await sendNotification({
@@ -2896,7 +2935,7 @@ export const sendInterviewNotificationHandler = asyncHandler(async (req: Request
         title: t(interviewerLocale, 'notifications.ats_interview_invite.title'),
         message: t(interviewerLocale, 'notifications.ats_interview_invite.message', {
           candidate: candidateName,
-          date: scheduledDate.toLocaleDateString(dateLocale, { timeZone: 'Europe/Rome' }),
+          date: scheduledDate.toLocaleDateString(dateLocale, { timeZone: targetTimezone }),
           time: scheduledTime,
           location: locationSuffix,
         }),
@@ -2983,13 +3022,30 @@ async function sendProfessionalInterviewEmail(params: {
       description: string | null;
       interview_type: string | null;
       candidate_id: number;
+      store_timezone: string | null;
+      store_address: string | null;
+      store_cap: string | null;
+      store_city: string | null;
+      store_name: string | null;
     }>(
-      `SELECT scheduled_at, location, description, interview_type, candidate_id
-       FROM interviews WHERE id = $1 LIMIT 1`,
+      `SELECT i.scheduled_at, i.location, i.description, i.interview_type, i.candidate_id,
+              st.timezone AS store_timezone, st.address AS store_address, st.cap AS store_cap, st.city AS store_city, st.name AS store_name
+       FROM interviews i
+       LEFT JOIN candidates c ON c.id = i.candidate_id
+       LEFT JOIN stores st ON st.id = COALESCE(i.store_id, c.store_id)
+       WHERE i.id = $1 LIMIT 1`,
       [interviewId],
     );
 
     if (!interviewRow) throw new Error('Interview not found');
+
+    const targetTimezone = interviewRow.store_timezone || 'Europe/Rome';
+    const isInPerson = interviewRow.interview_type === 'in_person' || !interviewRow.interview_type;
+    const rawStoreAddr = [interviewRow.store_address, interviewRow.store_cap, interviewRow.store_city].filter(Boolean).join(', ');
+    const fallbackAddr = rawStoreAddr || interviewRow.store_name || storeName || '';
+    const effectiveLocation = isInPerson
+      ? (interviewRow.location && interviewRow.location.trim() ? interviewRow.location.trim() : fallbackAddr)
+      : '';
 
     const frontendBase = resolveFrontendBase(req);
     const backendBase = resolveBackendBase(req);
@@ -3003,12 +3059,12 @@ async function sendProfessionalInterviewEmail(params: {
       day: '2-digit',
       month: 'long',
       year: 'numeric',
-      timeZone: 'Europe/Rome',
+      timeZone: targetTimezone,
     });
     const timeLabel = scheduledDate.toLocaleTimeString('it-IT', {
       hour: '2-digit',
       minute: '2-digit',
-      timeZone: 'Europe/Rome',
+      timeZone: targetTimezone,
     });
     const logoPath = findEmailLogoPath();
     const logoCid = logoPath ? 'veylo-hr-logo' : null;
@@ -3018,7 +3074,7 @@ async function sendProfessionalInterviewEmail(params: {
     const safeCandidateName = escapeHtml(candidateName);
     const safeStoreName = escapeHtml(storeName);
     const safeLogoSrc = escapeHtml(logoSrc);
-    const safeLocation = escapeHtml(interviewRow.location || '');
+    const safeLocation = escapeHtml(effectiveLocation);
     const safeDescription = escapeHtml(interviewRow.description || '').replace(/\r?\n/g, '<br />');
     const logoUrl = logoSrc;
 
@@ -3026,7 +3082,7 @@ async function sendProfessionalInterviewEmail(params: {
     const ics = generateICSEvent({
       title: `Colloquio: ${candidateName}`,
       description: interviewRow.description || 'Job Interview',
-      location: interviewRow.location || '',
+      location: effectiveLocation,
       startDate: scheduledDate,
     });
     
@@ -3053,16 +3109,16 @@ async function sendProfessionalInterviewEmail(params: {
             <table style="width: 100%; border-collapse: collapse;">
               <tr>
                 <td style="padding: 8px 0; color: #64748b; font-weight: 600; width: 140px;">Data e Ora</td>
-                <td style="padding: 8px 0; color: #0f172a;">${interviewRow.scheduled_at ? new Date(interviewRow.scheduled_at).toLocaleString('it-IT', { timeZone: 'Europe/Rome' }) : 'N/A'}</td>
+                <td style="padding: 8px 0; color: #0f172a;">${interviewRow.scheduled_at ? new Date(interviewRow.scheduled_at).toLocaleString('it-IT', { timeZone: targetTimezone }) : 'N/A'}</td>
               </tr>
               <tr>
                 <td style="padding: 8px 0; color: #64748b; font-weight: 600;">Tipo</td>
                 <td style="padding: 8px 0; color: #0f172a;">${interviewRow.interview_type === 'phone' ? 'Telefonico 📞' : 'Di Persona 🤝'}</td>
               </tr>
-              ${interviewRow.location ? `
+              ${effectiveLocation ? `
               <tr>
                 <td style="padding: 8px 0; color: #64748b; font-weight: 600;">Luogo</td>
-                <td style="padding: 8px 0; color: #0f172a;">${interviewRow.location}</td>
+                <td style="padding: 8px 0; color: #0f172a;">${escapeHtml(effectiveLocation)}</td>
               </tr>` : ''}
               ${interviewRow.description ? `
               <tr>
