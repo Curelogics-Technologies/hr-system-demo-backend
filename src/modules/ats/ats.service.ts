@@ -897,7 +897,7 @@ export async function listCandidates(
   filters: { status?: string; jobPostingId?: number; storeIds?: number[] } = {},
 ): Promise<Candidate[]> {
   const companyIds = Array.isArray(companyId) ? companyId : [companyId];
-  const conditions: string[] = ['c.company_id = ANY($1::int[])', "jp.status = 'published'"];
+  const conditions: string[] = ['c.company_id = ANY($1::int[])', "(c.job_posting_id IS NULL OR jp.status = 'published')"];
   const params: unknown[] = [companyIds];
   let idx = 2;
 
@@ -1039,11 +1039,11 @@ export async function updateCandidateStage(
     };
   }
 
-  let queryStr = `UPDATE candidates SET status = $1, last_stage_change = NOW(), updated_at = NOW()`;
+  let queryStr = `UPDATE candidates SET status = $1, unread = FALSE, last_stage_change = NOW(), updated_at = NOW()`;
   const queryParams: unknown[] = [newStatus, id, companyId];
 
   if (newStatus === 'rejected' && rejectionReason !== undefined) {
-    queryStr = `UPDATE candidates SET status = $1, rejection_reason = $4, last_stage_change = NOW(), updated_at = NOW()`;
+    queryStr = `UPDATE candidates SET status = $1, rejection_reason = $4, unread = FALSE, last_stage_change = NOW(), updated_at = NOW()`;
     queryParams.push(rejectionReason);
   }
 
@@ -1093,13 +1093,13 @@ export async function listInterviews(candidateId: number, companyId: number, sto
          LEFT JOIN job_postings jp ON jp.id = c.job_posting_id
          WHERE i.candidate_id = $1
            AND c.company_id = $2
-           AND jp.status = 'published'
+           AND (c.job_posting_id IS NULL OR jp.status = 'published')
            AND COALESCE(c.store_id, jp.store_id) = ANY($3::int[])
          ORDER BY i.scheduled_at ASC`
       : `SELECT i.* FROM interviews i
          JOIN candidates c ON c.id = i.candidate_id
-         JOIN job_postings jp ON jp.id = c.job_posting_id
-         WHERE i.candidate_id = $1 AND c.company_id = $2 AND jp.status = 'published'
+         LEFT JOIN job_postings jp ON jp.id = c.job_posting_id
+         WHERE i.candidate_id = $1 AND c.company_id = $2 AND (c.job_posting_id IS NULL OR jp.status = 'published')
          ORDER BY i.scheduled_at ASC`,
     useStoreScope ? [candidateId, companyId, storeIds] : [candidateId, companyId],
   );
@@ -1120,13 +1120,16 @@ export async function listAllInterviews(
   const useStoreScope = Array.isArray(storeIds) && storeIds.length > 0;
   
   // Build WHERE conditions
-  const conditions: string[] = ['c.company_id = ANY($1::int[])', "jp.status = 'published'"];
+  const conditions: string[] = ['c.company_id = ANY($1::int[])', "(c.job_posting_id IS NULL OR jp.status = 'published')"];
   const params: any[] = [companyIds];
   let paramIndex = 2;
 
   if (useStoreScope) {
     // Check interview store_id, candidate store_id, or job_posting store_id
-    conditions.push(`COALESCE(i.store_id, c.store_id, jp.store_id) = ANY($${paramIndex}::int[])`);
+    conditions.push(`(
+      COALESCE(i.store_id, c.store_id, jp.store_id) = ANY($${paramIndex}::int[])
+      OR COALESCE(i.store_id, c.store_id, jp.store_id) IS NULL
+    )`);
     params.push(storeIds);
     paramIndex++;
   }
@@ -1280,6 +1283,13 @@ export async function createInterview(
   const candidate = await getCandidate(candidateId, companyId, storeIds);
   if (!candidate) return null;
 
+  const fallbackStoreId = Array.isArray(storeIds) && storeIds.length > 0 ? storeIds[0] : null;
+  const effectiveStoreId = candidate.storeId ?? fallbackStoreId;
+
+  if (candidate.storeId == null && effectiveStoreId != null) {
+    await query(`UPDATE candidates SET store_id = $1 WHERE id = $2 AND store_id IS NULL`, [effectiveStoreId, candidateId]);
+  }
+
   const row = await queryOne<Record<string, unknown>>(
     `INSERT INTO interviews (
        candidate_id, company_id, store_id, interviewer_id,
@@ -1290,7 +1300,7 @@ export async function createInterview(
     [
       candidateId,
       companyId,
-      candidate.storeId ?? null,
+      effectiveStoreId,
       data.interviewerId ?? null,
       data.interviewType || 'in_person',
       data.scheduledAt,
@@ -1301,6 +1311,9 @@ export async function createInterview(
       data.icsUid ?? null,
     ],
   );
+  if (row) {
+    await markCandidateRead(candidateId, companyId);
+  }
   return row ? mapInterview(row) : null;
 }
 
@@ -1703,7 +1716,7 @@ export async function listAllInterviewFeedbackComments(
 ): Promise<AllInterviewFeedbackComment[]> {
   const useStoreScope = Array.isArray(storeIds) && storeIds.length > 0;
   
-  const conditions: string[] = ['c.company_id = ANY($1::int[])', "jp.status = 'published'"];
+  const conditions: string[] = ['c.company_id = ANY($1::int[])', "(c.job_posting_id IS NULL OR jp.status = 'published')"];
   const params: any[] = [companyIds];
   let paramIndex = 2;
 

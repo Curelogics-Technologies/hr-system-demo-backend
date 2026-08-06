@@ -20,9 +20,9 @@ export async function getHRAlerts(companyId: number, storeIds?: number[]): Promi
   // 1. New unread candidates received in the last 24 hours
   const newCandRows = await query<{ count: string }>(
     `SELECT COUNT(c.*) AS count FROM candidates c
-     JOIN job_postings jp ON jp.id = c.job_posting_id
+     LEFT JOIN job_postings jp ON jp.id = c.job_posting_id
      WHERE c.company_id = $1 AND c.unread = TRUE AND c.created_at >= NOW() - INTERVAL '24 hours'
-       AND jp.status = 'published'
+       AND (c.job_posting_id IS NULL OR jp.status = 'published')
      ${storeClause.replace(/store_id/g, 'c.store_id')}`,
     [companyId, ...storeParams],
   );
@@ -40,10 +40,13 @@ export async function getHRAlerts(companyId: number, storeIds?: number[]): Promi
   const todayRows = await query<{ count: string }>(
     `SELECT COUNT(i.*) AS count FROM interviews i
      JOIN candidates c ON c.id = i.candidate_id
-     JOIN job_postings jp ON jp.id = c.job_posting_id
-     WHERE c.company_id = $1 AND DATE(i.scheduled_at AT TIME ZONE 'UTC') = CURRENT_DATE
-       AND jp.status = 'published'`,
-    [companyId],
+     LEFT JOIN job_postings jp ON jp.id = c.job_posting_id
+     LEFT JOIN stores st ON st.id = c.store_id
+     WHERE c.company_id = $1
+       AND DATE(i.scheduled_at AT TIME ZONE COALESCE(NULLIF(BTRIM(st.timezone), ''), 'Europe/Rome')) = (NOW() AT TIME ZONE COALESCE(NULLIF(BTRIM(st.timezone), ''), 'Europe/Rome'))::date
+       AND (c.job_posting_id IS NULL OR jp.status = 'published')
+     ${storeClause.replace(/store_id/g, 'c.store_id')}`,
+    [companyId, ...storeParams],
   );
   const todayCount = parseInt(todayRows[0]?.count ?? '0', 10);
   if (todayCount > 0) {
@@ -58,9 +61,9 @@ export async function getHRAlerts(companyId: number, storeIds?: number[]): Promi
   // 3. Candidates stuck in "received" status for more than 3 days
   const pendingRows = await query<{ count: string }>(
     `SELECT COUNT(c.*) AS count FROM candidates c
-     JOIN job_postings jp ON jp.id = c.job_posting_id
+     LEFT JOIN job_postings jp ON jp.id = c.job_posting_id
      WHERE c.company_id = $1 AND c.status = 'received' AND c.created_at < NOW() - INTERVAL '3 days'
-       AND jp.status = 'published'
+       AND (c.job_posting_id IS NULL OR jp.status = 'published')
      ${storeClause.replace(/store_id/g, 'c.store_id')}`,
     [companyId, ...storeParams],
   );

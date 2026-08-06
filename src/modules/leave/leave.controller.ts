@@ -884,10 +884,10 @@ export const listLeaveRequests = asyncHandler(async (req: Request, res: Response
     extraWhere += ` AND lr.leave_type = $${paramIdx}`; extraParams.push(leave_type); paramIdx++;
   }
   if (date_from) {
-    extraWhere += ` AND lr.start_date >= $${paramIdx}`; extraParams.push(date_from); paramIdx++;
+    extraWhere += ` AND lr.end_date >= $${paramIdx}`; extraParams.push(date_from); paramIdx++;
   }
   if (date_to) {
-    extraWhere += ` AND lr.end_date <= $${paramIdx}`; extraParams.push(date_to); paramIdx++;
+    extraWhere += ` AND lr.start_date <= $${paramIdx}`; extraParams.push(date_to); paramIdx++;
   }
   if (store_id) {
     extraWhere += ` AND lr.store_id = $${paramIdx}`; extraParams.push(parseInt(store_id, 10)); paramIdx++;

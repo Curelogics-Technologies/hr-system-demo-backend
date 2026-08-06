@@ -116,12 +116,8 @@ export function shouldRunReportAtCurrentTime(
     return parts.weekday >= 1 && parts.weekday <= 5;
   }
 
-  if (isMonthlyDayBasedReport(reportId)) {
-    const clampedDay = getClampedMonthDay(parts.year, parts.month - 1, day);
-    return parts.day === clampedDay;
-  }
-
-  return parts.weekday === day;
+  const safeDay = day > 7 ? ((day - 1) % 7) + 1 : day;
+  return parts.weekday === safeDay;
 }
 
 export function getLastScheduledRunDate(
@@ -145,33 +141,8 @@ export function getLastScheduledRunDate(
     return candidate;
   }
 
-  if (isMonthlyDayBasedReport(reportId)) {
-    let candidate = new Date(Date.UTC(
-      parts.year,
-      parts.month - 1,
-      getClampedMonthDay(parts.year, parts.month - 1, day),
-      hours,
-      minutes,
-      0,
-      0,
-    ));
-    if (candidate.getTime() > currentWallClock.getTime()) {
-      const previousMonthIndex = parts.month - 2;
-      const previousMonthDate = new Date(Date.UTC(parts.year, previousMonthIndex, 1, hours, minutes, 0, 0));
-      candidate = new Date(Date.UTC(
-        previousMonthDate.getUTCFullYear(),
-        previousMonthDate.getUTCMonth(),
-        getClampedMonthDay(previousMonthDate.getUTCFullYear(), previousMonthDate.getUTCMonth(), day),
-        hours,
-        minutes,
-        0,
-        0,
-      ));
-    }
-    return candidate;
-  }
-
-  let candidate = withTime(shiftDays(currentWallClock, day - parts.weekday), hours, minutes);
+  const safeDay = day > 7 ? ((day - 1) % 7) + 1 : day;
+  let candidate = withTime(shiftDays(currentWallClock, safeDay - parts.weekday), hours, minutes);
   if (candidate.getTime() > currentWallClock.getTime()) {
     candidate = shiftDays(candidate, -7);
   }
