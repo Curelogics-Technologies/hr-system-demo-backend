@@ -11,6 +11,8 @@ import { createCandidate } from '../ats/ats.service';
 import { sendNotification } from '../notifications/notifications.service';
 import { t } from '../../utils/i18n';
 import { authenticate, requireSuperAdmin } from '../../middleware/auth';
+import { rateLimit } from '../../middleware/rateLimit';
+import { resolveIndeedSecretBySlug } from '../../services/indeedCredentials.service';
 
 export type PublicJobRow = {
   id: number;
@@ -1027,8 +1029,12 @@ router.get(
 );
 
 // Route 1: POST /api/public/indeed-apply/:companySlug
+// Public webhook (no auth by design). Protected by HMAC signature verification
+// and a rate limit against abuse/spam. Max 60 requests/minute per IP — far above
+// any legitimate Indeed delivery volume.
 router.post(
   '/indeed-apply/:companySlug',
+  rateLimit({ windowMs: 60_000, max: 60, keyPrefix: 'indeed-apply', message: 'Too Many Requests' }),
   raw({ type: '*/*' }),
   asyncHandler(async (req: Request, res: Response) => {
     const { companySlug } = req.params;
@@ -1041,20 +1047,29 @@ router.post(
     // Run signature verification and candidate creation asynchronously
     setImmediate(async () => {
       try {
-        // Resolve company-specific or default secret
-        const companyUpper = (companySlug || '').replace(/-/g, '_').toUpperCase();
-        const companySlugShort = (companySlug || '').split('-')[0].toUpperCase();
-        const secret = process.env[`INDEED_APPLY_SECRET_${companyUpper}`] ||
-                       process.env[`INDEED_APPLY_SECRET_${companySlugShort}`] ||
-                       process.env.INDEED_APPLY_SECRET ||
-                       'mock_veylohr_indeed_secret_2026';
+        // Resolve company-specific or global secret. NO hardcoded fallback: if no
+        // secret is configured we FAIL CLOSED and reject the payload, rather than
+        // trusting a value that lives in the source (which anyone could use to
+        // forge a valid signature for any company). Resolved from the company's
+        // own stored (encrypted) secret first, then the environment variable.
+        const secret = await resolveIndeedSecretBySlug(companySlug);
 
-        // Calculate HMAC signature
+        if (!secret) {
+          console.error(`Indeed Apply: no INDEED_APPLY_SECRET configured for company '${companySlug}' — payload rejected (fail-closed).`);
+          return;
+        }
+
+        // Calculate the expected HMAC and compare in constant time.
         const hmac = crypto.createHmac('sha1', secret);
         hmac.update(rawBody || '');
         const expectedSig = hmac.digest('base64');
 
-        if (!signature || signature !== expectedSig) {
+        const providedBuf = Buffer.from(signature || '', 'utf8');
+        const expectedBuf = Buffer.from(expectedSig, 'utf8');
+        const signatureValid = providedBuf.length === expectedBuf.length
+          && crypto.timingSafeEqual(providedBuf, expectedBuf);
+
+        if (!signatureValid) {
           console.warn('Indeed Apply: invalid HMAC signature — payload discarded');
           return;
         }

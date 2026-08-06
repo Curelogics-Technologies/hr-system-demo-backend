@@ -7,6 +7,7 @@ import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
 import { asyncHandler } from '../../utils/asyncHandler';
 import { ok, created, badRequest, forbidden, notFound } from '../../utils/response';
 import { buildSalaryText, canonicalizeSalaryPeriod } from '../../utils/salaryPeriod';
+import { resolveIndeedApiToken } from '../../services/indeedCredentials.service';
 import { sendEmailForCompany } from '../../services/email.service';
 import { query, queryOne } from '../../config/database';
 import { runCandidateRetentionJob } from '../../jobs/candidate-retention.job';
@@ -1738,11 +1739,8 @@ export const getIndeedStatsHandler = asyncHandler(async (req: Request, res: Resp
     }
   }
   
-  const companyUpper = companySlug.replace(/-/g, '_').toUpperCase();
-  const companySlugShort = companySlug.split('-')[0].toUpperCase();
-  const apiToken = process.env[`INDEED_APPLY_API_TOKEN_${companyUpper}`] ||
-                   process.env[`INDEED_APPLY_API_TOKEN_${companySlugShort}`] ||
-                   process.env.INDEED_APPLY_API_TOKEN;
+  // Company's own stored token (encrypted, DB) → environment → null.
+  const apiToken = await resolveIndeedApiToken(companyId, companySlug);
   const isIndeedApplyConfigured = !!apiToken;
   const isDispositionSyncReal = !!(apiToken && apiToken !== 'mock_veylohr_indeed_token_2026');
 
@@ -1964,7 +1962,7 @@ function parseCandidateSourceProfile(sourceRef: unknown): Record<string, string>
   }
 }
 
-function formatPdfDate(value: unknown): string {
+function formatPdfDate(value: unknown, timeZone: string = 'Europe/Rome'): string {
   if (value === null || value === undefined || value === '') return '-';
   const date = value instanceof Date ? value : new Date(String(value));
   if (Number.isNaN(date.getTime())) return pdfText(value);
@@ -1974,7 +1972,7 @@ function formatPdfDate(value: unknown): string {
     year: 'numeric',
     hour: '2-digit',
     minute: '2-digit',
-    timeZone: 'Europe/Rome',
+    timeZone,
   });
 }
 
@@ -1983,7 +1981,8 @@ async function buildCandidateProfilePdf(candidateId: number, companyId: number, 
     `SELECT c.*,
             jp.title AS position_title,
             co.name AS company_name,
-            s.name AS store_name
+            s.name AS store_name,
+            s.timezone AS store_timezone
      FROM candidates c
      LEFT JOIN job_postings jp ON jp.id = c.job_posting_id
      LEFT JOIN companies co ON co.id = c.company_id
@@ -1994,6 +1993,9 @@ async function buildCandidateProfilePdf(candidateId: number, companyId: number, 
   );
 
   if (!candidate) return null;
+
+  // Render dates in the candidate's store timezone (falls back to Europe/Rome).
+  const storeTz = (candidate.store_timezone as string | null)?.trim() || 'Europe/Rome';
 
   const candidateComments = await query<Record<string, unknown>>(
     `SELECT cc.body, cc.created_at, u.name, u.surname, u.role
@@ -2094,7 +2096,7 @@ async function buildCandidateProfilePdf(candidateId: number, companyId: number, 
   });
   page.drawText('VEYLO HR', { x: margin, y: pageSize[1] - 52, size: 15, font: fontBold, color: rgb(0.95, 0.78, 0.35) });
   page.drawText(recipientType === 'interviewer' ? 'Candidate Profile & Comments' : 'Candidate Profile', { x: margin, y: pageSize[1] - 82, size: 21, font: fontBold, color: rgb(1, 1, 1) });
-  page.drawText(`Generated: ${formatPdfDate(new Date().toISOString())}`, { x: margin, y: pageSize[1] - 100, size: 8.5, font, color: rgb(0.82, 0.87, 0.93) });
+  page.drawText(`Generated: ${formatPdfDate(new Date().toISOString(), storeTz)}`, { x: margin, y: pageSize[1] - 100, size: 8.5, font, color: rgb(0.82, 0.87, 0.93) });
   y = pageSize[1] - 145;
 
   section('Candidate data');
@@ -2143,7 +2145,7 @@ async function buildCandidateProfilePdf(candidateId: number, companyId: number, 
     } else {
       candidateComments.forEach((comment, index) => {
         const author = `${comment.name ?? ''} ${comment.surname ?? ''}`.trim() || 'User';
-        drawLine(`${index + 1}. ${author} (${comment.role ?? '-'}) - ${formatPdfDate(comment.created_at as string)}`, { bold: true });
+        drawLine(`${index + 1}. ${author} (${comment.role ?? '-'}) - ${formatPdfDate(comment.created_at as string, storeTz)}`, { bold: true });
         drawLine(comment.body as string, { indent: 14 });
         y -= 4;
       });
@@ -2156,7 +2158,7 @@ async function buildCandidateProfilePdf(candidateId: number, companyId: number, 
       interviewFeedback.forEach((comment, index) => {
         const author = `${comment.name ?? ''} ${comment.surname ?? ''}`.trim() || 'User';
         const interviewLabel = `${comment.interview_type === 'phone' ? 'Phone' : 'In-person'} interview ${formatPdfDate(comment.scheduled_at as string)}`;
-        drawLine(`${index + 1}. ${author} (${comment.role ?? '-'}) - ${formatPdfDate(comment.created_at as string)}`, { bold: true });
+        drawLine(`${index + 1}. ${author} (${comment.role ?? '-'}) - ${formatPdfDate(comment.created_at as string, storeTz)}`, { bold: true });
         drawLine(interviewLabel, { italic: true, indent: 14, color: rgb(0.42, 0.46, 0.53) });
         drawLine(comment.body as string, { indent: 14 });
         y -= 4;
@@ -2276,6 +2278,17 @@ export const jobFeedHandler = async (req: Request, res: Response): Promise<void>
       ? `${frontendBase}/careers`
       : `${frontendBase}/careers/${encodedCompanySlug}`;
 
+    // Resolve each company's Indeed Apply token ONCE (company DB value → env),
+    // so the per-job loop below stays synchronous and does not query per row.
+    const tokenByCompany = new Map<number, string | null>();
+    const distinctCompanyIds = Array.from(
+      new Set(jobs.map((j) => j.companyId).filter((v): v is number => typeof v === 'number')),
+    );
+    for (const cid of distinctCompanyIds) {
+      const slug = jobs.find((j) => j.companyId === cid)?.companySlug || company.slug;
+      tokenByCompany.set(cid, await resolveIndeedApiToken(cid, slug));
+    }
+
     const jobItems = jobs
       .map((job) => {
         const isFullRemote = job.remoteType === 'remote';
@@ -2322,12 +2335,8 @@ export const jobFeedHandler = async (req: Request, res: Response): Promise<void>
         const expirationDate = job.expirationDate
           ? new Date(job.expirationDate).toISOString()
           : null;
-        const companyUpper = company.slug.replace(/-/g, '_').toUpperCase();
-        const companySlugShort = company.slug.split('-')[0].toUpperCase(); // e.g. FUSARO
-        const configuredApiToken = process.env[`INDEED_APPLY_API_TOKEN_${companyUpper}`] ||
-                         process.env[`INDEED_APPLY_API_TOKEN_${companySlugShort}`] ||
-                         process.env.INDEED_APPLY_API_TOKEN ||
-                         null;
+        // Company's own stored token (encrypted, DB) → environment → null.
+        const configuredApiToken = (job.companyId != null ? tokenByCompany.get(job.companyId) : null) ?? null;
         // Native "Apply on Indeed" is advertised ONLY when a real token is configured.
         // Without one (partnership not signed / placeholder), we omit <indeed-apply-data>
         // entirely so Indeed routes candidates to the job <url> (the Careers page) rather
