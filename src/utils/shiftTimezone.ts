@@ -34,6 +34,18 @@ export function isValidIanaTimezone(value: string): boolean {
   }
 }
 
+/**
+ * Timezone safe to pass to Date#toLocaleString / Intl — never throws. Guards the
+ * notification/email/PDF formatting path against a legacy or imported store row
+ * that somehow holds an invalid timezone (new writes are already normalised).
+ */
+export function safeDisplayTimezone(tz: string | null | undefined, fallback: string = 'Europe/Rome'): string {
+  if (typeof tz !== 'string') return fallback;
+  const trimmed = tz.trim();
+  if (!trimmed) return fallback;
+  return isValidIanaTimezone(trimmed) ? trimmed : fallback;
+}
+
 export function normalizeShiftTimezone(raw: unknown, fallback: string = DEFAULT_SHIFT_TIMEZONE): string {
   if (typeof raw !== 'string') return fallback;
   const trimmed = raw.trim();

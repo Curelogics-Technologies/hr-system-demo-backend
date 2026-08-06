@@ -8,6 +8,7 @@ import { asyncHandler } from '../../utils/asyncHandler';
 import { ok, created, badRequest, forbidden, notFound } from '../../utils/response';
 import { buildSalaryText, canonicalizeSalaryPeriod } from '../../utils/salaryPeriod';
 import { resolveIndeedApiToken } from '../../services/indeedCredentials.service';
+import { safeDisplayTimezone } from '../../utils/shiftTimezone';
 import { sendEmailForCompany } from '../../services/email.service';
 import { query, queryOne } from '../../config/database';
 import { runCandidateRetentionJob } from '../../jobs/candidate-retention.job';
@@ -1437,7 +1438,7 @@ export const createInterviewHandler = asyncHandler(async (req: Request, res: Res
      WHERE c.id = $1 LIMIT 1`,
     [candidateId]
   );
-  const targetTimezone = candidateDetails?.store_timezone || 'Europe/Rome';
+  const targetTimezone = safeDisplayTimezone(candidateDetails?.store_timezone);
 
   // Create notification logs for tracking
   const notificationPromises: Promise<void>[] = [];
@@ -1995,7 +1996,7 @@ async function buildCandidateProfilePdf(candidateId: number, companyId: number, 
   if (!candidate) return null;
 
   // Render dates in the candidate's store timezone (falls back to Europe/Rome).
-  const storeTz = (candidate.store_timezone as string | null)?.trim() || 'Europe/Rome';
+  const storeTz = safeDisplayTimezone(candidate.store_timezone as string | null);
 
   const candidateComments = await query<Record<string, unknown>>(
     `SELECT cc.body, cc.created_at, u.name, u.surname, u.role
@@ -2923,7 +2924,7 @@ export const sendInterviewNotificationHandler = asyncHandler(async (req: Request
         `SELECT full_name FROM candidates WHERE id = $1 LIMIT 1`,
         [interviewRow.candidate_id],
       );
-      const targetTimezone = interviewRow.store_timezone || 'Europe/Rome';
+      const targetTimezone = safeDisplayTimezone(interviewRow.store_timezone);
       const scheduledTime = scheduledDate.toLocaleTimeString(dateLocale, { hour: '2-digit', minute: '2-digit', timeZone: targetTimezone });
       const candidateName = candidateRow?.full_name?.trim()
         || (interviewerLocale === 'it' ? 'il candidato' : 'the candidate');
@@ -3048,7 +3049,7 @@ async function sendProfessionalInterviewEmail(params: {
 
     if (!interviewRow) throw new Error('Interview not found');
 
-    const targetTimezone = interviewRow.store_timezone || 'Europe/Rome';
+    const targetTimezone = safeDisplayTimezone(interviewRow.store_timezone);
     const isInPerson = interviewRow.interview_type === 'in_person' || !interviewRow.interview_type;
     const rawStoreAddr = [interviewRow.store_address, interviewRow.store_cap, interviewRow.store_city].filter(Boolean).join(', ');
     const fallbackAddr = rawStoreAddr || interviewRow.store_name || storeName || '';
