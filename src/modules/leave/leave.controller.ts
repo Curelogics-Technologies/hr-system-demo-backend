@@ -601,16 +601,20 @@ export const submitLeave = asyncHandler(async (req: Request, res: Response) => {
     }
   }
 
-  // Overlap check — ONLY FOR THE SAME USER (user_id = $2)
+  // Overlap check — ONLY FOR THE SAME USER (user_id = $2).
+  // Counts ANY live request (pending, in-progress OR approved), not just approved
+  // ones — otherwise a user could submit two overlapping requests while both are
+  // still pending and then have both approved, deducting the balance twice.
+  // Rejected/cancelled requests are ignored so re-submitting after one is allowed.
   const overlap = await queryOne<{ id: number }>(
     `SELECT id FROM leave_requests
      WHERE company_id = $1 AND user_id = $2
-       AND status IN ('approved', 'admin_approved')
+       AND status NOT IN ('rejected', 'cancelled', 'store manager rejected', 'area manager rejected', 'HR rejected')
        AND start_date <= $3 AND end_date >= $4`,
     [companyId, userId, end_date, start_date],
   );
   if (overlap) {
-    badRequest(res, 'Hai già un permesso approvato che si sovrappone a queste date', 'LEAVE_OVERLAP');
+    badRequest(res, 'Hai già una richiesta di permesso che si sovrappone a queste date', 'LEAVE_OVERLAP');
     return;
   }
 
@@ -988,13 +992,52 @@ export const listLeaveRequests = asyncHandler(async (req: Request, res: Response
   ok(res, { requests, total, page, limit, pages: Math.ceil(total / limit) });
 });
 
+/**
+ * Server-side store scoping for approve/reject. Returns an error message when the
+ * caller is not allowed to act on a request from the given store, or null when
+ * allowed. Store managers are limited to their own store; single-company area
+ * managers to the stores they supervise; admin/HR/super-admin are unrestricted.
+ */
+async function ensureLeaveStoreScope(
+  req: Request,
+  role: string,
+  isSuperAdmin: boolean,
+  allowedCompanyIds: number[],
+  requestStoreId: number | null,
+): Promise<string | null> {
+  if (isSuperAdmin || role === 'admin' || role === 'hr') return null;
+
+  if (role === 'store_manager') {
+    if (requestStoreId == null || requestStoreId !== req.user!.storeId) {
+      return 'Questa richiesta non appartiene al tuo negozio';
+    }
+    return null;
+  }
+
+  if (role === 'area_manager') {
+    if (allowedCompanyIds.length > 1) return null;   // group-wide by design
+    if (requestStoreId == null) return null;          // company-level request
+    const amStores = await query<{ store_id: number }>(
+      `SELECT DISTINCT store_id FROM users
+       WHERE role = 'store_manager' AND supervisor_id = $1
+         AND company_id = $2 AND status = 'active' AND store_id IS NOT NULL`,
+      [req.user!.userId, req.user!.companyId],
+    );
+    if (!amStores.some((s) => s.store_id === requestStoreId)) {
+      return 'Questa richiesta non è tra i negozi che gestisci';
+    }
+  }
+
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // GET /api/leave/pending — approval queue for caller's role
 // ---------------------------------------------------------------------------
 
 export const getPendingApprovals = asyncHandler(async (req: Request, res: Response) => {
   // FIX 7: removed unused `companyId` from destructure
-  const { role, storeId } = req.user!;
+  const { role, storeId, userId } = req.user!;
   const allowedCompanyIds = await resolveAllowedCompanyIds(req.user!);
   const isSuperAdmin = req.user!.is_super_admin === true;
 
@@ -1020,12 +1063,26 @@ export const getPendingApprovals = asyncHandler(async (req: Request, res: Respon
         const hasCrossCompany = allowedCompanyIds.length > 1;
 
         if (hasCrossCompany) {
-          // If cross-company is ON, allow Area Manager to see pending requests across all group companies
+          // Cross-company area manager keeps group-wide visibility by design.
           scopeWhere = `lr.company_id = ANY($1) AND lr.current_approver_role = 'area_manager'`;
           scopeParams = [allowedCompanyIds];
         } else {
-          scopeWhere = `lr.company_id = ANY($1) AND lr.current_approver_role = 'area_manager'`;
-          scopeParams = [allowedCompanyIds];
+          // Single-company area manager: restrict to the stores they supervise
+          // (plus company-level requests with no store), matching listLeaveRequests.
+          const amStores = await query<{ store_id: number }>(
+            `SELECT DISTINCT store_id FROM users
+             WHERE role = 'store_manager' AND supervisor_id = $1
+               AND company_id = $2 AND status = 'active' AND store_id IS NOT NULL`,
+            [userId, req.user!.companyId],
+          );
+          const supervisedStoreIds = amStores.map((s) => s.store_id);
+          if (supervisedStoreIds.length === 0) {
+            scopeWhere = `lr.company_id = ANY($1) AND lr.current_approver_role = 'area_manager' AND lr.store_id IS NULL`;
+            scopeParams = [allowedCompanyIds];
+          } else {
+            scopeWhere = `lr.company_id = ANY($1) AND lr.current_approver_role = 'area_manager' AND (lr.store_id = ANY($2::int[]) OR lr.store_id IS NULL)`;
+            scopeParams = [allowedCompanyIds, supervisedStoreIds];
+          }
         }
         break;
       }
@@ -1174,6 +1231,28 @@ export const approveLeave = asyncHandler(async (req: Request, res: Response) => 
 
   if (!isSuperAdmin && !isOverride && role !== 'admin' && stageRole !== effectiveRole) {
     forbidden(res, "Non sei il responsabile dell'approvazione di questa richiesta", 'LEAVE_NOT_RESPONSIBLE');
+    return;
+  }
+
+  // Store scoping (server-side): a store manager may only act on requests from
+  // their own store; an area manager only on stores they supervise. Admin/HR and
+  // super admins are unrestricted. Requests with no store (company-level) are
+  // left to the higher roles.
+  const storeScopeError = await ensureLeaveStoreScope(req, role, isSuperAdmin, allowedCompanyIds, leaveRequest.store_id);
+  if (storeScopeError) { forbidden(res, storeScopeError, 'LEAVE_WRONG_STORE'); return; }
+
+  // Re-check overlap against ALREADY-APPROVED leaves (excluding this request) so
+  // that two overlapping requests cannot both reach approval — which would
+  // deduct the balance twice for the same days.
+  const approvedOverlap = await queryOne<{ id: number }>(
+    `SELECT id FROM leave_requests
+     WHERE company_id = $1 AND user_id = $2 AND id <> $3
+       AND status IN ('approved', 'admin_approved')
+       AND start_date <= $4 AND end_date >= $5`,
+    [leaveRequest.company_id, leaveRequest.user_id, leaveRequest.id, leaveRequest.end_date, leaveRequest.start_date],
+  );
+  if (approvedOverlap) {
+    badRequest(res, 'Un altro permesso approvato si sovrappone a queste date', 'LEAVE_OVERLAP');
     return;
   }
 
@@ -1430,8 +1509,9 @@ export const rejectLeave = asyncHandler(async (req: Request, res: Response) => {
     end_date: string;
     current_approver_role: string;
     status: string;
+    store_id: number | null;
   }>(
-    `SELECT id, company_id, user_id, start_date, end_date, current_approver_role, status
+    `SELECT id, company_id, user_id, start_date, end_date, current_approver_role, status, store_id
      FROM leave_requests WHERE id = $1 AND company_id = ANY($2)`,
     [leaveId, allowedCompanyIds],
   );
@@ -1452,6 +1532,11 @@ export const rejectLeave = asyncHandler(async (req: Request, res: Response) => {
     forbidden(res, "Non sei il responsabile dell'approvazione di questa richiesta", 'LEAVE_NOT_RESPONSIBLE');
     return;
   }
+
+  // Store scoping (server-side): mirror approveLeave — a store/area manager may
+  // only reject requests within their own store / supervised stores.
+  const storeScopeError = await ensureLeaveStoreScope(req, role, isSuperAdmin, allowedCompanyIds, leaveRequest.store_id);
+  if (storeScopeError) { forbidden(res, storeScopeError, 'LEAVE_WRONG_STORE'); return; }
 
   // If HR/Admin use emergency override OR are normal Admin, prioritize terminal transition
   let approverRoleForRecord = isSuperAdmin ? stageRole : effectiveRole;

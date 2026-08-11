@@ -2,6 +2,7 @@ import { Router } from 'express';
 import multer from 'multer';
 import { z } from 'zod';
 import { authenticate, requireRole, enforceCompany, requireModulePermission } from '../../middleware/auth';
+import { rateLimit } from '../../middleware/rateLimit';
 import { validate } from '../../middleware/validate';
 import {
   submitLeave,
@@ -288,9 +289,16 @@ router.put(
   updateApprovalConfig,
 );
 
-// POST /api/leave/escalate - usually triggered internally or by superadmin
+// POST /api/leave/escalate - manual trigger for admins only.
+// NOTE: automatic escalation already runs as an in-process hourly cron (see
+// index.ts), so this endpoint is not required for automation — it is now locked
+// behind authentication + admin role (+ a rate limit) to close the previously
+// public exposure that allowed anyone to advance approvals for every company.
 router.post(
   '/escalate',
+  rateLimit({ windowMs: 60_000, max: 10, keyPrefix: 'leave-escalate' }),
+  authenticate,
+  requireRole('admin'),
   executeEscalation,
 );
 
