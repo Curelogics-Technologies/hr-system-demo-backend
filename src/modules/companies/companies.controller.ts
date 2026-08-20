@@ -3,6 +3,7 @@ import { pool, query, queryOne } from '../../config/database';
 import { ok, created, notFound, badRequest } from '../../utils/response';
 import { asyncHandler } from '../../utils/asyncHandler';
 import { resolveAllowedCompanyIds, resolveCompanyGroupId } from '../../utils/companyScope';
+import { normalizePartitaIva, normalizeSdiCode, normalizePecEmail } from '../../utils/italianFiscal';
 
 interface CompanyRow {
   id: number;
@@ -18,6 +19,9 @@ interface CompanyRow {
   owner_surname: string | null;
   owner_avatar_filename: string | null;
   registration_number: string | null;
+  vat_number: string | null;
+  sdi_recipient_code: string | null;
+  pec_email: string | null;
   company_email: string | null;
   company_phone_numbers: string | null;
   offices_locations: string | null;
@@ -42,6 +46,9 @@ interface CompanyRow {
 
 type CompanyProfileInput = {
   registration_number?: string | null;
+  vat_number?: string | null;
+  sdi_recipient_code?: string | null;
+  pec_email?: string | null;
   company_email?: string | null;
   company_phone_numbers?: string | null;
   offices_locations?: string | null;
@@ -68,6 +75,18 @@ function normalizeOptionalString(value: unknown): string | null | undefined {
   return normalized.length > 0 ? normalized : null;
 }
 
+// Stores the e-invoicing fields in a canonical shape (IT prefix stripped, SDI
+// upper-cased, PEC lower-cased) so lookups and comparisons stay predictable.
+// An absent or blank value stays absent/null — these fields remain optional.
+function normalizeFiscalString(
+  value: unknown,
+  canonicalize: (raw: string) => string,
+): string | null | undefined {
+  const normalized = normalizeOptionalString(value);
+  if (normalized === undefined || normalized === null) return normalized;
+  return canonicalize(normalized);
+}
+
 function normalizeOptionalNumber(value: unknown): number | null | undefined {
   if (value === undefined) return undefined;
   if (value === null || value === '') return null;
@@ -78,6 +97,9 @@ function normalizeOptionalNumber(value: unknown): number | null | undefined {
 function extractCompanyProfileInput(payload: Record<string, unknown>): CompanyProfileInput {
   return {
     registration_number: normalizeOptionalString(payload.registration_number),
+    vat_number: normalizeFiscalString(payload.vat_number, normalizePartitaIva),
+    sdi_recipient_code: normalizeFiscalString(payload.sdi_recipient_code, normalizeSdiCode),
+    pec_email: normalizeFiscalString(payload.pec_email, normalizePecEmail),
     company_email: normalizeOptionalString(payload.company_email),
     company_phone_numbers: normalizeOptionalString(payload.company_phone_numbers),
     offices_locations: normalizeOptionalString(payload.offices_locations),
@@ -110,6 +132,9 @@ const COMPANY_LIST_SELECT = `
     owner.surname AS owner_surname,
     owner.avatar_filename AS owner_avatar_filename,
     c.registration_number,
+    c.vat_number,
+    c.sdi_recipient_code,
+    c.pec_email,
     c.company_email,
     c.company_phone_numbers,
     c.offices_locations,
@@ -288,6 +313,9 @@ export const updateCompany = asyncHandler(async (req: Request, res: Response) =>
 
   const profileEntries: Array<[keyof CompanyProfileInput, string | number | null | undefined]> = [
     ['registration_number', profile.registration_number],
+    ['vat_number', profile.vat_number],
+    ['sdi_recipient_code', profile.sdi_recipient_code],
+    ['pec_email', profile.pec_email],
     ['company_email', profile.company_email],
     ['company_phone_numbers', profile.company_phone_numbers],
     ['offices_locations', profile.offices_locations],
@@ -414,6 +442,9 @@ export const createCompany = asyncHandler(async (req: Request, res: Response) =>
        group_id,
        owner_user_id,
        registration_number,
+       vat_number,
+       sdi_recipient_code,
+       pec_email,
        company_email,
        company_phone_numbers,
        offices_locations,
@@ -432,7 +463,7 @@ export const createCompany = asyncHandler(async (req: Request, res: Response) =>
        discount_valid_from,
        discount_valid_to
      )
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
      RETURNING id`,
     [
       name,
@@ -440,6 +471,9 @@ export const createCompany = asyncHandler(async (req: Request, res: Response) =>
       group_id ?? null,
       ownerUserId,
       profile.registration_number ?? null,
+      profile.vat_number ?? null,
+      profile.sdi_recipient_code ?? null,
+      profile.pec_email ?? null,
       profile.company_email ?? null,
       profile.company_phone_numbers ?? null,
       profile.offices_locations ?? null,
@@ -552,7 +586,7 @@ export const deactivateCompany = asyncHandler(async (req: Request, res: Response
   if (isNaN(targetCompanyId)) { notFound(res, 'Azienda non trovata'); return; }
 
   const updated = await queryOne(
-    `UPDATE companies SET is_active = false WHERE id = $1 RETURNING id, name, slug, is_active, logo_filename, banner_filename, group_id, owner_user_id, registration_number, company_email, company_phone_numbers, offices_locations, country, city, state, address, currency, created_at`,
+    `UPDATE companies SET is_active = false WHERE id = $1 RETURNING id, name, slug, is_active, logo_filename, banner_filename, group_id, owner_user_id, registration_number, vat_number, sdi_recipient_code, pec_email, company_email, company_phone_numbers, offices_locations, country, city, state, address, currency, created_at`,
     [targetCompanyId]
   );
   if (!updated) { notFound(res, 'Azienda non trovata'); return; }
@@ -567,7 +601,7 @@ export const activateCompany = asyncHandler(async (req: Request, res: Response) 
   if (isNaN(targetCompanyId)) { notFound(res, 'Azienda non trovata'); return; }
 
   const updated = await queryOne(
-    `UPDATE companies SET is_active = true WHERE id = $1 RETURNING id, name, slug, is_active, logo_filename, banner_filename, group_id, owner_user_id, registration_number, company_email, company_phone_numbers, offices_locations, country, city, state, address, currency, created_at`,
+    `UPDATE companies SET is_active = true WHERE id = $1 RETURNING id, name, slug, is_active, logo_filename, banner_filename, group_id, owner_user_id, registration_number, vat_number, sdi_recipient_code, pec_email, company_email, company_phone_numbers, offices_locations, country, city, state, address, currency, created_at`,
     [targetCompanyId]
   );
   if (!updated) { notFound(res, 'Azienda non trovata'); return; }
