@@ -17,6 +17,7 @@ import {
 import { authenticate, requireRole, enforceCompany, requireSuperAdmin, requireModulePermission } from '../../middleware/auth';
 import { validate } from '../../middleware/validate';
 import { auditLog } from '../../middleware/auditLog';
+import { isValidPartitaIva, isValidSdiCode, isValidPecEmail } from '../../utils/italianFiscal';
 import {
   companyLogoUploadMiddleware,
   uploadCompanyLogo,
@@ -27,6 +28,28 @@ import {
 } from './logo.controller';
 
 const router = Router();
+
+// Italian e-invoicing fields. Optional by design: the companies table already
+// holds live client records that predate them, and those must keep saving
+// without a value. Format is checked only when something was actually entered.
+const optionalFiscalField = (
+  max: number,
+  isValid: (value: string) => boolean,
+  message: string,
+) =>
+  z
+    .string()
+    .max(max)
+    .nullable()
+    .optional()
+    .refine((value) => value == null || value.trim() === '' || isValid(value), { message });
+
+const vatNumberField = () =>
+  optionalFiscalField(20, isValidPartitaIva, 'Partita IVA non valida (11 cifre)');
+const sdiRecipientCodeField = () =>
+  optionalFiscalField(7, isValidSdiCode, 'Codice Destinatario SDI non valido (6-7 caratteri)');
+const pecEmailField = () =>
+  optionalFiscalField(255, isValidPecEmail, 'Indirizzo PEC non valido');
 
 const updateCompanySchema = z.object({
   name: z.string().min(1, 'Nome azienda obbligatorio').max(255),
@@ -49,6 +72,9 @@ const updateCompanySchema = z.object({
   discount_percent: z.number().min(0).max(100).nullable().optional(),
   discount_valid_from: z.string().nullable().optional(),
   discount_valid_to: z.string().nullable().optional(),
+  vat_number: vatNumberField(),
+  sdi_recipient_code: sdiRecipientCodeField(),
+  pec_email: pecEmailField(),
 });
 
 const createCompanySchema = z.object({
@@ -73,6 +99,9 @@ const createCompanySchema = z.object({
   discount_percent: z.number().min(0).max(100).nullable().optional(),
   discount_valid_from: z.string().nullable().optional(),
   discount_valid_to: z.string().nullable().optional(),
+  vat_number: vatNumberField(),
+  sdi_recipient_code: sdiRecipientCodeField(),
+  pec_email: pecEmailField(),
 });
 
 const transferOwnershipSchema = z.object({
