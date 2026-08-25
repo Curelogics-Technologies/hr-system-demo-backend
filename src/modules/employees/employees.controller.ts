@@ -15,6 +15,8 @@ import {
 import { emitToCompany } from '../../config/socket';
 import { emailService } from '../../services/email.service';
 import { sendWelcomeEmailAutomation } from '../automations/welcomeEmail';
+import { recordHeadcountEvent } from '../billing/headcount.service';
+import { assertLicenseCapacity } from '../billing/license.service';
 
 // Safe fields for list view (NO sensitive data)
 const LIST_FIELDS = `
@@ -944,6 +946,9 @@ export const createEmployee = asyncHandler(async (req: Request, res: Response) =
     const extra = crypto.randomBytes(8).toString('base64url').slice(0, 1);
     tempPassword = upper + digit + lower + base + extra; // 16 chars total
   }
+  // One employee consumes one paid license. Refuse before creating anything.
+  await assertLicenseCapacity(companyId, 'employee', 1);
+
   const passwordHash = await bcrypt.hash(tempPassword, 12);
 
   const employee = await queryOne(
@@ -1009,6 +1014,17 @@ export const createEmployee = asyncHandler(async (req: Request, res: Response) =
       tempPassword
     ).catch(err => console.error('[AUTOMATION] Background welcome email error:', err));
   }
+
+  // Billing ledger: a new active employee raises the billable headcount. The
+  // charge itself is prorated by the daily sweep (or the manual Sync button),
+  // not here — this only records when it happened.
+  void recordHeadcountEvent({
+    companyId,
+    resourceType: body.role === 'store_terminal' ? 'terminal' : 'employee',
+    changeType: 'added',
+    userId: (employee as any).id,
+    userLabel: [body.name, body.surname].filter(Boolean).join(' '),
+  });
 
   created(res, employee, 'Dipendente creato con successo');
 });
@@ -1214,6 +1230,17 @@ export const deactivateEmployee = asyncHandler(async (req: Request, res: Respons
     notFound(res, 'Dipendente non trovato o già disattivato');
     return;
   }
+
+  // Billing ledger: the billed headcount just went down. The reduction is not
+  // refunded — it takes effect at the next renewal — but it must be recorded.
+  void recordHeadcountEvent({
+    companyId: (employee as any).company_id ?? req.user!.companyId!,
+    resourceType: (employee as any).role === 'store_terminal' ? 'terminal' : 'employee',
+    changeType: 'removed',
+    userId: (employee as any).id,
+    userLabel: [(employee as any).name, (employee as any).surname].filter(Boolean).join(' '),
+  });
+
   ok(res, employee, 'Dipendente disattivato');
 });
 
@@ -1322,6 +1349,15 @@ export const activateEmployee = asyncHandler(async (req: Request, res: Response)
     notFound(res, 'Dipendente non trovato o già attivo');
     return;
   }
+
+  void recordHeadcountEvent({
+    companyId: (employee as any).company_id ?? req.user!.companyId!,
+    resourceType: (employee as any).role === 'store_terminal' ? 'terminal' : 'employee',
+    changeType: 'added',
+    userId: (employee as any).id,
+    userLabel: [(employee as any).name, (employee as any).surname].filter(Boolean).join(' '),
+  });
+
   ok(res, employee, 'Dipendente riattivato');
 });
 
