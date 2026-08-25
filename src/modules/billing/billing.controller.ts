@@ -180,6 +180,7 @@ export class BillingController {
           amountCents: tx.amount_cents,
           currency: tx.currency,
           status: tx.status,
+          kind: tx.kind,
           description: tx.description,
           seatQuantity: tx.seat_quantity,
           deviceQuantity: tx.device_quantity,

@@ -380,11 +380,11 @@ export class SubscriptionService {
           `INSERT INTO billing_transactions (
             company_id, subscription_id, provider,
             provider_payment_id, amount_cents, currency,
-            status, description,
+            status, kind, description,
             seat_quantity, device_quantity,
             unit_price_employee_cents, unit_price_device_cents,
             invoice_url, paid_at
-          ) VALUES ($1, $2, $3, $4, $5, $6, 'paid', $7, $8, $9, $10, $11, $12, NOW())`,
+          ) VALUES ($1, $2, $3, $4, $5, $6, 'paid', 'activation', $7, $8, $9, $10, $11, $12, NOW())`,
           [
             sub.company_id,
             sub.id,
@@ -637,11 +637,11 @@ export class SubscriptionService {
           `INSERT INTO billing_transactions (
             company_id, subscription_id, provider,
             provider_invoice_id, amount_cents, currency,
-            status, description,
+            status, kind, description,
             seat_quantity, device_quantity,
             unit_price_employee_cents, unit_price_device_cents,
             invoice_url, paid_at
-          ) VALUES ($1, $2, $3, $4, $5, $6, 'paid', $7, $8, $9, $10, $11, $12, NOW())`,
+          ) VALUES ($1, $2, $3, $4, $5, $6, 'paid', $13, $7, $8, $9, $10, $11, $12, NOW())`,
           [
             sub.company_id,
             sub.id,
@@ -657,6 +657,7 @@ export class SubscriptionService {
             Math.round(parseFloat(sub.unit_price_employee) * 100),
             Math.round(parseFloat(sub.unit_price_device) * 100),
             event.invoiceUrl || null,
+            hasPendingUpgrade ? 'license_upgrade' : 'renewal',
           ]
         );
       }
@@ -708,9 +709,9 @@ export class SubscriptionService {
       `INSERT INTO billing_transactions (
         company_id, subscription_id, provider,
         amount_cents, currency,
-        status, description,
+        status, kind, description,
         failure_code, failure_message
-      ) VALUES ($1, $2, $3, $4, $5, 'failed', $6, $7, $8)`,
+      ) VALUES ($1, $2, $3, $4, $5, 'failed', 'failed', $6, $7, $8)`,
       [
         sub.company_id,
         sub.id,
@@ -924,7 +925,11 @@ export class SubscriptionService {
         amountCents: tx.amount_cents,
         currency: tx.currency,
         status: tx.status,
+        // What the payment was — the UI words it in the reader's language.
+        kind: tx.kind,
         description: tx.description,
+        seatQuantity: tx.seat_quantity,
+        deviceQuantity: tx.device_quantity,
         invoiceUrl: tx.invoice_url,
         failureMessage: tx.failure_message,
         paidAt: tx.paid_at,
@@ -1341,9 +1346,9 @@ export class SubscriptionService {
           await client.query(
             `INSERT INTO billing_transactions (
                company_id, subscription_id, provider, provider_invoice_id,
-               amount_cents, currency, status, description,
+               amount_cents, currency, status, kind, description,
                seat_quantity, device_quantity, invoice_url, paid_at
-             ) VALUES ($1,$2,'stripe',$3,$4,$5,'paid',$6,$7,$8,$9,NOW())`,
+             ) VALUES ($1,$2,'stripe',$3,$4,$5,'paid','license_upgrade',$6,$7,$8,$9,NOW())`,
             [
               companyId,
               sub.id,
