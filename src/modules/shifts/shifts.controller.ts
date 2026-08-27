@@ -11,6 +11,41 @@ import { sendNotification } from '../notifications/notifications.service';
 import { sendShiftCreatedAutomation } from '../automations/shiftNotification';
 import { t } from '../../utils/i18n';
 import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
+import { APPROVED_LEAVE_STATUS_SQL } from '../../utils/leaveCoverage';
+
+/**
+ * Approved leave covering a date the caller is about to schedule.
+ *
+ * Shift creation checked overlaps with other shifts but never asked whether the
+ * person was already on approved holiday or sick leave, so rosters were built
+ * against days the employee could not work — and because approval only cancels
+ * shifts when the optional `cancel_shifts` box is ticked, those shifts stayed
+ * active and turned into false "unjustified absence" records.
+ *
+ * Reported as a warning the operator can override rather than a hard block:
+ * leave can be revoked, and a partial-day permission does not always rule out
+ * a shift.
+ */
+async function findLeaveConflict(
+  companyId: number,
+  userId: number,
+  date: string,
+): Promise<{ id: number; leave_type: string; start_date: string; end_date: string; leave_duration_type: string | null } | null> {
+  return queryOne(
+    `SELECT id, leave_type,
+            TO_CHAR(start_date, 'YYYY-MM-DD') AS start_date,
+            TO_CHAR(end_date,   'YYYY-MM-DD') AS end_date,
+            leave_duration_type
+       FROM leave_requests
+      WHERE company_id = $1
+        AND user_id = $2
+        AND ${APPROVED_LEAVE_STATUS_SQL}
+        AND start_date <= $3::date
+        AND end_date   >= $3::date
+      LIMIT 1`,
+    [companyId, userId, date],
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Helper: parse a cell value as HH:MM time string (handles Excel fractions, Date, string)
@@ -588,6 +623,25 @@ export const createShift = asyncHandler(async (req: Request, res: Response) => {
       conflict(res, 'Turno sovrapposto per questo dipendente in questa data', 'OVERLAP_CONFLICT');
       return;
     }
+
+    // Warn (do not block) when the day is already covered by approved leave.
+    // The operator can confirm with confirm_leave_conflict — that acknowledged
+    // decision is what stops the shift becoming a false absence later.
+    if (body.confirm_leave_conflict !== true) {
+      const leaveConflict = await findLeaveConflict(effectiveCompanyId, body.user_id, nDate);
+      if (leaveConflict) {
+        conflict(
+          res,
+          'Il dipendente ha un permesso approvato in questa data',
+          'LEAVE_CONFLICT',
+          {
+            leave: leaveConflict,
+            hint: 'Conferma per creare comunque il turno, oppure annulla il permesso.',
+          },
+        );
+        return;
+      }
+    }
   }
 
   const isFlexible = body.break_type === 'flexible';
@@ -898,6 +952,24 @@ export const updateShift = asyncHandler(async (req: Request, res: Response) => {
     if (overlapMain || overlapSplit) {
       conflict(res, 'Turno sovrapposto per questo dipendente in questa data', 'OVERLAP_CONFLICT');
       return;
+    }
+
+    // Same leave warning as creation: moving a shift onto a leave day is the
+    // other way this conflict gets introduced.
+    if (body.confirm_leave_conflict !== true) {
+      const leaveConflict = await findLeaveConflict(effectiveCompanyId, targetUserId, nTargetDate);
+      if (leaveConflict) {
+        conflict(
+          res,
+          'Il dipendente ha un permesso approvato in questa data',
+          'LEAVE_CONFLICT',
+          {
+            leave: leaveConflict,
+            hint: 'Conferma per spostare comunque il turno, oppure annulla il permesso.',
+          },
+        );
+        return;
+      }
     }
   }
 
@@ -1218,6 +1290,7 @@ export const copyWeek = asyncHandler(async (req: Request, res: Response) => {
   const sourceMondayDate = new Date(`${source_monday}T12:00:00`);
   const targetMondayDate = new Date(`${target_monday}T12:00:00`);
   let skippedOffDay = 0;
+  let skippedLeave = 0;
 
   const insertedShifts: Record<string, any>[] = [];
   for (const s of sourceShifts) {
@@ -1284,6 +1357,13 @@ export const copyWeek = asyncHandler(async (req: Request, res: Response) => {
       continue;
     }
 
+    // A bulk copy has no operator sitting in front of it to answer a warning,
+    // so leave days are skipped and reported back rather than silently booked.
+    if (await findLeaveConflict(s.company_id, s.user_id, targetDate)) {
+      skippedLeave++;
+      continue;
+    }
+
     try {
       const createdShift = await queryOne<Record<string, any>>(
         `INSERT INTO shifts (
@@ -1343,8 +1423,15 @@ export const copyWeek = asyncHandler(async (req: Request, res: Response) => {
 
   ok(
     res,
-    { copied: insertedShifts.length, skipped_off_day: skippedOffDay, shifts: insertedShifts },
-    'Settimana copiata',
+    {
+      copied: insertedShifts.length,
+      skipped_off_day: skippedOffDay,
+      skipped_leave: skippedLeave,
+      shifts: insertedShifts,
+    },
+    skippedLeave > 0
+      ? `Settimana copiata. ${skippedLeave} turno/i non copiati: permesso approvato in quelle date.`
+      : 'Settimana copiata',
   );
 });
 
@@ -1871,7 +1958,7 @@ export const exportShifts = asyncHandler(async (req: Request, res: Response) => 
       });
 
       // 2. Draw Cell Texts
-      const fullName = `${user.surname} ${user.name}`;
+      const fullName = `${user.name} ${user.surname}`;
       const dispName = fullName.length > 20 ? fullName.slice(0, 18) + '..' : fullName;
       page.drawText(dispName, {
         x: colX(0) + 5,
@@ -2279,6 +2366,14 @@ export const importShifts = asyncHandler(async (req: Request, res: Response) => 
         );
       }
       if (overlapMain || overlapSplit) { skipped++; continue; }
+
+      // Import is unattended: report the leave clash as a row error so the
+      // operator sees it, instead of quietly creating a future false absence.
+      if (await findLeaveConflict(companyId, userId, dateVal)) {
+        errors.push(`Riga ${rowNum}: permesso approvato in questa data — turno non importato`);
+        skipped++;
+        continue;
+      }
 
       // Collect validated rows for batched INSERT (M5)
       validRows.push([

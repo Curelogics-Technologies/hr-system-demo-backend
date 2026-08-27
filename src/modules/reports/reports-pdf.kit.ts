@@ -129,7 +129,8 @@ export function drawCoverHeader(
   ctx: DocContext,
   opts: {
     title: string; companyName: string; scopeLabel: string;
-    periodLabel: string; comparisonLabel: string; alert?: boolean;
+    /** Omitted when the report performs no period comparison. */
+    periodLabel: string; comparisonLabel?: string; alert?: boolean;
   },
 ): void {
   const bandHeight = 100;
@@ -155,9 +156,11 @@ export function drawCoverHeader(
   ctx.page.drawText(opts.periodLabel, {
     x: MARGIN + 20, y: ctx.y - 80, size: 9, font: ctx.font, color: rgb(0.82, 0.82, 0.82),
   });
-  ctx.page.drawText(opts.comparisonLabel, {
-    x: MARGIN + 20, y: ctx.y - 92, size: 8, font: ctx.fontItalic, color: rgb(0.7, 0.7, 0.7),
-  });
+  if (opts.comparisonLabel) {
+    ctx.page.drawText(opts.comparisonLabel, {
+      x: MARGIN + 20, y: ctx.y - 92, size: 8, font: ctx.fontItalic, color: rgb(0.7, 0.7, 0.7),
+    });
+  }
   ctx.y -= bandHeight + 26;
 }
 

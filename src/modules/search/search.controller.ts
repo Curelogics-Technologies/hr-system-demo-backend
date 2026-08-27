@@ -111,7 +111,7 @@ export const globalSearch = asyncHandler(async (req: Request, res: Response) => 
   if (queryEmployees) {
     queries.push(
       query(
-        `SELECT u.id, u.name, u.surname, u.email, u.unique_id, u.role, u.company_id, c.name AS company_name
+        `SELECT u.id, u.name, u.surname, u.email, u.unique_id, u.role, u.avatar_filename, u.company_id, c.name AS company_name
          FROM users u
          LEFT JOIN companies c ON c.id = u.company_id
          WHERE u.company_id = ANY($1)

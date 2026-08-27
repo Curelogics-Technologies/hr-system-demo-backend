@@ -25,7 +25,30 @@ export interface ReportDefinition {
   /** ISO weekday (1 = Monday) for weekly, day-of-month for monthly. */
   defaultDay: number;
   defaultSections: string[];
+  /**
+   * Sections this report can actually render.
+   *
+   * The configure dialog used to build its checkbox list from the user's ROLE,
+   * so it offered sections the generator had no branch for: ticking them saved
+   * fine and produced nothing in the PDF, with no warning. The list of what a
+   * report can draw belongs to the report, so it lives here and both the API
+   * and the UI read it from one place.
+   */
+  supportedSections: string[];
+  /**
+   * Whether the generator actually computes the previous period and renders a
+   * comparison. The cover prints "Confronto con: <period>" only when this is
+   * true — it used to print unconditionally, promising a comparison that the
+   * daily branch never performed.
+   */
+  comparesPeriods: boolean;
 }
+
+/** Everything the general (non-daily) generator branch knows how to draw. */
+const FULL_SECTIONS = [
+  'workforce', 'shifts', 'anomalies', 'leave', 'attendance',
+  'onboarding', 'trainings', 'medical', 'contracts', 'ats',
+];
 
 export const REPORT_DEFINITIONS: ReportDefinition[] = [
   {
@@ -38,6 +61,8 @@ export const REPORT_DEFINITIONS: ReportDefinition[] = [
     defaultTime: '07:00',
     defaultDay: 1,
     defaultSections: ['workforce', 'shifts', 'anomalies', 'leave', 'contracts', 'ats'],
+    supportedSections: FULL_SECTIONS,
+    comparesPeriods: true,
   },
   {
     id: 'admin_weekly',
@@ -49,6 +74,8 @@ export const REPORT_DEFINITIONS: ReportDefinition[] = [
     defaultTime: '07:00',
     defaultDay: 1,
     defaultSections: ['shifts', 'anomalies', 'leave'],
+    supportedSections: FULL_SECTIONS,
+    comparesPeriods: true,
   },
   {
     id: 'hr_monthly',
@@ -60,6 +87,8 @@ export const REPORT_DEFINITIONS: ReportDefinition[] = [
     defaultTime: '08:00',
     defaultDay: 1,
     defaultSections: ['workforce', 'leave', 'trainings', 'medical', 'contracts'],
+    supportedSections: FULL_SECTIONS,
+    comparesPeriods: true,
   },
   {
     id: 'hr_weekly',
@@ -71,6 +100,8 @@ export const REPORT_DEFINITIONS: ReportDefinition[] = [
     defaultTime: '07:00',
     defaultDay: 1,
     defaultSections: ['attendance', 'anomalies', 'shifts', 'leave', 'onboarding'],
+    supportedSections: FULL_SECTIONS,
+    comparesPeriods: true,
   },
   {
     id: 'anomaly_daily',
@@ -82,6 +113,12 @@ export const REPORT_DEFINITIONS: ReportDefinition[] = [
     defaultTime: '08:00',
     defaultDay: 1,
     defaultSections: ['ats'],
+    // The daily alert renders sections directly with no period comparison.
+    supportedSections: [
+      'anomalies', 'shifts', 'ats', 'leave', 'attendance',
+      'workforce', 'onboarding', 'contracts', 'trainings', 'medical',
+    ],
+    comparesPeriods: false,
   },
 ];
 

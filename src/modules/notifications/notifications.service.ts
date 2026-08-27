@@ -21,6 +21,8 @@ export type NotificationEventType =
   | 'leave.submitted'
   | 'leave.approved'
   | 'leave.rejected'
+  /** Stale request reassigned to the next approver, or the current one chased. Never an approval. */
+  | 'leave.escalated'
   | 'document.uploaded'
   | 'document.assigned'
   | 'document.signature_required'
