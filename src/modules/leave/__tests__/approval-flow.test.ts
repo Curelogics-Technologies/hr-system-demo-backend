@@ -298,3 +298,133 @@ describe('zero days is an allocation, not a removal', () => {
     expect(res.body.code).toBe('LEAVES_FULL');
   });
 });
+
+describe('admins can approve on a chain that has no admin step', () => {
+  // The seeded chain is store_manager -> area_manager -> hr, which is how most
+  // companies are configured. An admin used to be forced onto a non-existent
+  // 'admin' step and refused with "Ruolo non autorizzato ad approvare",
+  // meaning no admin could approve anything at all.
+  async function walkToHr(start: string, end: string): Promise<number> {
+    const id = await submitAs('employee1@acme-test.com', start, end);
+    await makeStale(id); await processEscalationLogic();
+    await makeStale(id); await processEscalationLogic();
+    return id;
+  }
+
+  it('lets a company admin approve a request sitting at HR', async () => {
+    await allocate(seeds.employee1Id, 2026, 30);
+    const id = await walkToHr('2026-10-05', '2026-10-06');
+
+    const token = await login('admin@acme-test.com');
+    const res = await request.put(`/api/leave/${id}/approve`).set('Authorization', `Bearer ${token}`).send({});
+
+    expect(res.status).toBe(200);
+    const r = await readRequest(id);
+    expect(r.approved_by).not.toBeNull();
+  });
+
+  it('lets a super admin approve one too', async () => {
+    await allocate(seeds.employee1Id, 2026, 30);
+    const id = await walkToHr('2026-10-12', '2026-10-13');
+
+    const token = await login('superadmin@acme-test.com');
+    const res = await request.put(`/api/leave/${id}/approve`).set('Authorization', `Bearer ${token}`).send({});
+
+    expect(res.status).toBe(200);
+    expect((await readRequest(id)).approved_by).not.toBeNull();
+  });
+
+  it('tells a store manager WHO the request is waiting on, not just "no permission"', async () => {
+    const id = await walkToHr('2026-10-19', '2026-10-20');
+
+    const token = await login('manager.roma@acme-test.com');
+    const res = await request.put(`/api/leave/${id}/approve`).set('Authorization', `Bearer ${token}`).send({});
+
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe('LEAVE_NOT_RESPONSIBLE');
+    expect(res.body.details.waitingOn).toBe('hr');   // actionable, not a dead end
+    expect(res.body.error).toContain('hr');
+  });
+});
+
+describe('the agreed flow, end to end', () => {
+  async function balance(): Promise<number> {
+    const { rows: [b] } = await testPool.query(
+      `SELECT used_days FROM leave_balances WHERE user_id=$1 AND year=2026 AND leave_type='vacation'`,
+      [seeds.employee1Id]);
+    return b ? Number(b.used_days) : -1;
+  }
+
+  it('HR approval finalises and deducts, with no admin step required', async () => {
+    await allocate(seeds.employee1Id, 2026, 30);
+    const id = await submitAs('employee1@acme-test.com', '2026-11-25', '2026-11-27');
+    await makeStale(id); await processEscalationLogic();   // past store manager
+    await makeStale(id); await processEscalationLogic();   // past area manager
+    expect((await readRequest(id)).current_approver_role).toBe('hr');
+
+    const token = await login('hr@acme-test.com');
+    const res = await request.put(`/api/leave/${id}/approve`).set('Authorization', `Bearer ${token}`).send({});
+    expect(res.status).toBe(200);
+
+    const r = await readRequest(id);
+    expect(r.current_approver_role).toBeNull();   // chain complete at HR
+    expect(r.approved_by).not.toBeNull();
+    expect(await balance()).toBeGreaterThan(0);   // deducted
+  });
+
+  it('an admin approving early finalises immediately and deducts', async () => {
+    await allocate(seeds.employee1Id, 2026, 30);
+    const id = await submitAs('employee1@acme-test.com', '2026-12-02', '2026-12-04');
+    // Still sitting with the store manager — the admin steps in.
+    expect((await readRequest(id)).current_approver_role).toBe('store_manager');
+
+    const token = await login('admin@acme-test.com');
+    const res = await request.put(`/api/leave/${id}/approve`).set('Authorization', `Bearer ${token}`).send({});
+    expect(res.status).toBe(200);
+
+    const r = await readRequest(id);
+    expect(r.current_approver_role).toBeNull();
+    expect(r.approved_by).not.toBeNull();
+    expect(await balance()).toBeGreaterThan(0);
+  });
+
+  it('reopening gives the days back and returns the request to pending', async () => {
+    await allocate(seeds.employee1Id, 2026, 30);
+    const id = await submitAs('employee1@acme-test.com', '2026-12-09', '2026-12-11');
+
+    const adminToken = await login('admin@acme-test.com');
+    await request.put(`/api/leave/${id}/approve`).set('Authorization', `Bearer ${adminToken}`).send({});
+    const afterApprove = await balance();
+    expect(afterApprove).toBeGreaterThan(0);
+
+    const res = await request.put(`/api/leave/${id}/reopen`).set('Authorization', `Bearer ${adminToken}`).send({});
+    expect(res.status).toBe(200);
+
+    const r = await readRequest(id);
+    expect(r.status).toBe('pending');
+    expect(r.approved_by).toBeNull();
+    expect(await balance()).toBe(0);             // days credited back
+  });
+
+  it('reopening an auto-approved request does NOT credit days that were never spent', async () => {
+    await allocate(seeds.employee1Id, 2026, 30);
+    const id = await submitAs('employee1@acme-test.com', '2026-12-16', '2026-12-18');
+    // Force the damaged state the old escalation produced.
+    await testPool.query(`ALTER TABLE leave_requests DISABLE TRIGGER trg_leave_requests_require_human_approval`);
+    await testPool.query(`UPDATE leave_requests SET status='admin_approved', current_approver_role=NULL, approved_by=NULL WHERE id=$1`, [id]);
+    await testPool.query(`ALTER TABLE leave_requests ENABLE TRIGGER trg_leave_requests_require_human_approval`);
+
+    const token = await login('admin@acme-test.com');
+    const res = await request.put(`/api/leave/${id}/reopen`).set('Authorization', `Bearer ${token}`).send({});
+    expect(res.status).toBe(200);
+    expect(res.body.data.restored_days).toBe(0);
+    expect(await balance()).toBe(0);
+  });
+
+  it('only an admin can reopen', async () => {
+    const id = await submitAs('employee1@acme-test.com', '2026-12-27', '2026-12-29');
+    const token = await login('hr@acme-test.com');
+    const res = await request.put(`/api/leave/${id}/reopen`).set('Authorization', `Bearer ${token}`).send({});
+    expect([403, 404]).toContain(res.status);
+  });
+});
