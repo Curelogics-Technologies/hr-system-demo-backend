@@ -327,6 +327,22 @@ async function getUserUsedDays(userId: number, year: number, leaveType: string):
 const DEFAULT_APPROVAL_CHAIN = ['store_manager', 'area_manager', 'hr', 'admin'];
 
 /**
+ * Roles whose decision can never be made by the system.
+ *
+ * The inactivity job may carry a request past a store or area manager who has
+ * not looked at it — that only moves it up the chain, it grants nothing. HR and
+ * Admin are different: HR approval is where the leave becomes real and the
+ * balance is deducted, so it must always be a person. A request sitting on HR
+ * or Admin is chased, never advanced and never approved.
+ */
+const MANUAL_ONLY_APPROVER_ROLES = new Set(['hr', 'admin']);
+
+/** True when the inactivity job is allowed to carry this stage forward. */
+function canAutoAdvance(role: string): boolean {
+  return !MANUAL_ONLY_APPROVER_ROLES.has(role);
+}
+
+/**
  * Maps each role to the status name produced when that role approves.
  */
 const ROLE_STATUS: Record<string, string> = {
@@ -393,6 +409,47 @@ async function isUserOnLeave(userId: number, startDate: string, endDate: string)
 
 
 /**
+ * All active users who could act as `role` for this company/store.
+ *
+ * Shared by the approver search and by the escalation reminder, so the person we
+ * route a request to is always the same person we notify about it.
+ */
+async function usersForApproverRole(
+  companyId: number,
+  storeId: number | null,
+  role: string,
+  submitterId: number,
+): Promise<{ id: number }[]> {
+  if (role === 'store_manager' && storeId) {
+    return query(
+      `SELECT id FROM users WHERE role = 'store_manager' AND store_id = $1 AND company_id = $2 AND status = 'active'`,
+      [storeId, companyId],
+    );
+  }
+  if (role === 'area_manager') {
+    // Priority: direct supervisor of the submitter
+    const supervisor = await queryOne<{ id: number }>(
+      `SELECT id FROM users WHERE id = (SELECT supervisor_id FROM users WHERE id = $1) AND role = 'area_manager' AND status = 'active' LIMIT 1`,
+      [submitterId],
+    );
+    if (supervisor) return [supervisor];
+    // The chain is company-specific, so fall back to any area manager in the
+    // request's company rather than looking across the group.
+    return query(
+      `SELECT id FROM users WHERE role = 'area_manager' AND company_id = $1 AND status = 'active'`,
+      [companyId],
+    );
+  }
+  if (role === 'hr' || role === 'admin') {
+    return query(
+      `SELECT id FROM users WHERE role = $2 AND company_id = $1 AND status = 'active'`,
+      [companyId, role],
+    );
+  }
+  return [];
+}
+
+/**
  * Recursively find the next active approver in the chain, skipping those on leave or unavailable.
 
  * Updated to correctly handle skips when starting from a mid-chain role and to check multiple potential users.
@@ -427,29 +484,7 @@ async function findNextActiveApprover(
     const role = approvalChain[i];
 
     // 1. Get ALL potential active users for this role
-    let users: { id: number }[] = [];
-    if (role === 'store_manager' && storeId) {
-      users = await query(`SELECT id FROM users WHERE role = 'store_manager' AND store_id = $1 AND company_id = $2 AND status = 'active'`, [storeId, companyId]);
-    } else if (role === 'area_manager') {
-      // Priority: direct supervisor of the submitter
-      const supervisor = await queryOne<{ id: number }>(
-        `SELECT id FROM users WHERE id = (SELECT supervisor_id FROM users WHERE id = $1) AND role = 'area_manager' AND status = 'active' LIMIT 1`,
-        [submitterId]
-      );
-      if (supervisor) {
-        users = [supervisor];
-      } else {
-        // Cross-company support: lookup area manager in other companies if group visibility is potentially relevant
-        // However, the chain is company-specific, so we usually look in the request's company.
-        // For Area Manager, we might want to check if the caller is an AM in a different company of the same group.
-        // But findNextActiveApprover is used to find WHO SHOULD BE NEXT, not who IS ACTING.
-        users = await query(`SELECT id FROM users WHERE role = 'area_manager' AND company_id = $1 AND status = 'active'`, [companyId]);
-      }
-    } else if (role === 'hr') {
-      users = await query(`SELECT id FROM users WHERE role = 'hr' AND company_id = $1 AND status = 'active'`, [companyId]);
-    } else if (role === 'admin') {
-      users = await query(`SELECT id FROM users WHERE role = 'admin' AND company_id = $1 AND status = 'active'`, [companyId]);
-    }
+    const users = await usersForApproverRole(companyId, storeId, role, submitterId);
 
     // 2. Filter out users who are either the submitter or on leave
     const availableUsers: { id: number }[] = [];
@@ -676,44 +711,111 @@ export const submitLeave = asyncHandler(async (req: Request, res: Response) => {
     nextApproverRole = 'admin';
   }
 
-  const leaveRequest = await queryOne(
-    `INSERT INTO leave_requests
-      (company_id, user_id, store_id, leave_type, start_date, end_date, leave_duration_type, short_start_time, short_end_time,
-       status, current_approver_role, notes,
-       medical_certificate_name, medical_certificate_data, medical_certificate_type, skipped_approvers, on_leave_skipped_approvers)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
-     RETURNING id, company_id, user_id, store_id, leave_type, start_date, end_date,
-               leave_duration_type, short_start_time, short_end_time,
-               status, current_approver_role, notes, medical_certificate_name, 
-               skipped_approvers, on_leave_skipped_approvers, escalated, is_emergency_override, last_action_at, created_at, updated_at`,
-    [
-      companyId,
-      userId,
-      storeId ?? null,
-      leave_type,
-      start_date,
-      end_date,
-      leaveDurationType,
-      shortStartTime,
-      shortEndTime,
-      status,
-      nextApproverRole,
-      notes ?? null,
-      certificateName,
-      certificateData,
-      certificateMime,
-      JSON.stringify(skippedApprovers),
-      JSON.stringify(onLeaveSkippedApprovers),
-    ],
-  );
+  // An admin submitting for themselves lands on `approved` with no further
+  // approver — i.e. the leave is granted here and now. That path used to insert
+  // the row and stop, never touching leave_balances, which is the same defect
+  // the escalation job had. Granting and deducting must happen together, so the
+  // terminal case runs in one transaction.
+  const grantsImmediately = nextApproverRole === null;
+  const balanceYear = yearFromIsoDate(start_date);
 
-  // If auto-approved (Admin or HR), record the approval action
-  if (finalRole === 'admin' || finalRole === 'hr') {
-    await query(
-      `INSERT INTO leave_approvals (leave_request_id, approver_id, approver_role, action, notes)
-       VALUES ($1,$2,$3,'approved',$4)`,
-      [leaveRequest.id, userId, role, 'Auto-approved on creation']
+  // Same rule as HR/Admin approval: nothing is granted against an entitlement
+  // nobody configured. An admin filing their own leave is a terminal approval,
+  // so it is held to the same standard.
+  if (grantsImmediately && requestedDays > 0) {
+    const configured = await queryOne<{ id: number }>(
+      `SELECT id FROM leave_balances
+        WHERE company_id = $1 AND user_id = $2 AND year = $3 AND leave_type = $4`,
+      [companyId, userId, balanceYear, leave_type],
     );
+    if (!configured) {
+      res.status(422).json({
+        success: false,
+        error: `Saldo non configurato (${leave_type === 'vacation' ? 'ferie' : 'malattia'} ${balanceYear}). Configura prima i giorni disponibili.`,
+        code: 'BALANCE_NOT_CONFIGURED',
+        details: { user_id: userId, year: balanceYear, leave_type },
+      });
+      return;
+    }
+  }
+
+  const submitClient = await pool.connect();
+  let leaveRequest: any;
+  try {
+    await submitClient.query('BEGIN');
+
+    const insertResult = await submitClient.query(
+      `INSERT INTO leave_requests
+        (company_id, user_id, store_id, leave_type, start_date, end_date, leave_duration_type, short_start_time, short_end_time,
+         status, current_approver_role, notes,
+         medical_certificate_name, medical_certificate_data, medical_certificate_type, skipped_approvers, on_leave_skipped_approvers,
+         approved_by, approved_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
+               CASE WHEN $18::int IS NULL THEN NULL ELSE NOW() END)
+       RETURNING id, company_id, user_id, store_id, leave_type, start_date, end_date,
+                 leave_duration_type, short_start_time, short_end_time,
+                 status, current_approver_role, notes, medical_certificate_name,
+                 skipped_approvers, on_leave_skipped_approvers, escalated, is_emergency_override, last_action_at, created_at, updated_at`,
+      [
+        companyId,
+        userId,
+        storeId ?? null,
+        leave_type,
+        start_date,
+        end_date,
+        leaveDurationType,
+        shortStartTime,
+        shortEndTime,
+        status,
+        nextApproverRole,
+        notes ?? null,
+        certificateName,
+        certificateData,
+        certificateMime,
+        JSON.stringify(skippedApprovers),
+        JSON.stringify(onLeaveSkippedApprovers),
+        grantsImmediately ? userId : null,
+      ],
+    );
+    leaveRequest = insertResult.rows[0];
+
+    // If auto-approved (Admin or HR), record the approval action
+    if (finalRole === 'admin' || finalRole === 'hr') {
+      await submitClient.query(
+        `INSERT INTO leave_approvals (leave_request_id, approver_id, approver_role, action, notes)
+         VALUES ($1,$2,$3,'approved',$4)`,
+        [leaveRequest.id, userId, role, 'Auto-approved on creation'],
+      );
+    }
+
+    if (grantsImmediately && requestedDays > 0) {
+      // UPDATE, not upsert: the allocation was verified above, and creating one
+      // here would reintroduce the invented-entitlement problem.
+      const deducted = await submitClient.query(
+        `UPDATE leave_balances
+            SET used_days = used_days + $5, updated_at = NOW()
+          WHERE company_id = $1 AND user_id = $2 AND year = $3 AND leave_type = $4`,
+        [companyId, userId, balanceYear, leave_type, requestedDays],
+      );
+      if (deducted.rowCount === 0) {
+        throw Object.assign(new Error('BALANCE_NOT_CONFIGURED'), { code: '23514' });
+      }
+    }
+
+    await submitClient.query('COMMIT');
+  } catch (err: any) {
+    await submitClient.query('ROLLBACK');
+    if (err?.code === '23514') {
+      res.status(422).json({
+        success: false,
+        error: 'Saldo insufficiente per approvare automaticamente questa richiesta',
+        code: 'INSUFFICIENT_BALANCE',
+      });
+      return;
+    }
+    throw err;
+  } finally {
+    submitClient.release();
   }
 
   // Send notification for leave submission
@@ -927,7 +1029,7 @@ export const listLeaveRequests = asyncHandler(async (req: Request, res: Response
        lr.notes, lr.created_at, lr.updated_at,
        lr.last_action_at,
        lr.medical_certificate_name,
-       lr.skipped_approvers, lr.on_leave_skipped_approvers, lr.escalated, lr.is_emergency_override,
+       lr.skipped_approvers, lr.on_leave_skipped_approvers, lr.escalated, lr.is_emergency_override, lr.approved_by, lr.approved_at, lr.last_reminder_at,
        (
          SELECT array_agg(DISTINCT approver_role)
          FROM leave_approvals
@@ -1108,7 +1210,7 @@ export const getPendingApprovals = asyncHandler(async (req: Request, res: Respon
        lr.notes, lr.created_at,
        lr.medical_certificate_name,
        lr.last_action_at,
-       lr.skipped_approvers, lr.on_leave_skipped_approvers, lr.escalated, lr.is_emergency_override,
+       lr.skipped_approvers, lr.on_leave_skipped_approvers, lr.escalated, lr.is_emergency_override, lr.approved_by, lr.approved_at, lr.last_reminder_at,
        (
          SELECT array_agg(DISTINCT approver_role)
          FROM leave_approvals
@@ -1280,6 +1382,33 @@ export const approveLeave = asyncHandler(async (req: Request, res: Response) => 
     return;
   }
 
+  // ── Balance must exist before HR or Admin can approve ─────────────────────
+  // Approval used to silently create a 25/10-day allocation from a hardcoded
+  // default, so leave was granted against days nobody had actually assigned.
+  // HR and Admin are the levels that make the leave real, so they cannot
+  // approve until somebody has configured the employee's entitlement. Lower
+  // levels are deliberately unaffected: passing a request up the chain does not
+  // require the balance to exist yet.
+  const approverIsHrOrAdmin =
+    MANUAL_ONLY_APPROVER_ROLES.has(effectiveRole) || isSuperAdmin || isOverride;
+  if (approverIsHrOrAdmin) {
+    const balanceYear = yearFromIsoDate(leaveRequest.start_date);
+    const configured = await queryOne<{ id: number }>(
+      `SELECT id FROM leave_balances
+        WHERE company_id = $1 AND user_id = $2 AND year = $3 AND leave_type = $4`,
+      [leaveRequest.company_id, leaveRequest.user_id, balanceYear, leaveRequest.leave_type],
+    );
+    if (!configured) {
+      res.status(422).json({
+        success: false,
+        error: `Saldo non configurato per questo dipendente (${leaveRequest.leave_type === 'vacation' ? 'ferie' : 'malattia'} ${balanceYear}). Configura prima i giorni disponibili, poi approva la richiesta.`,
+        code: 'BALANCE_NOT_CONFIGURED',
+        details: { user_id: leaveRequest.user_id, year: balanceYear, leave_type: leaveRequest.leave_type },
+      });
+      return;
+    }
+  }
+
   // Final step: update balance only when fully approved
   if (!transition.nextApprover) {
     const requestedDays = computeRequestedLeaveDays(leaveRequest);
@@ -1290,13 +1419,10 @@ export const approveLeave = asyncHandler(async (req: Request, res: Response) => 
     try {
       await client.query('BEGIN');
 
-      await client.query(
-        `INSERT INTO leave_balances (company_id, user_id, year, leave_type, total_days, used_days)
-         VALUES ($1,$2,$3,$4,$5,0)
-         ON CONFLICT (company_id, user_id, year, leave_type) DO NOTHING`,
-        [leaveRequest.company_id, leaveRequest.user_id, year, leaveRequest.leave_type, defaultTotal],
-      );
-
+      // No silent default allocation any more. Inventing 25/10 days meant leave
+      // was granted against an entitlement nobody had set; the guard above
+      // requires HR/Admin to configure it first. The lock is taken on the row
+      // that must already exist.
       const balanceResult = await client.query(
         `SELECT total_days FROM leave_balances
          WHERE company_id=$1 AND user_id=$2 AND year=$3 AND leave_type=$4
@@ -1304,6 +1430,16 @@ export const approveLeave = asyncHandler(async (req: Request, res: Response) => 
         [leaveRequest.company_id, leaveRequest.user_id, year, leaveRequest.leave_type],
       );
       const balance = balanceResult.rows[0];
+      if (!balance) {
+        await client.query('ROLLBACK');
+        res.status(422).json({
+          success: false,
+          error: `Saldo non configurato per questo dipendente (${leaveRequest.leave_type === 'vacation' ? 'ferie' : 'malattia'} ${year}). Configura prima i giorni disponibili, poi approva la richiesta.`,
+          code: 'BALANCE_NOT_CONFIGURED',
+          details: { user_id: leaveRequest.user_id, year, leave_type: leaveRequest.leave_type },
+        });
+        return;
+      }
       const totalDays = parseFloat(balance.total_days);
 
       // Dynamically calculate used days from already approved requests
@@ -1340,14 +1476,15 @@ export const approveLeave = asyncHandler(async (req: Request, res: Response) => 
 
       const updated = await client.query(
         `UPDATE leave_requests
-         SET status=$1, current_approver_role=$2, updated_at=NOW(), last_action_at=NOW(), is_emergency_override=$3
+         SET status=$1, current_approver_role=$2, updated_at=NOW(), last_action_at=NOW(), is_emergency_override=$3,
+             approved_by=$5, approved_at=NOW()
          WHERE id=$4
          RETURNING id, company_id, user_id, store_id, leave_type, start_date, end_date,
                    leave_duration_type,
                    TO_CHAR(short_start_time, 'HH24:MI') AS short_start_time,
                    TO_CHAR(short_end_time, 'HH24:MI') AS short_end_time,
                    status, current_approver_role, notes, created_at, updated_at`,
-        [transition.nextStatus, transition.nextApprover, isOverride, leaveId],
+        [transition.nextStatus, transition.nextApprover, isOverride, leaveId, userId],
       );
 
       await client.query(
@@ -1363,13 +1500,18 @@ export const approveLeave = asyncHandler(async (req: Request, res: Response) => 
         [requestedDays, leaveRequest.company_id, leaveRequest.user_id, year, leaveRequest.leave_type],
       );
       if (balanceUpdate.rowCount === 0) {
-        await client.query(
-          `INSERT INTO leave_balances (company_id, user_id, year, leave_type, total_days, used_days)
-           VALUES ($1,$2,$3,$4,$5,$6)
-           ON CONFLICT (company_id, user_id, year, leave_type) DO UPDATE
-           SET used_days = leave_balances.used_days + EXCLUDED.used_days, updated_at = NOW()`,
-          [leaveRequest.company_id, leaveRequest.user_id, year, leaveRequest.leave_type, defaultTotal, requestedDays],
-        );
+        // The row was locked FOR UPDATE a few statements ago, so zero rows here
+        // means it vanished mid-transaction. Creating one with an invented
+        // total is exactly what let leave be granted against days nobody
+        // allocated, so fail loudly instead.
+        await client.query('ROLLBACK');
+        res.status(422).json({
+          success: false,
+          error: 'Saldo non configurato per questo dipendente. Configura prima i giorni disponibili, poi approva la richiesta.',
+          code: 'BALANCE_NOT_CONFIGURED',
+          details: { user_id: leaveRequest.user_id, year, leave_type: leaveRequest.leave_type },
+        });
+        return;
       }
 
       // Cancel shifts if requested
@@ -1756,6 +1898,115 @@ export const getBalance = asyncHandler(async (req: Request, res: Response) => {
 });
 
 // ---------------------------------------------------------------------------
+// GET /api/leave/balances — every balance in scope, in one query
+//
+// The admin leave panel used to call GET /balance once per employee, which is
+// why it capped itself at 50 people: 50 parallel HTTP requests was already the
+// practical ceiling. Lifting that cap without this endpoint would just turn the
+// display bug into a performance one.
+// ---------------------------------------------------------------------------
+export const listBalances = asyncHandler(async (req: Request, res: Response) => {
+  const { role } = req.user!;
+
+  if (LEAVE_BLOCKED_ROLES.has(role)) {
+    forbidden(res, 'Accesso non consentito per questo ruolo');
+    return;
+  }
+  if (!['admin', 'hr', 'system_admin'].includes(role) && req.user!.is_super_admin !== true) {
+    forbidden(res, 'Solo admin e HR possono consultare i saldi di tutti i dipendenti');
+    return;
+  }
+
+  const allowedCompanyIds = await resolveAllowedCompanyIds(req.user!);
+  const { year, company_id, store_id } = req.query as Record<string, string>;
+
+  const targetYear = year ? parseInt(year, 10) : currentYearInDefaultLeaveTimezone();
+  if (Number.isNaN(targetYear)) {
+    badRequest(res, 'Anno non valido', 'VALIDATION_ERROR');
+    return;
+  }
+
+  // A company filter narrows the scope; without one a super admin legitimately
+  // sees every company they can access.
+  let companyIds = allowedCompanyIds;
+  if (company_id) {
+    const requested = parseInt(company_id, 10);
+    if (Number.isNaN(requested) || !allowedCompanyIds.includes(requested)) {
+      forbidden(res, 'Non hai accesso a questa azienda');
+      return;
+    }
+    companyIds = [requested];
+  }
+
+  const params: (number[] | number | string)[] = [companyIds, targetYear];
+  let storeClause = '';
+  if (store_id) {
+    const requestedStore = parseInt(store_id, 10);
+    if (Number.isNaN(requestedStore)) {
+      badRequest(res, 'store_id non valido', 'VALIDATION_ERROR');
+      return;
+    }
+    params.push(requestedStore);
+    storeClause = ` AND u.store_id = $${params.length}`;
+  }
+
+  // One row per (employee, leave_type). used_days is derived from the approved
+  // requests themselves — the same rule getUserUsedDays applies per user — so
+  // the panel and the single-user endpoint cannot disagree.
+  const rows = await query<{
+    user_id: number;
+    company_id: number;
+    leave_type: string;
+    total_days: string;
+    used_days: string;
+    updated_at: string | null;
+  }>(
+    `SELECT lb.user_id, lb.company_id, lb.leave_type,
+            lb.total_days,
+            COALESCE(used.days, 0)::numeric AS used_days,
+            lb.updated_at
+       FROM leave_balances lb
+       JOIN users u ON u.id = lb.user_id AND u.status = 'active'
+       LEFT JOIN LATERAL (
+         SELECT SUM(
+                  CASE
+                    WHEN lr.leave_duration_type = 'short_leave' THEN 0.5
+                    ELSE (lr.end_date - lr.start_date + 1)
+                  END
+                ) AS days
+           FROM leave_requests lr
+          WHERE lr.user_id = lb.user_id
+            AND lr.leave_type = lb.leave_type
+            AND lr.status IN ('approved', 'admin_approved')
+            AND EXTRACT(YEAR FROM lr.start_date) = lb.year
+       ) used ON TRUE
+      WHERE lb.company_id = ANY($1::int[])
+        AND lb.year = $2
+        ${storeClause}
+      ORDER BY lb.user_id, lb.leave_type`,
+    params,
+  );
+
+  const byUser: Record<number, Array<Record<string, unknown>>> = {};
+  for (const r of rows) {
+    const total = parseFloat(r.total_days);
+    const used = parseFloat(r.used_days);
+    (byUser[r.user_id] ||= []).push({
+      user_id: r.user_id,
+      company_id: r.company_id,
+      year: targetYear,
+      leave_type: r.leave_type,
+      total_days: r.total_days,
+      used_days: used,
+      remaining_days: Number((total - used).toFixed(2)),
+      updated_at: r.updated_at,
+    });
+  }
+
+  ok(res, { year: targetYear, balances: byUser });
+});
+
+// ---------------------------------------------------------------------------
 // POST /api/leave/admin — admin/hr creates leave on behalf of an employee
 // Auto-approved (hr_approved), balance deducted atomically
 // ---------------------------------------------------------------------------
@@ -1887,8 +2138,8 @@ export const createLeaveAdmin = asyncHandler(async (req: Request, res: Response)
     const inserted = await dbClient.query(
       `INSERT INTO leave_requests
          (company_id, user_id, store_id, leave_type, start_date, end_date, leave_duration_type, short_start_time, short_end_time,
-          status, current_approver_role, notes)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+          status, current_approver_role, notes, approved_by, approved_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW())
        RETURNING id, company_id, user_id, store_id, leave_type, start_date, end_date,
                  leave_duration_type,
                  TO_CHAR(short_start_time, 'HH24:MI') AS short_start_time,
@@ -1907,6 +2158,9 @@ export const createLeaveAdmin = asyncHandler(async (req: Request, res: Response)
         initialStatus,
         nextApprover,
         notes ?? null,
+        // Only the terminal (admin/super-admin) path grants the leave outright;
+        // the HR path still needs an admin decision, so it has no approver yet.
+        nextApprover === null ? adminId : null,
       ],
     );
 
@@ -1985,8 +2239,15 @@ export const setBalance = asyncHandler(async (req: Request, res: Response) => {
     badRequest(res, `Anno non valido (${currentYear - 10}–${currentYear + 5})`, 'INVALID_YEAR');
     return;
   }
-  if (typeof total_days !== 'number' || total_days <= 0 || !Number.isFinite(total_days)) {
-    badRequest(res, 'Il totale dei giorni deve essere un numero positivo', 'INVALID_TOTAL_DAYS');
+  // Two distinct inputs, deliberately:
+  //   null  -> remove the allocation entirely (back to not-configured)
+  //   0     -> a real allocation of zero days, which displays as 0 and blocks
+  //            any further leave because nothing remains
+  // Conflating them meant an admin could not express "this person is entitled
+  // to nothing" separately from "nobody has decided yet".
+  const isClearRequest = total_days === null || total_days === undefined;
+  if (!isClearRequest && (typeof total_days !== 'number' || total_days < 0 || !Number.isFinite(total_days))) {
+    badRequest(res, 'Il totale dei giorni non può essere negativo', 'INVALID_TOTAL_DAYS');
     return;
   }
 
@@ -2001,6 +2262,48 @@ export const setBalance = asyncHandler(async (req: Request, res: Response) => {
   }
 
   const effectiveCompanyId = targetUser.company_id;
+
+  // ── Clearing an allocation ────────────────────────────────────────────────
+  // Removing the row is what takes the employee back to "not configured", which
+  // in turn blocks HR/Admin approval until someone sets real days. That is a
+  // heavier action than editing a number, so it is admin-only, and it is
+  // refused outright once leave has been booked against the allocation —
+  // deleting then would silently orphan days the employee has already taken.
+  if (isClearRequest) {
+    const isAdmin = req.user!.role === 'admin' || req.user!.is_super_admin === true;
+    if (!isAdmin) {
+      forbidden(
+        res,
+        'Solo un amministratore può azzerare (rimuovere) il saldo di un dipendente',
+        'BALANCE_CLEAR_ADMIN_ONLY',
+      );
+      return;
+    }
+
+    const existing = await queryOne<{ used_days: string }>(
+      `SELECT used_days FROM leave_balances
+        WHERE company_id=$1 AND user_id=$2 AND year=$3 AND leave_type=$4`,
+      [effectiveCompanyId, user_id, year, leave_type],
+    );
+
+    if (existing && parseFloat(existing.used_days) > 0) {
+      res.status(422).json({
+        success: false,
+        error: `Impossibile rimuovere il saldo: ${parseFloat(existing.used_days)} giorni risultano già utilizzati.`,
+        code: 'BALANCE_CLEAR_HAS_USAGE',
+      });
+      return;
+    }
+
+    await query(
+      `DELETE FROM leave_balances
+        WHERE company_id=$1 AND user_id=$2 AND year=$3 AND leave_type=$4`,
+      [effectiveCompanyId, user_id, year, leave_type],
+    );
+
+    ok(res, { cleared: true, user_id, year, leave_type }, 'Saldo rimosso');
+    return;
+  }
 
   const result = await query<{
     id: number; company_id: number; user_id: number; year: number;
@@ -2453,6 +2756,56 @@ export const importLeaveBalances = asyncHandler(async (req: Request, res: Respon
 // Auto-Escalation Logic
 // ---------------------------------------------------------------------------
 
+/**
+ * Tell the people who owe a decision that one is outstanding.
+ *
+ * The old escalation approved the request instead of chasing anyone, so nothing
+ * was ever sent. Both branches of the new job go through here.
+ */
+async function notifyApproversOfPendingLeave(
+  req: { id: number; company_id: number; user_id: number; store_id: number | null },
+  approverRole: string,
+  kind: 'reassigned' | 'reminder',
+): Promise<void> {
+  try {
+    const approvers = await usersForApproverRole(req.company_id, req.store_id, approverRole, req.user_id);
+    if (approvers.length === 0) {
+      console.warn(`[leave-escalation] request ${req.id}: no active "${approverRole}" to notify`);
+      return;
+    }
+
+    const employee = await queryOne<{ name: string; surname: string }>(
+      `SELECT name, surname FROM users WHERE id = $1`,
+      [req.user_id],
+    );
+    const who = employee ? `${employee.name} ${employee.surname}`.trim() : `dipendente #${req.user_id}`;
+
+    const title = kind === 'reassigned'
+      ? 'Richiesta di permesso riassegnata'
+      : 'Sollecito: richiesta di permesso in attesa';
+    const message = kind === 'reassigned'
+      ? `La richiesta di permesso di ${who} è stata riassegnata a te per inattività del livello precedente. Nessuna approvazione automatica è stata effettuata: attende la tua decisione.`
+      : `La richiesta di permesso di ${who} è ferma da più di 2 giorni e attende la tua decisione. Nessuna approvazione automatica verrà effettuata.`;
+
+    await Promise.all(
+      approvers.map((a) =>
+        sendNotification({
+          companyId: req.company_id,
+          userId: a.id,
+          type: 'leave.escalated',
+          title,
+          message,
+          priority: 'high',
+          metadata: { leave_request_id: req.id, kind },
+        }).catch(() => undefined),
+      ),
+    );
+  } catch (err) {
+    // A failed notification must never stop the job from processing the rest.
+    console.error(`[leave-escalation] notification failed for request ${req.id}`, err);
+  }
+}
+
 export async function processEscalationLogic() {
   const stalled = await query<{
     id: number;
@@ -2465,8 +2818,11 @@ export async function processEscalationLogic() {
     escalated: boolean;
     skipped_approvers: string[] | null;
     on_leave_skipped_approvers: string[] | null;
+    reminder_due: boolean;
   }>(
-    `SELECT id, company_id, user_id, store_id, start_date, end_date, current_approver_role, escalated, skipped_approvers, on_leave_skipped_approvers
+    `SELECT id, company_id, user_id, store_id, start_date, end_date, current_approver_role,
+            escalated, skipped_approvers, on_leave_skipped_approvers,
+            (last_reminder_at IS NULL OR last_reminder_at < NOW() - INTERVAL '2 days') AS reminder_due
      FROM leave_requests
      WHERE status NOT IN ('admin_approved', 'rejected', 'cancelled')
        AND last_action_at < NOW() - INTERVAL '2 days'
@@ -2482,39 +2838,94 @@ export async function processEscalationLogic() {
       const transition = transitions[req.current_approver_role];
       if (!transition) continue;
 
-      // Use findNextActiveApprover to skip anyone on leave during escalation
-      const { approver: nextActiveRole, skipped: additionalSkipped } = await findNextActiveApprover(
-        req.company_id,
-        req.store_id,
-        req.start_date,
-        req.end_date,
-        req.user_id,
-        transition.nextApprover,
-        chain
-      );
+      // HR and Admin decisions are never made by the system. A request sitting
+      // on either is chased where it is — not advanced, not approved.
+      const stageMayAdvance = canAutoAdvance(req.current_approver_role);
 
-      const finalNextRole = nextActiveRole;
-      const finalNextStatus = finalNextRole ? (transitions[finalNextRole]?.nextStatus || transition.nextStatus) : 'admin_approved';
-      const updatedSkipped = Array.from(new Set([...(req.skipped_approvers || []), ...additionalSkipped]));
-      const realAdditionalSkipped = additionalSkipped.filter(r => chain.includes(r));
-      const updatedOnLeaveSkipped = Array.from(new Set([...(req.on_leave_skipped_approvers || []), ...realAdditionalSkipped]));
+      // Only ever look FORWARD. findNextActiveApprover treats a null start role
+      // as "scan the whole chain from the top", which at the end of the chain
+      // would hand the request back to the first approver — so when there is no
+      // next role we must not call it at all.
+      let nextActiveRole: string | null = null;
+      let additionalSkipped: string[] = [];
+      if (stageMayAdvance && transition.nextApprover) {
+        const found = await findNextActiveApprover(
+          req.company_id,
+          req.store_id,
+          req.start_date,
+          req.end_date,
+          req.user_id,
+          transition.nextApprover,
+          chain,
+        );
+        nextActiveRole = found.approver;
+        additionalSkipped = found.skipped;
+      }
 
-      await query(
-        `UPDATE leave_requests
-         SET current_approver_role = $1, status = $2, escalated = TRUE, last_action_at = NOW(),
-             skipped_approvers = $3, on_leave_skipped_approvers = $4
-         WHERE id = $5`,
-        [finalNextRole, finalNextStatus, JSON.stringify(updatedSkipped), JSON.stringify(updatedOnLeaveSkipped), req.id]
-      );
+      if (nextActiveRole) {
+        // ── Auto-advance (below HR only) ────────────────────────────────────
+        // Carry the request past a store/area manager who has not looked at it.
+        // `status` records that the stage was cleared, but the request only ever
+        // moves TOWARDS a human decision: the next role is always a real
+        // approver, and approved_by stays NULL, so it can never be mistaken for
+        // granted and no balance is deducted here.
+        const updatedSkipped = Array.from(new Set([...(req.skipped_approvers || []), ...additionalSkipped]));
+        const realAdditionalSkipped = additionalSkipped.filter(r => chain.includes(r));
+        const updatedOnLeaveSkipped = Array.from(new Set([...(req.on_leave_skipped_approvers || []), ...realAdditionalSkipped]));
 
-      // Record the escalation
-      await query(
-        `INSERT INTO leave_approvals (leave_request_id, approver_id, approver_role, action, notes)
-         VALUES ($1, NULL, 'system', 'escalated', $2)`,
-        [req.id, `System auto-approved at ${req.current_approver_role} stage and escalated to ${finalNextRole || 'final'} due to inactivity.`]
-      );
+        await query(
+          `UPDATE leave_requests
+           SET current_approver_role = $1, status = $2, escalated = TRUE,
+               last_action_at = NOW(), last_reminder_at = NOW(),
+               skipped_approvers = $3, on_leave_skipped_approvers = $4
+           WHERE id = $5`,
+          [
+            nextActiveRole,
+            // The status THIS stage produces — not the next role's, which is
+            // what made the status run a phase ahead of the approver.
+            transition.nextStatus,
+            JSON.stringify(updatedSkipped),
+            JSON.stringify(updatedOnLeaveSkipped),
+            req.id,
+          ],
+        );
 
-      escalatedCount++;
+        await query(
+          `INSERT INTO leave_approvals (leave_request_id, approver_id, approver_role, action, notes)
+           VALUES ($1, NULL, 'system', 'escalated', $2)`,
+          [req.id, `Fase ${req.current_approver_role} superata automaticamente per inattività; assegnata a ${nextActiveRole}. Approvazione finale e scarico del saldo riservati a una decisione umana.`],
+        );
+
+        await notifyApproversOfPendingLeave(req, nextActiveRole, 'reassigned');
+        escalatedCount++;
+      } else {
+        // ── Solicit ─────────────────────────────────────────────────────────
+        // Either the stage belongs to HR/Admin — whose decision is always a
+        // person's — or there is nobody further down the chain. Either way the
+        // request stays exactly where it is and we chase the current approver.
+        // It is never granted by default.
+        if (!req.reminder_due) continue;
+
+        // last_action_at is intentionally left alone: the request is still
+        // stale and must keep showing up in the "requires attention" report.
+        await query(
+          `UPDATE leave_requests SET escalated = TRUE, last_reminder_at = NOW() WHERE id = $1`,
+          [req.id],
+        );
+
+        await query(
+          `INSERT INTO leave_approvals (leave_request_id, approver_id, approver_role, action, notes)
+           VALUES ($1, NULL, 'system', 'escalated', $2)`,
+          [req.id, `Sollecito automatico a ${req.current_approver_role}: richiesta ferma da oltre 2 giorni — ${
+            stageMayAdvance
+              ? 'nessun approvatore disponibile ai livelli successivi'
+              : `l'approvazione ${req.current_approver_role.toUpperCase()} richiede sempre una decisione umana`
+          }. Nessuna approvazione automatica.`],
+        );
+
+        await notifyApproversOfPendingLeave(req, req.current_approver_role, 'reminder');
+        escalatedCount++;
+      }
     } catch (err) {
       // Avoid crashing the whole background task because of one broken row/constraint.
       if (isPgCheckConstraintError(err)) {

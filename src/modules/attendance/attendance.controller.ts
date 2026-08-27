@@ -16,6 +16,11 @@ import {
   withDeviceProfileHash,
 } from '../../utils/deviceProfile';
 import { sendLateArrivalAlertAutomation } from '../automations/lateArrivalAlert';
+import {
+  APPROVED_LEAVE_STATUSES as SHARED_APPROVED_LEAVE_STATUSES,
+  loadApprovedLeaveDays,
+  leaveCoverageKey,
+} from '../../utils/leaveCoverage';
 
 // ---------------------------------------------------------------------------
 // Date helpers used where API contracts expect date-only values.
@@ -32,7 +37,10 @@ const DEFAULT_SHIFT_TIMEZONE_SQL = DEFAULT_SHIFT_TIMEZONE.replace(/'/g, "''");
 const SHIFT_TIMEZONE_SQL = `COALESCE(NULLIF(BTRIM(s.timezone), ''), '${DEFAULT_SHIFT_TIMEZONE_SQL}')`;
 const SHIFT_START_UTC_SQL = coalescedShiftPointUtcSql('s.start_at_utc', 's.date', 's.start_time', 's.timezone');
 const SHIFT_END_UTC_SQL = coalescedShiftPointUtcSql('s.end_at_utc', 's.date', 's.end_time', 's.timezone');
-const APPROVED_LEAVE_STATUSES = ['approved', 'admin_approved', 'admin approved', 'hr_approved'];
+// Was a local list that omitted 'HR approved' — the terminal status when a
+// company's approval chain ends at HR — so those employees could still clock in
+// while on approved leave. Now shared with the anomaly and report engines.
+const APPROVED_LEAVE_STATUSES = [...SHARED_APPROVED_LEAVE_STATUSES];
 
 function localDateStr(date: Date): string {
   const y = date.getFullYear();
@@ -1307,8 +1315,8 @@ export interface AnomalyResult {
   user_avatar_filename: string | null;
   store_name: string;
   date: string;
-  anomaly_type: 'late_arrival' | 'no_show' | 'long_break' | 'early_exit' | 'overtime' | 'missing_checkout' | 'missing_break';
-  severity: 'low' | 'medium' | 'high';
+  anomaly_type: 'late_arrival' | 'no_show' | 'long_break' | 'early_exit' | 'overtime' | 'missing_checkout' | 'missing_break' | 'on_leave';
+  severity: 'low' | 'medium' | 'high' | 'info';
   details: string;
   details_key: string;
   details_params: Record<string, string | number>;
@@ -1475,6 +1483,12 @@ export async function calculateAnomaliesForRange(
     if (e.event_type === 'break_end' && (!group.break_end || t > group.break_end)) group.break_end = t;
   }
 
+  // Days already covered by approved leave. Loaded once for the window: the
+  // loop below runs over every shift and cannot afford a query each.
+  const leaveDays = await loadApprovedLeaveDays(allowedCompanyIds, from, to, {
+    userId: filterUserId ?? null,
+  });
+
   const LATE_MS = 10 * 60 * 1000; // 10 minutes
   const EARLY_EXIT_MS = 1000;
   const LONG_BREAK_MS = 5 * 60 * 1000;  // 5 minutes
@@ -1496,14 +1510,22 @@ export async function calculateAnomaliesForRange(
 
     if (!evGroup?.checkin) {
       if (shiftEnd.getTime() < nowTs || shiftStart.getTime() + LATE_MS < nowTs) {
+        // A person on approved leave is not an unjustified absence. The shift
+        // may well still be active — cancel_shifts is optional on approval — so
+        // the shift status alone cannot be trusted here. Reported as `on_leave`
+        // rather than dropped, so the manager sees why the slot is empty.
+        const onLeave = leaveDays.has(leaveCoverageKey(shift.user_id, shift.date));
         anomalies.push({
           shift_id: shift.id, company_id: shift.company_id, user_id: shift.user_id,
           user_name: shift.user_name, user_surname: shift.user_surname,
           user_avatar_filename: shift.user_avatar_filename,
           store_name: shift.store_name, date: shift.date,
-          anomaly_type: 'no_show', severity: 'high',
-          details: `Nessun arrivo registrato. Turno: ${shift.start_time.slice(0, 5)}–${shift.end_time.slice(0, 5)}`,
-          details_key: 'attendance.detail_no_show',
+          anomaly_type: onLeave ? 'on_leave' : 'no_show',
+          severity: onLeave ? 'info' : 'high',
+          details: onLeave
+            ? `Assenza giustificata da permesso approvato. Turno: ${shift.start_time.slice(0, 5)}–${shift.end_time.slice(0, 5)}`
+            : `Nessun arrivo registrato. Turno: ${shift.start_time.slice(0, 5)}–${shift.end_time.slice(0, 5)}`,
+          details_key: onLeave ? 'attendance.detail_on_leave' : 'attendance.detail_no_show',
           details_params: { start: shift.start_time.slice(0, 5), end: shift.end_time.slice(0, 5) },
           checkin_source: null,
         });
@@ -1646,6 +1668,10 @@ export async function calculateAnomaliesForRange(
 export async function sendAnomalyNotifications(anomalies: AnomalyResult[]): Promise<void> {
   const localeCache = new Map<number, string>();
   for (const anomaly of anomalies) {
+    // `on_leave` is context for the manager's screen, not an incident. Alerting
+    // someone because a colleague is on approved holiday is the noise this fix
+    // exists to remove.
+    if (anomaly.anomaly_type === 'on_leave') continue;
     if (!localeCache.has(anomaly.user_id)) {
       const localeRow = await queryOne<{ locale: string | null }>(
         `SELECT locale
@@ -1766,7 +1792,16 @@ export const getAnomalies = asyncHandler(async (req: Request, res: Response) => 
 
   await sendAnomalyNotifications(anomalies);
 
-  ok(res, { anomalies, total: anomalies.length });
+  // `on_leave` rows are context, not incidents. They are returned so the
+  // manager can see why a slot is empty, but the headline count must only
+  // report real anomalies — otherwise excluding people on approved leave from
+  // no_show would still leave them inflating the total.
+  const realAnomalies = anomalies.filter(a => a.anomaly_type !== 'on_leave');
+  ok(res, {
+    anomalies,
+    total: realAnomalies.length,
+    on_leave_count: anomalies.length - realAnomalies.length,
+  });
 });
 
 // ---------------------------------------------------------------------------

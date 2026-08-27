@@ -9,9 +9,11 @@
     "start": "node dist/index.js",
     "seed": "ts-node src/scripts/seed.ts",
     "seed:prod": "node dist/scripts/seed.js",
-    "test": "DATABASE_URL=postgresql://user@localhost:5432/hr_system_test TEST_DATABASE_URL=postgresql://user@localhost:5432/hr_system_test jest",
-    "test:watch": "DATABASE_URL=postgresql://user@localhost:5432/hr_system_test TEST_DATABASE_URL=postgresql://user@localhost:5432/hr_system_test jest --watch",
-    "test:coverage": "DATABASE_URL=postgresql://user@localhost:5432/hr_system_test TEST_DATABASE_URL=postgresql://user@localhost:5432/hr_system_test jest --coverage"
+    "diagnose:leave": "ts-node src/scripts/diagnoseLeaveIntegrity.ts",
+    "repair:leave": "ts-node src/scripts/repairLeaveEscalations.ts",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage"
   },
   "dependencies": {
     "@paypal/paypal-server-sdk": "^2.5.0",

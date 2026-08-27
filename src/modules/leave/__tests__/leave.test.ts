@@ -338,6 +338,16 @@ describe('PUT /api/leave/:id/approve', () => {
   });
 
   it('full approval chain: store_manager → area_manager → hr → hr_approved, balance decremented', async () => {
+    // HR approval now requires the employee's entitlement to be configured —
+    // leave is never granted against days nobody allocated.
+    await testPool.query(
+      `INSERT INTO leave_balances (company_id, user_id, year, leave_type, total_days, used_days)
+       VALUES ($1, $2, 2026, 'vacation', 25, 0)
+       ON CONFLICT (company_id, user_id, year, leave_type)
+       DO UPDATE SET total_days = 25, used_days = 0`,
+      [seeds.acmeId, seeds.employee1Id],
+    );
+
     // Step 1: store_manager approves
     const smToken = await login('manager.roma@acme-test.com');
     const step1 = await request
@@ -469,10 +479,12 @@ describe('GET /api/leave/balance', () => {
     );
     // Seed approved leave request representing 10 days of vacation
     // 2026-05-01 (Fri) to 2026-05-14 (Tue) = 10 working days
+    // approved_by is required: migration 135 forbids a request reaching a
+    // terminal approval without a person behind it.
     await testPool.query(
-      `INSERT INTO leave_requests (company_id, user_id, store_id, leave_type, start_date, end_date, status, current_approver_role, notes)
-       VALUES ($1, $2, $3, 'vacation', '2026-05-01', '2026-05-14', 'approved', null, 'Ferie pregresse')`,
-      [seeds.acmeId, seeds.employee1Id, seeds.romaStoreId]
+      `INSERT INTO leave_requests (company_id, user_id, store_id, leave_type, start_date, end_date, status, current_approver_role, notes, approved_by, approved_at)
+       VALUES ($1, $2, $3, 'vacation', '2026-05-01', '2026-05-14', 'approved', null, 'Ferie pregresse', $4, NOW())`,
+      [seeds.acmeId, seeds.employee1Id, seeds.romaStoreId, seeds.adminId]
     );
   });
 

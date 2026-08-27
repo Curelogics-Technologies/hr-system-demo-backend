@@ -4,6 +4,7 @@ import { ok } from '../../utils/response';
 import { asyncHandler } from '../../utils/asyncHandler';
 import { coalescedShiftPointUtcSql } from '../../utils/shiftTimezone';
 import { resolveAllowedCompanyIds } from '../../utils/companyScope';
+import { loadApprovedLeaveDays, leaveCoverageKey } from '../../utils/leaveCoverage';
 
 function localToday(): string {
   const now = new Date();
@@ -240,8 +241,16 @@ export const getHomeData = asyncHandler(async (req: Request, res: Response) => {
 
       const LATE_MS = 10 * 60 * 1000; // 10 minutes
       let totalAbsences = 0;
+      let justifiedAbsences = 0;
       let delays = 0;
       const nowTs = now.getTime();
+
+      // Fourth copy of the no-show rule (anomaly engine, reports, store
+      // dashboard, here). Approved leave must not count as an absence in any
+      // of them, or the admin KPI keeps contradicting the anomaly list.
+      const adminLeaveDays = await loadApprovedLeaveDays(
+        allowedCompanyIds, anomalyStartStr, anomalyEndStr,
+      );
 
       for (const shift of anomalyShifts) {
         const key = `${shift.user_id}:${shift.date}`;
@@ -254,7 +263,11 @@ export const getHomeData = asyncHandler(async (req: Request, res: Response) => {
 
         if (!evGroup?.checkin) {
           if (shiftEnd.getTime() < nowTs || shiftStart.getTime() + LATE_MS < nowTs) {
-            totalAbsences++;
+            if (adminLeaveDays.has(leaveCoverageKey(shift.user_id, shift.date))) {
+              justifiedAbsences++;
+            } else {
+              totalAbsences++;
+            }
           }
           continue;
         }
@@ -288,6 +301,9 @@ export const getHomeData = asyncHandler(async (req: Request, res: Response) => {
         dashboardStats: {
           attendanceRate,
           totalAbsences,
+          // Reported separately so the dashboard can show that the drop in
+          // absences is justified leave, not a data loss.
+          justifiedAbsences,
           delays,
           shiftCoverage,
         },
@@ -759,6 +775,10 @@ export const getHomeData = asyncHandler(async (req: Request, res: Response) => {
         if (e.event_type === 'break_end' && (!group.break_end || t > group.break_end)) group.break_end = t;
       }
 
+      const leaveDays = companyId
+        ? await loadApprovedLeaveDays([companyId], today, today, { storeId })
+        : new Set<string>();
+
       const LATE_MS = 10 * 60 * 1000; // 10 minutes
       const EARLY_EXIT_MS = 1000;
       const LONG_BREAK_MS = 5 * 60 * 1000;  // 5 minutes
@@ -776,7 +796,12 @@ export const getHomeData = asyncHandler(async (req: Request, res: Response) => {
         if (shiftStart.getTime() > nowTs) continue;
 
         if (!evGroup?.checkin) {
-          if (shiftEnd.getTime() < nowTs) {
+          // Same rule as the anomaly engine: approved leave is a justified
+          // absence, so it must not appear on the manager's dashboard as a
+          // no-show. (This third copy of the no-show logic was not in the
+          // original report — it had the same defect.)
+          const onLeave = leaveDays.has(leaveCoverageKey(shift.user_id, shift.date));
+          if (shiftEnd.getTime() < nowTs && !onLeave) {
             todayAnomalies.push({
               anomaly_type: 'no_show', severity: 'high',
               user_name: shift.user_name, user_surname: shift.user_surname,
