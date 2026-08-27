@@ -57,8 +57,14 @@ function parseJsonColumn<T>(value: T | string, fallback: T): T {
 }
 
 function mapConfigRow(r: ReportConfigRow) {
+  const definition = getReportDefinition(r.report_id);
   return {
     reportId: r.report_id,
+    // What this particular report can render. The configure dialog used to
+    // build its checkbox list from the user's role, which offered sections the
+    // generator had no branch for — they saved, then produced nothing.
+    supportedSections: definition?.supportedSections ?? [],
+    comparesPeriods: definition?.comparesPeriods ?? true,
     day: r.day,
     time: r.time,
     recipients: parseJsonColumn<string[]>(r.recipients, []),
@@ -177,6 +183,25 @@ export const saveReportConfiguration = asyncHandler(async (req: Request, res: Re
     if (storeId !== req.user.storeId) {
       forbidden(res, 'Non hai i permessi per impostare questo negozio.');
       return;
+    }
+  }
+
+  // Refuse sections this report cannot draw, instead of storing them and
+  // producing a PDF that silently omits them.
+  if (Array.isArray(sections)) {
+    const definition = getReportDefinition(reportId);
+    if (definition) {
+      const unsupported = sections.filter(
+        (s: string) => !definition.supportedSections.includes(String(s).toLowerCase().trim()),
+      );
+      if (unsupported.length > 0) {
+        badRequest(
+          res,
+          `Sezioni non disponibili per questo report: ${unsupported.join(', ')}`,
+          'UNSUPPORTED_SECTION',
+        );
+        return;
+      }
     }
   }
 

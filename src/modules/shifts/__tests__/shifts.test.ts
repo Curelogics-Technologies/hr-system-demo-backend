@@ -730,3 +730,87 @@ describe('GET /api/shifts/affluence with week — scheduledStaff annotation', ()
     expect(tueTile.scheduled_staff).toBe(1);
   });
 });
+
+describe('POST /api/shifts — approved leave conflict', () => {
+  let leaveId: number;
+  const CONFLICT_DATE = '2026-04-08';
+
+  beforeAll(async () => {
+    const { rows: [lr] } = await testPool.query(
+      `INSERT INTO leave_requests
+         (company_id, user_id, store_id, leave_type, start_date, end_date,
+          status, current_approver_role, approved_by, approved_at)
+       VALUES ($1, $2, $3, 'vacation', $4, $4, 'approved', NULL, $5, NOW())
+       RETURNING id`,
+      [seeds.acmeId, seeds.employee1Id, seeds.romaStoreId, CONFLICT_DATE, seeds.adminId],
+    );
+    leaveId = lr.id;
+  });
+
+  afterAll(async () => {
+    await testPool.query('DELETE FROM shifts WHERE user_id = $1 AND date = $2', [seeds.employee1Id, CONFLICT_DATE]);
+    await testPool.query('DELETE FROM leave_requests WHERE id = $1', [leaveId]);
+  });
+
+  it('warns instead of silently creating a shift on an approved-leave day', async () => {
+    const token = await login('admin@acme-test.com');
+    const res = await request
+      .post('/api/shifts')
+      .set('Authorization', `Bearer ${token}`)
+      .send({
+        user_id: seeds.employee1Id,
+        store_id: seeds.romaStoreId,
+        date: CONFLICT_DATE,
+        start_time: '09:00',
+        end_time: '17:00',
+      });
+
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe('LEAVE_CONFLICT');
+    // The operator needs to know *which* leave, not just that there is one.
+    expect(res.body.details.leave.start_date).toBe(CONFLICT_DATE);
+    expect(res.body.details.leave.leave_type).toBe('vacation');
+  });
+
+  it('does not create the shift when the warning is returned', async () => {
+    const { rows } = await testPool.query(
+      'SELECT COUNT(*)::int AS n FROM shifts WHERE user_id = $1 AND date = $2',
+      [seeds.employee1Id, CONFLICT_DATE],
+    );
+    expect(rows[0].n).toBe(0);
+  });
+
+  it('creates the shift once the operator confirms', async () => {
+    const token = await login('admin@acme-test.com');
+    const res = await request
+      .post('/api/shifts')
+      .set('Authorization', `Bearer ${token}`)
+      .send({
+        user_id: seeds.employee1Id,
+        store_id: seeds.romaStoreId,
+        date: CONFLICT_DATE,
+        start_time: '09:00',
+        end_time: '17:00',
+        confirm_leave_conflict: true,
+      });
+
+    expect(res.status).toBe(201);
+  });
+
+  it('leaves days without approved leave completely unaffected', async () => {
+    const token = await login('admin@acme-test.com');
+    const res = await request
+      .post('/api/shifts')
+      .set('Authorization', `Bearer ${token}`)
+      .send({
+        user_id: seeds.employee1Id,
+        store_id: seeds.romaStoreId,
+        date: '2026-04-09',
+        start_time: '09:00',
+        end_time: '17:00',
+      });
+
+    expect(res.status).toBe(201);
+    await testPool.query('DELETE FROM shifts WHERE id = $1', [res.body.data.id]);
+  });
+});

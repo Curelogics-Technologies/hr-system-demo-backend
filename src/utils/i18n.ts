@@ -160,6 +160,10 @@ const MESSAGES: Record<string, Record<SupportedLocale, string>> = {
     en: 'No show',
     it: 'Assenza al turno',
   },
+  'notifications.attendance_anomaly_kind_on_leave': {
+    en: 'On approved leave',
+    it: 'In permesso approvato',
+  },
   'notifications.attendance_anomaly_kind_long_break': {
     en: 'Long break',
     it: 'Pausa troppo lunga',

@@ -150,6 +150,11 @@ const baseShiftObject = z.object({
   is_off_day:    z.boolean().optional(),
   notes:         z.string().max(500).optional().nullable(),
   status:        z.enum(['scheduled','confirmed','cancelled']).optional(),
+  // Acknowledges a LEAVE_CONFLICT warning — the employee has approved leave on
+  // this date and the operator has chosen to schedule them regardless. Must be
+  // declared here: Zod strips keys the schema does not know about, so an
+  // undeclared flag never reaches the controller.
+  confirm_leave_conflict: z.boolean().optional(),
 });
 
 const createShiftSchema = baseShiftObject.superRefine(shiftCrossValidate);

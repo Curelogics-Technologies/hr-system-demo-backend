@@ -469,10 +469,12 @@ describe('GET /api/leave/balance', () => {
     );
     // Seed approved leave request representing 10 days of vacation
     // 2026-05-01 (Fri) to 2026-05-14 (Tue) = 10 working days
+    // approved_by is required: migration 135 forbids a request reaching a
+    // terminal approval without a person behind it.
     await testPool.query(
-      `INSERT INTO leave_requests (company_id, user_id, store_id, leave_type, start_date, end_date, status, current_approver_role, notes)
-       VALUES ($1, $2, $3, 'vacation', '2026-05-01', '2026-05-14', 'approved', null, 'Ferie pregresse')`,
-      [seeds.acmeId, seeds.employee1Id, seeds.romaStoreId]
+      `INSERT INTO leave_requests (company_id, user_id, store_id, leave_type, start_date, end_date, status, current_approver_role, notes, approved_by, approved_at)
+       VALUES ($1, $2, $3, 'vacation', '2026-05-01', '2026-05-14', 'approved', null, 'Ferie pregresse', $4, NOW())`,
+      [seeds.acmeId, seeds.employee1Id, seeds.romaStoreId, seeds.adminId]
     );
   });
 

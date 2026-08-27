@@ -29,8 +29,15 @@ export function notFound(res: Response, error = 'Risorsa non trovata', code = 'N
   res.status(404).json({ success: false, error, code });
 }
 
-export function conflict(res: Response, error: string, code = 'CONFLICT'): void {
-  res.status(409).json({ success: false, error, code });
+export function conflict(
+  res: Response,
+  error: string,
+  code = 'CONFLICT',
+  // Extra context the client needs to offer a sensible override — e.g. which
+  // approved leave a shift would land on.
+  details?: Record<string, unknown>,
+): void {
+  res.status(409).json({ success: false, error, code, ...(details ? { details } : {}) });
 }
 
 export function serverError(res: Response, error = 'Errore interno del server', code = 'SERVER_ERROR'): void {

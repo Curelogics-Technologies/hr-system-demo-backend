@@ -14,6 +14,7 @@ import {
   approveLeave,
   rejectLeave,
   getBalance,
+  listBalances,
   setBalance,
   downloadCertificate,
   exportLeaveBalances,
@@ -164,6 +165,17 @@ router.post(
   requireModulePermission('permessi', 'write'),
   uploadExcel.single('file'),
   importLeaveBalances,
+);
+
+// GET /api/leave/balances — all balances in scope (admin/HR panel)
+// Declared before '/balance' so Express does not treat "balances" as a param.
+router.get(
+  '/balances',
+  authenticate,
+  enforceCompany,
+  requireRole('admin', 'hr'),
+  requireModulePermission('permessi', 'read'),
+  listBalances,
 );
 
 // GET /api/leave/balance — leave balance for user

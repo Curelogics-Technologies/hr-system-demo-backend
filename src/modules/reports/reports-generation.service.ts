@@ -406,13 +406,19 @@ async function renderReport(
   }, { maxPages, title, companyName });
 
   const prior = previousPeriod(period);
+  const definition = getReportDefinition(reportId);
+  // Only claim a comparison the branch below actually performs. The daily alert
+  // computes `prior` for nothing, so promising one on the cover was misleading.
+  const comparesPeriods = definition?.comparesPeriods ?? reportId !== 'anomaly_daily';
 
   drawCoverHeader(ctx, {
     title,
     companyName,
     scopeLabel: await resolveScopeLabel(scope),
     periodLabel: `Periodo: ${presentation(period.start)} - ${presentation(period.end)}`,
-    comparisonLabel: `Confronto con: ${presentation(prior.start)} - ${presentation(prior.end)}`,
+    comparisonLabel: comparesPeriods
+      ? `Confronto con: ${presentation(prior.start)} - ${presentation(prior.end)}`
+      : undefined,
     alert: reportId === 'anomaly_daily',
   });
 
@@ -420,6 +426,16 @@ async function renderReport(
     let index = 1;
     const step = () => index++;
 
+    // 'anomalies' and 'shifts' were offered in the configure dialog but had no
+    // branch here, so selecting them silently produced an empty PDF.
+    const needsAnomalies = wants(config.sections, 'anomalies') || wants(config.sections, 'shifts');
+    const anomalies = needsAnomalies ? await computeAnomalies(scope, period, thresholds) : [];
+
+    if (wants(config.sections, 'anomalies')) sectionPeopleBreakdown(ctx, anomalies, step(), maxRows);
+    if (wants(config.sections, 'shifts')) {
+      const breakdown = await buildStoreBreakdown(scope, period, thresholds, anomalies);
+      sectionStoreBreakdown(ctx, breakdown, step(), maxRows);
+    }
     if (wants(config.sections, 'ats')) await sectionAts(ctx, scope, thresholds, step(), maxRows);
     if (wants(config.sections, 'leave')) await sectionLeave(ctx, scope, period, step(), maxRows);
     if (wants(config.sections, 'attendance')) await sectionAttendance(ctx, scope, period, step(), maxRows);

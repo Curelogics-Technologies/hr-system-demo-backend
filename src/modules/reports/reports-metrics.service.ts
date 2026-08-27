@@ -24,6 +24,25 @@ import {
   RAG_SEVERITY_RANK,
 } from './reports-thresholds';
 import { KpiCard, ExceptionItem, TrendRow } from './reports-pdf.kit';
+import {
+  APPROVED_LEAVE_STATUS_SQL,
+  loadApprovedLeaveDays,
+  leaveCoverageKey,
+} from '../../utils/leaveCoverage';
+
+/**
+ * True when shift `s` falls on a day the employee had approved full-day leave.
+ * Such a shift was never a real staffing expectation, so it belongs in neither
+ * the numerator nor the denominator of the completion/absence KPIs.
+ */
+const SHIFT_COVERED_BY_LEAVE_SQL = `EXISTS (
+  SELECT 1 FROM leave_requests lr
+   WHERE lr.company_id = s.company_id
+     AND lr.user_id    = s.user_id
+     AND ${APPROVED_LEAVE_STATUS_SQL.replace('status', 'lr.status')}
+     AND COALESCE(lr.leave_duration_type, 'full_day') <> 'short_leave'
+     AND s.date BETWEEN lr.start_date AND lr.end_date
+)`;
 
 // shifts.start_time is wall-clock in the store's timezone. Parsing "09:00" in Node
 // resolves it against the SERVER's timezone, which silently turns every shift into
@@ -155,6 +174,13 @@ export async function computeAnomalies(
     else byUserDay.set(key, [ev]);
   }
 
+  // Days already covered by approved leave. Shifts are only cancelled when the
+  // approver ticks the optional cancel_shifts box, so an active shift is not
+  // evidence that the person was expected in.
+  const leaveDays = await loadApprovedLeaveDays(
+    [scope.companyId], iso(period.start), iso(period.end), { storeId: scope.storeId ?? null },
+  );
+
   const out: AnomalyRecord[] = [];
 
   for (const shift of shifts) {
@@ -166,7 +192,11 @@ export async function computeAnomalies(
     const storeName = shift.store_name ?? '-';
 
     if (checkins.length === 0 && checkouts.length === 0) {
-      out.push({ userId: shift.user_id, userName, storeName, date: shift.date, kind: 'no_show', minutes: 0, severity: 'red' });
+      // Approved leave is a justified absence: it must not count as a no-show,
+      // inflate the absence rate, or pull the store's traffic light down.
+      if (!leaveDays.has(leaveCoverageKey(shift.user_id, shift.date))) {
+        out.push({ userId: shift.user_id, userName, storeName, date: shift.date, kind: 'no_show', minutes: 0, severity: 'red' });
+      }
       continue;
     }
 
@@ -272,11 +302,16 @@ export async function snapshotPeriod(
           AND termination_date BETWEEN $2 AND $3`,
       [co, startStr, endStr, store],
     ),
+    // Shifts the company actually expected someone to work. A shift on a day
+    // covered by approved leave was never a real expectation — counting it
+    // would depress the completion rate exactly the way a no-show does, so
+    // excluding it from the no-show list alone would not fix the KPI.
     scalar(
-      `SELECT COUNT(*) AS n FROM shifts
-        WHERE company_id = $1 AND date BETWEEN $2 AND $3
-          AND status <> 'cancelled'
-          AND ($4::int IS NULL OR store_id = $4)`,
+      `SELECT COUNT(*) AS n FROM shifts s
+        WHERE s.company_id = $1 AND s.date BETWEEN $2 AND $3
+          AND s.status <> 'cancelled'
+          AND ($4::int IS NULL OR s.store_id = $4)
+          AND NOT ${SHIFT_COVERED_BY_LEAVE_SQL}`,
       [co, startStr, endStr, store],
     ),
     // A shift counts as completed only when the person both arrived and left.
@@ -285,6 +320,7 @@ export async function snapshotPeriod(
         WHERE s.company_id = $1 AND s.date BETWEEN $2 AND $3
           AND s.status <> 'cancelled'
           AND ($4::int IS NULL OR s.store_id = $4)
+          AND NOT ${SHIFT_COVERED_BY_LEAVE_SQL}
           AND EXISTS (SELECT 1 FROM attendance_events e
                        WHERE e.user_id = s.user_id AND e.event_type = 'checkin'
                          AND e.event_time::DATE = s.date)
@@ -443,6 +479,7 @@ export async function buildStoreBreakdown(
        LEFT JOIN stores st ON st.id = s.store_id
       WHERE s.company_id = $1 AND s.date BETWEEN $2 AND $3
         AND ($4::int IS NULL OR s.store_id = $4)
+        AND NOT ${SHIFT_COVERED_BY_LEAVE_SQL}
       GROUP BY st.name
       ORDER BY COUNT(*) DESC`,
     [scope.companyId, iso(period.start), iso(period.end), scope.storeId ?? null],
