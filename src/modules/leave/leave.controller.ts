@@ -327,6 +327,22 @@ async function getUserUsedDays(userId: number, year: number, leaveType: string):
 const DEFAULT_APPROVAL_CHAIN = ['store_manager', 'area_manager', 'hr', 'admin'];
 
 /**
+ * Roles whose decision can never be made by the system.
+ *
+ * The inactivity job may carry a request past a store or area manager who has
+ * not looked at it — that only moves it up the chain, it grants nothing. HR and
+ * Admin are different: HR approval is where the leave becomes real and the
+ * balance is deducted, so it must always be a person. A request sitting on HR
+ * or Admin is chased, never advanced and never approved.
+ */
+const MANUAL_ONLY_APPROVER_ROLES = new Set(['hr', 'admin']);
+
+/** True when the inactivity job is allowed to carry this stage forward. */
+function canAutoAdvance(role: string): boolean {
+  return !MANUAL_ONLY_APPROVER_ROLES.has(role);
+}
+
+/**
  * Maps each role to the status name produced when that role approves.
  */
 const ROLE_STATUS: Record<string, string> = {
@@ -702,7 +718,26 @@ export const submitLeave = asyncHandler(async (req: Request, res: Response) => {
   // terminal case runs in one transaction.
   const grantsImmediately = nextApproverRole === null;
   const balanceYear = yearFromIsoDate(start_date);
-  const balanceDefaultTotal = leave_type === 'vacation' ? 25 : 10;
+
+  // Same rule as HR/Admin approval: nothing is granted against an entitlement
+  // nobody configured. An admin filing their own leave is a terminal approval,
+  // so it is held to the same standard.
+  if (grantsImmediately && requestedDays > 0) {
+    const configured = await queryOne<{ id: number }>(
+      `SELECT id FROM leave_balances
+        WHERE company_id = $1 AND user_id = $2 AND year = $3 AND leave_type = $4`,
+      [companyId, userId, balanceYear, leave_type],
+    );
+    if (!configured) {
+      res.status(422).json({
+        success: false,
+        error: `Saldo non configurato (${leave_type === 'vacation' ? 'ferie' : 'malattia'} ${balanceYear}). Configura prima i giorni disponibili.`,
+        code: 'BALANCE_NOT_CONFIGURED',
+        details: { user_id: userId, year: balanceYear, leave_type },
+      });
+      return;
+    }
+  }
 
   const submitClient = await pool.connect();
   let leaveRequest: any;
@@ -754,13 +789,17 @@ export const submitLeave = asyncHandler(async (req: Request, res: Response) => {
     }
 
     if (grantsImmediately && requestedDays > 0) {
-      await submitClient.query(
-        `INSERT INTO leave_balances (company_id, user_id, year, leave_type, total_days, used_days)
-         VALUES ($1,$2,$3,$4,$5,$6)
-         ON CONFLICT (company_id, user_id, year, leave_type) DO UPDATE
-         SET used_days = leave_balances.used_days + EXCLUDED.used_days, updated_at = NOW()`,
-        [companyId, userId, balanceYear, leave_type, balanceDefaultTotal, requestedDays],
+      // UPDATE, not upsert: the allocation was verified above, and creating one
+      // here would reintroduce the invented-entitlement problem.
+      const deducted = await submitClient.query(
+        `UPDATE leave_balances
+            SET used_days = used_days + $5, updated_at = NOW()
+          WHERE company_id = $1 AND user_id = $2 AND year = $3 AND leave_type = $4`,
+        [companyId, userId, balanceYear, leave_type, requestedDays],
       );
+      if (deducted.rowCount === 0) {
+        throw Object.assign(new Error('BALANCE_NOT_CONFIGURED'), { code: '23514' });
+      }
     }
 
     await submitClient.query('COMMIT');
@@ -1343,6 +1382,33 @@ export const approveLeave = asyncHandler(async (req: Request, res: Response) => 
     return;
   }
 
+  // ── Balance must exist before HR or Admin can approve ─────────────────────
+  // Approval used to silently create a 25/10-day allocation from a hardcoded
+  // default, so leave was granted against days nobody had actually assigned.
+  // HR and Admin are the levels that make the leave real, so they cannot
+  // approve until somebody has configured the employee's entitlement. Lower
+  // levels are deliberately unaffected: passing a request up the chain does not
+  // require the balance to exist yet.
+  const approverIsHrOrAdmin =
+    MANUAL_ONLY_APPROVER_ROLES.has(effectiveRole) || isSuperAdmin || isOverride;
+  if (approverIsHrOrAdmin) {
+    const balanceYear = yearFromIsoDate(leaveRequest.start_date);
+    const configured = await queryOne<{ id: number }>(
+      `SELECT id FROM leave_balances
+        WHERE company_id = $1 AND user_id = $2 AND year = $3 AND leave_type = $4`,
+      [leaveRequest.company_id, leaveRequest.user_id, balanceYear, leaveRequest.leave_type],
+    );
+    if (!configured) {
+      res.status(422).json({
+        success: false,
+        error: `Saldo non configurato per questo dipendente (${leaveRequest.leave_type === 'vacation' ? 'ferie' : 'malattia'} ${balanceYear}). Configura prima i giorni disponibili, poi approva la richiesta.`,
+        code: 'BALANCE_NOT_CONFIGURED',
+        details: { user_id: leaveRequest.user_id, year: balanceYear, leave_type: leaveRequest.leave_type },
+      });
+      return;
+    }
+  }
+
   // Final step: update balance only when fully approved
   if (!transition.nextApprover) {
     const requestedDays = computeRequestedLeaveDays(leaveRequest);
@@ -1353,13 +1419,10 @@ export const approveLeave = asyncHandler(async (req: Request, res: Response) => 
     try {
       await client.query('BEGIN');
 
-      await client.query(
-        `INSERT INTO leave_balances (company_id, user_id, year, leave_type, total_days, used_days)
-         VALUES ($1,$2,$3,$4,$5,0)
-         ON CONFLICT (company_id, user_id, year, leave_type) DO NOTHING`,
-        [leaveRequest.company_id, leaveRequest.user_id, year, leaveRequest.leave_type, defaultTotal],
-      );
-
+      // No silent default allocation any more. Inventing 25/10 days meant leave
+      // was granted against an entitlement nobody had set; the guard above
+      // requires HR/Admin to configure it first. The lock is taken on the row
+      // that must already exist.
       const balanceResult = await client.query(
         `SELECT total_days FROM leave_balances
          WHERE company_id=$1 AND user_id=$2 AND year=$3 AND leave_type=$4
@@ -1367,6 +1430,16 @@ export const approveLeave = asyncHandler(async (req: Request, res: Response) => 
         [leaveRequest.company_id, leaveRequest.user_id, year, leaveRequest.leave_type],
       );
       const balance = balanceResult.rows[0];
+      if (!balance) {
+        await client.query('ROLLBACK');
+        res.status(422).json({
+          success: false,
+          error: `Saldo non configurato per questo dipendente (${leaveRequest.leave_type === 'vacation' ? 'ferie' : 'malattia'} ${year}). Configura prima i giorni disponibili, poi approva la richiesta.`,
+          code: 'BALANCE_NOT_CONFIGURED',
+          details: { user_id: leaveRequest.user_id, year, leave_type: leaveRequest.leave_type },
+        });
+        return;
+      }
       const totalDays = parseFloat(balance.total_days);
 
       // Dynamically calculate used days from already approved requests
@@ -1427,13 +1500,18 @@ export const approveLeave = asyncHandler(async (req: Request, res: Response) => 
         [requestedDays, leaveRequest.company_id, leaveRequest.user_id, year, leaveRequest.leave_type],
       );
       if (balanceUpdate.rowCount === 0) {
-        await client.query(
-          `INSERT INTO leave_balances (company_id, user_id, year, leave_type, total_days, used_days)
-           VALUES ($1,$2,$3,$4,$5,$6)
-           ON CONFLICT (company_id, user_id, year, leave_type) DO UPDATE
-           SET used_days = leave_balances.used_days + EXCLUDED.used_days, updated_at = NOW()`,
-          [leaveRequest.company_id, leaveRequest.user_id, year, leaveRequest.leave_type, defaultTotal, requestedDays],
-        );
+        // The row was locked FOR UPDATE a few statements ago, so zero rows here
+        // means it vanished mid-transaction. Creating one with an invented
+        // total is exactly what let leave be granted against days nobody
+        // allocated, so fail loudly instead.
+        await client.query('ROLLBACK');
+        res.status(422).json({
+          success: false,
+          error: 'Saldo non configurato per questo dipendente. Configura prima i giorni disponibili, poi approva la richiesta.',
+          code: 'BALANCE_NOT_CONFIGURED',
+          details: { user_id: leaveRequest.user_id, year, leave_type: leaveRequest.leave_type },
+        });
+        return;
       }
 
       // Cancel shifts if requested
@@ -2711,13 +2789,17 @@ export async function processEscalationLogic() {
       const transition = transitions[req.current_approver_role];
       if (!transition) continue;
 
+      // HR and Admin decisions are never made by the system. A request sitting
+      // on either is chased where it is — not advanced, not approved.
+      const stageMayAdvance = canAutoAdvance(req.current_approver_role);
+
       // Only ever look FORWARD. findNextActiveApprover treats a null start role
       // as "scan the whole chain from the top", which at the end of the chain
       // would hand the request back to the first approver — so when there is no
       // next role we must not call it at all.
       let nextActiveRole: string | null = null;
       let additionalSkipped: string[] = [];
-      if (transition.nextApprover) {
+      if (stageMayAdvance && transition.nextApprover) {
         const found = await findNextActiveApprover(
           req.company_id,
           req.store_id,
@@ -2732,35 +2814,47 @@ export async function processEscalationLogic() {
       }
 
       if (nextActiveRole) {
-        // ── Reassign ────────────────────────────────────────────────────────
-        // Hand the request to the next level. `status` is deliberately NOT
-        // written: nobody has approved anything, only the queue has moved.
+        // ── Auto-advance (below HR only) ────────────────────────────────────
+        // Carry the request past a store/area manager who has not looked at it.
+        // `status` records that the stage was cleared, but the request only ever
+        // moves TOWARDS a human decision: the next role is always a real
+        // approver, and approved_by stays NULL, so it can never be mistaken for
+        // granted and no balance is deducted here.
         const updatedSkipped = Array.from(new Set([...(req.skipped_approvers || []), ...additionalSkipped]));
         const realAdditionalSkipped = additionalSkipped.filter(r => chain.includes(r));
         const updatedOnLeaveSkipped = Array.from(new Set([...(req.on_leave_skipped_approvers || []), ...realAdditionalSkipped]));
 
         await query(
           `UPDATE leave_requests
-           SET current_approver_role = $1, escalated = TRUE,
+           SET current_approver_role = $1, status = $2, escalated = TRUE,
                last_action_at = NOW(), last_reminder_at = NOW(),
-               skipped_approvers = $2, on_leave_skipped_approvers = $3
-           WHERE id = $4`,
-          [nextActiveRole, JSON.stringify(updatedSkipped), JSON.stringify(updatedOnLeaveSkipped), req.id],
+               skipped_approvers = $3, on_leave_skipped_approvers = $4
+           WHERE id = $5`,
+          [
+            nextActiveRole,
+            // The status THIS stage produces — not the next role's, which is
+            // what made the status run a phase ahead of the approver.
+            transition.nextStatus,
+            JSON.stringify(updatedSkipped),
+            JSON.stringify(updatedOnLeaveSkipped),
+            req.id,
+          ],
         );
 
         await query(
           `INSERT INTO leave_approvals (leave_request_id, approver_id, approver_role, action, notes)
            VALUES ($1, NULL, 'system', 'escalated', $2)`,
-          [req.id, `Riassegnata da ${req.current_approver_role} a ${nextActiveRole} per inattività. Nessuna approvazione automatica.`],
+          [req.id, `Fase ${req.current_approver_role} superata automaticamente per inattività; assegnata a ${nextActiveRole}. Approvazione finale e scarico del saldo riservati a una decisione umana.`],
         );
 
         await notifyApproversOfPendingLeave(req, nextActiveRole, 'reassigned');
         escalatedCount++;
       } else {
         // ── Solicit ─────────────────────────────────────────────────────────
-        // End of the chain, or nobody available further down. There is no one
-        // to escalate to, so the request stays exactly where it is and we chase
-        // the current approver. It must never be granted by default.
+        // Either the stage belongs to HR/Admin — whose decision is always a
+        // person's — or there is nobody further down the chain. Either way the
+        // request stays exactly where it is and we chase the current approver.
+        // It is never granted by default.
         if (!req.reminder_due) continue;
 
         // last_action_at is intentionally left alone: the request is still
@@ -2773,7 +2867,11 @@ export async function processEscalationLogic() {
         await query(
           `INSERT INTO leave_approvals (leave_request_id, approver_id, approver_role, action, notes)
            VALUES ($1, NULL, 'system', 'escalated', $2)`,
-          [req.id, `Sollecito automatico a ${req.current_approver_role}: richiesta ferma da oltre 2 giorni. Nessuna approvazione automatica.`],
+          [req.id, `Sollecito automatico a ${req.current_approver_role}: richiesta ferma da oltre 2 giorni — ${
+            stageMayAdvance
+              ? 'nessun approvatore disponibile ai livelli successivi'
+              : `l'approvazione ${req.current_approver_role.toUpperCase()} richiede sempre una decisione umana`
+          }. Nessuna approvazione automatica.`],
         );
 
         await notifyApproversOfPendingLeave(req, req.current_approver_role, 'reminder');

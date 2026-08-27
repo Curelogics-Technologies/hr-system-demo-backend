@@ -49,18 +49,30 @@ afterAll(async () => {
 });
 
 describe('processEscalationLogic — never approves', () => {
-  it('reassigns a stale request to the next approver without touching its status', async () => {
+  it('auto-advances a stale store_manager stage to the next approver', async () => {
     const id = await seedStaleRequest('store_manager');
 
     await processEscalationLogic();
 
     const after = await readRequest(id);
-    // Moved down the chain...
+    // Below HR the job may clear the stage and hand it upwards...
     expect(after.current_approver_role).toBe('area_manager');
-    // ...but nobody approved anything.
-    expect(after.status).toBe('pending');
-    expect(after.approved_by).toBeNull();
     expect(after.escalated).toBe(true);
+    // ...but it is still nobody's decision: no approver on record, so the
+    // request cannot be mistaken for granted and no balance moves.
+    expect(after.approved_by).toBeNull();
+  });
+
+  it('records the status of the stage it cleared, not the next one', async () => {
+    // The original defect wrote the NEXT role's status, so the request claimed
+    // an approval the current approver had not given.
+    const id = await seedStaleRequest('store_manager');
+
+    await processEscalationLogic();
+
+    const after = await readRequest(id);
+    expect(after.status).toBe('store manager approved');
+    expect(after.current_approver_role).toBe('area_manager');
   });
 
   it('never produces a terminal approval, however many times it runs', async () => {

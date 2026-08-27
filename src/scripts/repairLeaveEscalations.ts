@@ -117,13 +117,25 @@ async function main(): Promise<void> {
         [t.id],
       );
 
-      let newStatus = 'pending';
-      let newApprover = chain[0];
+      // Reopen at HR: that is the level where leave becomes real and the
+      // balance is deducted, and it is precisely the decision these requests
+      // never received. Sending them back to the start would make managers
+      // re-approve stages the system had already cleared, so the request is
+      // parked exactly where a human is actually required.
+      //
+      // If a person genuinely signed off a stage BEYOND hr (an admin), that is
+      // preserved rather than thrown away.
+      const hrIndex = chain.indexOf('hr');
+      let newApprover = hrIndex >= 0 ? 'hr' : (chain[chain.length - 1] ?? 'admin');
+      let newStatus = hrIndex > 0 ? (ROLE_STATUS[chain[hrIndex - 1]] ?? 'pending') : 'pending';
+
       if (humanActions.length) {
         const lastRole = humanActions[0].approver_role as string;
         const idx = chain.indexOf(lastRole);
-        if (idx >= 0) {
-          newStatus = ROLE_STATUS[lastRole] ?? 'pending';
+        // Only honour a human action that is at or past HR; anything below is
+        // superseded by parking the request on HR.
+        if (idx >= 0 && hrIndex >= 0 && idx >= hrIndex) {
+          newStatus = ROLE_STATUS[lastRole] ?? newStatus;
           newApprover = chain[idx + 1] ?? lastRole;
         }
       }

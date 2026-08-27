@@ -338,6 +338,16 @@ describe('PUT /api/leave/:id/approve', () => {
   });
 
   it('full approval chain: store_manager → area_manager → hr → hr_approved, balance decremented', async () => {
+    // HR approval now requires the employee's entitlement to be configured —
+    // leave is never granted against days nobody allocated.
+    await testPool.query(
+      `INSERT INTO leave_balances (company_id, user_id, year, leave_type, total_days, used_days)
+       VALUES ($1, $2, 2026, 'vacation', 25, 0)
+       ON CONFLICT (company_id, user_id, year, leave_type)
+       DO UPDATE SET total_days = 25, used_days = 0`,
+      [seeds.acmeId, seeds.employee1Id],
+    );
+
     // Step 1: store_manager approves
     const smToken = await login('manager.roma@acme-test.com');
     const step1 = await request
