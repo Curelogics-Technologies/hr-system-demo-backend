@@ -2239,9 +2239,14 @@ export const setBalance = asyncHandler(async (req: Request, res: Response) => {
     badRequest(res, `Anno non valido (${currentYear - 10}–${currentYear + 5})`, 'INVALID_YEAR');
     return;
   }
-  // 0 is now a legitimate input: it means "clear this allocation", taking the
-  // employee back to not-configured. Negative and non-finite are still refused.
-  if (typeof total_days !== 'number' || total_days < 0 || !Number.isFinite(total_days)) {
+  // Two distinct inputs, deliberately:
+  //   null  -> remove the allocation entirely (back to not-configured)
+  //   0     -> a real allocation of zero days, which displays as 0 and blocks
+  //            any further leave because nothing remains
+  // Conflating them meant an admin could not express "this person is entitled
+  // to nothing" separately from "nobody has decided yet".
+  const isClearRequest = total_days === null || total_days === undefined;
+  if (!isClearRequest && (typeof total_days !== 'number' || total_days < 0 || !Number.isFinite(total_days))) {
     badRequest(res, 'Il totale dei giorni non può essere negativo', 'INVALID_TOTAL_DAYS');
     return;
   }
@@ -2264,7 +2269,7 @@ export const setBalance = asyncHandler(async (req: Request, res: Response) => {
   // heavier action than editing a number, so it is admin-only, and it is
   // refused outright once leave has been booked against the allocation —
   // deleting then would silently orphan days the employee has already taken.
-  if (total_days === 0) {
+  if (isClearRequest) {
     const isAdmin = req.user!.role === 'admin' || req.user!.is_super_admin === true;
     if (!isAdmin) {
       forbidden(

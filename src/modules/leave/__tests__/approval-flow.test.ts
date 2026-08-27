@@ -210,8 +210,8 @@ describe('HR approval requires a configured balance', () => {
   });
 });
 
-describe('clearing an allocation (total_days = 0)', () => {
-  async function putBalance(email: string, totalDays: number) {
+describe('clearing an allocation (empty field -> null)', () => {
+  async function putBalance(email: string, totalDays: number | null) {
     const token = await login(email);
     return request
       .put('/api/leave/balance')
@@ -222,7 +222,7 @@ describe('clearing an allocation (total_days = 0)', () => {
   it('admin can clear an unused allocation, returning the employee to not-configured', async () => {
     await allocate(seeds.employee1Id, 2026, 25);
 
-    const res = await putBalance('admin@acme-test.com', 0);
+    const res = await putBalance('admin@acme-test.com', null);
     expect(res.status).toBe(200);
 
     const { rows } = await testPool.query(
@@ -235,7 +235,7 @@ describe('clearing an allocation (total_days = 0)', () => {
   it('HR cannot clear an allocation — that is an admin action', async () => {
     await allocate(seeds.employee1Id, 2026, 25);
 
-    const res = await putBalance('hr@acme-test.com', 0);
+    const res = await putBalance('hr@acme-test.com', null);
     expect(res.status).toBe(403);
     expect(res.body.code).toBe('BALANCE_CLEAR_ADMIN_ONLY');
   });
@@ -247,7 +247,7 @@ describe('clearing an allocation (total_days = 0)', () => {
       [seeds.employee1Id],
     );
 
-    const res = await putBalance('admin@acme-test.com', 0);
+    const res = await putBalance('admin@acme-test.com', null);
     expect(res.status).toBe(422);
     expect(res.body.code).toBe('BALANCE_CLEAR_HAS_USAGE');
   });
@@ -255,5 +255,46 @@ describe('clearing an allocation (total_days = 0)', () => {
   it('still refuses a negative total', async () => {
     const res = await putBalance('admin@acme-test.com', -5);
     expect(res.status).toBe(400);
+  });
+});
+
+describe('zero days is an allocation, not a removal', () => {
+  it('stores 0 as a real allocation instead of deleting the row', async () => {
+    const token = await login('admin@acme-test.com');
+    const res = await request
+      .put('/api/leave/balance')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ user_id: seeds.employee1Id, year: 2026, leave_type: 'vacation', total_days: 0 });
+
+    expect(res.status).toBe(200);
+
+    const { rows } = await testPool.query(
+      `SELECT total_days FROM leave_balances
+        WHERE user_id = $1 AND year = 2026 AND leave_type = 'vacation'`,
+      [seeds.employee1Id],
+    );
+    // The row exists and reads 0 — "entitled to nothing" is a decision, and it
+    // must be distinguishable from "nobody has decided yet".
+    expect(rows).toHaveLength(1);
+    expect(Number(rows[0].total_days)).toBe(0);
+  });
+
+  it('blocks the employee from even creating a request', async () => {
+    const token = await login('admin@acme-test.com');
+    await request
+      .put('/api/leave/balance')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ user_id: seeds.employee1Id, year: 2026, leave_type: 'vacation', total_days: 0 });
+
+    const empToken = await login('employee1@acme-test.com');
+    const res = await request
+      .post('/api/leave')
+      .set('Authorization', `Bearer ${empToken}`)
+      .send({ leave_type: 'vacation', start_date: '2026-12-21', end_date: '2026-12-22' });
+
+    // Refused at submission, not left to fail later at approval — the employee
+    // finds out immediately rather than after three levels of review.
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('LEAVES_FULL');
   });
 });

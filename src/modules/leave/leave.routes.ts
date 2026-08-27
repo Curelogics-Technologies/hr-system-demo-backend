@@ -96,7 +96,9 @@ const setBalanceSchema = z.object({
   user_id:    z.number().int().positive(),
   year:       z.number().int().min(2020).max(2100),
   leave_type: z.enum(['vacation', 'sick']),
-  total_days: z.number().min(0).max(365),
+  // null removes the allocation (admin only); 0 is a real allocation of zero
+  // days. See setBalance for why the two are kept distinct.
+  total_days: z.number().min(0).max(365).nullable(),
 });
 
 // NOTE: /pending and /balance are declared BEFORE /:id routes to avoid
