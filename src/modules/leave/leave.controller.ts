@@ -1404,13 +1404,30 @@ export const approveLeave = asyncHandler(async (req: Request, res: Response) => 
     transitionKey = effectiveRole;
   }
 
-  // Custom transition for HR override to move directly to terminal
+  /**
+   * HR and Admin approvals are always FINAL.
+   *
+   * HR approval is the point at which leave becomes real and the balance is
+   * deducted, so it terminates the chain even when an admin step follows it —
+   * an admin step is an optional extra sign-off, not a requirement. An admin
+   * (or super admin) approving at any stage short-circuits the rest of the
+   * chain for the same reason.
+   *
+   * Previously both depended on where the role happened to sit in the chain:
+   * HR on a `... -> hr -> admin` chain merely handed the request on without
+   * deducting anything, and an admin approving early on a chain with no admin
+   * step only advanced it one place. Both left leave granted-looking with the
+   * balance untouched.
+   */
+  const finalisesImmediately = adminLike || effectiveRole === 'hr';
+
   const getTransition = (key: string) => {
     if (key === 'hr_override') return { nextStatus: 'admin_approved', nextApprover: null };
-    // An admin overriding a chain that has no admin step still gets to finish
-    // the request rather than being refused.
-    if (key === 'admin' && !TRANSITIONS.admin) {
-      return { nextStatus: 'approved', nextApprover: null };
+    if (finalisesImmediately) {
+      return {
+        nextStatus: adminLike ? 'approved' : 'HR approved',
+        nextApprover: null,
+      };
     }
     return TRANSITIONS[key];
   };
@@ -1820,50 +1837,87 @@ export const reopenLeave = asyncHandler(async (req: Request, res: Response) => {
 
   const allowedCompanyIds = await resolveAllowedCompanyIds(req.user!);
   const lr = await queryOne<{
-    id: number; company_id: number; status: string;
+    id: number; company_id: number; user_id: number; status: string;
     current_approver_role: string | null; approved_by: number | null;
+    leave_type: LeaveType; start_date: string; end_date: string;
+    leave_duration_type: LeaveDurationType | null;
+    short_start_time: string | null; short_end_time: string | null;
   }>(
-    `SELECT id, company_id, status, current_approver_role, approved_by
+    `SELECT id, company_id, user_id, status, current_approver_role, approved_by,
+            leave_type, start_date, end_date, leave_duration_type,
+            TO_CHAR(short_start_time, 'HH24:MI') AS short_start_time,
+            TO_CHAR(short_end_time,   'HH24:MI') AS short_end_time
        FROM leave_requests WHERE id = $1 AND company_id = ANY($2)`,
     [leaveId, allowedCompanyIds],
   );
   if (!lr) { notFound(res, 'Richiesta di permesso non trovata'); return; }
 
-  // Only requests that were never actually decided by a person.
-  if (lr.approved_by !== null) {
-    badRequest(
-      res,
-      'Questa richiesta è stata approvata da una persona: non può essere riaperta. Se necessario, rifiutala o eliminala.',
-      'REOPEN_NOT_UNVERIFIED',
-    );
+  if (lr.status === 'rejected' || lr.status === 'cancelled') {
+    badRequest(res, 'Una richiesta rifiutata o annullata non può essere riaperta.', 'REOPEN_INVALID_STATE');
     return;
   }
 
   const chain = await getApprovalChain(lr.company_id);
-  const hrIndex = chain.indexOf('hr');
-  const target = hrIndex >= 0 ? 'hr' : (chain[chain.length - 1] ?? 'admin');
-  // The status the stage BEFORE the target produces, so the request reads as
-  // "waiting on HR" rather than claiming an approval it never received.
-  const newStatus = hrIndex > 0 ? (ROLE_STATUS[chain[hrIndex - 1]] ?? 'pending') : 'pending';
+  // Back to the beginning: the decision is being undone, so the request starts
+  // the chain again rather than resuming halfway through it.
+  const firstApprover = chain[0] ?? 'hr';
 
-  const updated = await queryOne(
-    `UPDATE leave_requests
-        SET status = $1, current_approver_role = $2,
-            approved_by = NULL, approved_at = NULL,
-            escalated = FALSE, last_action_at = NOW(), last_reminder_at = NULL,
-            updated_at = NOW()
-      WHERE id = $3
-      RETURNING id, status, current_approver_role`,
-    [newStatus, target, leaveId],
+  // Days are only given back when they were actually taken away. A request that
+  // was auto-approved with nobody behind it never had its balance deducted, so
+  // restoring here would credit days that were never spent.
+  const wasDeducted = lr.approved_by !== null;
+  const requestedDays = computeRequestedLeaveDays(lr as any);
+  const year = yearFromIsoDate(lr.start_date);
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    if (wasDeducted && requestedDays > 0) {
+      await client.query(
+        `UPDATE leave_balances
+            SET used_days = GREATEST(0, used_days - $5), updated_at = NOW()
+          WHERE company_id = $1 AND user_id = $2 AND year = $3 AND leave_type = $4`,
+        [lr.company_id, lr.user_id, year, lr.leave_type, requestedDays],
+      );
+    }
+
+    await client.query(
+      `UPDATE leave_requests
+          SET status = 'pending', current_approver_role = $1,
+              approved_by = NULL, approved_at = NULL,
+              escalated = FALSE, last_action_at = NOW(), last_reminder_at = NULL,
+              updated_at = NOW()
+        WHERE id = $2`,
+      [firstApprover, leaveId],
+    );
+
+    await client.query(
+      `INSERT INTO leave_approvals (leave_request_id, approver_id, approver_role, action, notes)
+       VALUES ($1, $2, $3, 'escalated', $4)`,
+      [
+        leaveId, userId, role,
+        wasDeducted
+          ? `Riaperta da un amministratore: approvazione annullata, ${requestedDays} giorni riaccreditati sul saldo. Torna in attesa di ${firstApprover}.`
+          : `Riaperta da un amministratore: era stata approvata automaticamente per inattività, senza alcuna decisione umana e senza scarico del saldo. Torna in attesa di ${firstApprover}.`,
+      ],
+    );
+
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+
+  ok(
+    res,
+    { id: leaveId, status: 'pending', current_approver_role: firstApprover, restored_days: wasDeducted ? requestedDays : 0 },
+    wasDeducted
+      ? `Richiesta riaperta: ${requestedDays} giorni riaccreditati`
+      : 'Richiesta riaperta per una decisione umana',
   );
-
-  await query(
-    `INSERT INTO leave_approvals (leave_request_id, approver_id, approver_role, action, notes)
-     VALUES ($1, $2, $3, 'escalated', $4)`,
-    [leaveId, userId, role, `Riaperta da un amministratore: era stata approvata automaticamente per inattività, senza alcuna decisione umana. Riassegnata a ${target}.`],
-  );
-
-  ok(res, updated, 'Richiesta riaperta e riassegnata per una decisione umana');
 });
 
 // ---------------------------------------------------------------------------
