@@ -334,14 +334,14 @@ describe('admins can approve on a chain that has no admin step', () => {
     expect((await readRequest(id)).approved_by).not.toBeNull();
   });
 
-  it('tells a store manager WHO the request is waiting on, not just "no permission"', async () => {
+  it('refuses a store manager acting on a request that has already passed their level', async () => {
     const id = await walkToHr('2026-10-19', '2026-10-20');
 
     const token = await login('manager.roma@acme-test.com');
     const res = await request.put(`/api/leave/${id}/approve`).set('Authorization', `Bearer ${token}`).send({});
 
     expect(res.status).toBe(403);
-    expect(res.body.code).toBe('LEAVE_NOT_RESPONSIBLE');
+    expect(res.body.code).toBe('LEAVE_STAGE_ALREADY_PASSED');
     expect(res.body.details.waitingOn).toBe('hr');   // actionable, not a dead end
     expect(res.body.error).toContain('hr');
   });

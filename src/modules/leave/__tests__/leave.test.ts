@@ -327,14 +327,16 @@ describe('PUT /api/leave/:id/approve', () => {
     expect(res.status).toBe(403);
   });
 
-  it('approving a request not assigned to your role gets 403', async () => {
-    // Request is assigned to store_manager; area_manager tries to approve
+  it('a higher level may approve without waiting for its turn', async () => {
+    // Request is assigned to store_manager; the area manager decides it now.
+    // Approvers no longer have to wait for the request to reach their step —
+    // only acting from BEHIND the current stage is refused.
     const token = await login('area@acme-test.com');
     const res = await request
       .put(`/api/leave/${leaveId}/approve`)
       .set('Authorization', `Bearer ${token}`)
       .send({});
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(200);
   });
 
   it('full approval chain: store_manager → area_manager → hr → hr_approved, balance decremented', async () => {

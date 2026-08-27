@@ -1101,35 +1101,24 @@ export const listLeaveRequests = asyncHandler(async (req: Request, res: Response
  * managers to the stores they supervise; admin/HR/super-admin are unrestricted.
  */
 async function ensureLeaveStoreScope(
-  req: Request,
-  role: string,
-  isSuperAdmin: boolean,
-  allowedCompanyIds: number[],
-  requestStoreId: number | null,
+  _req: Request,
+  _role: string,
+  _isSuperAdmin: boolean,
+  _allowedCompanyIds: number[],
+  _requestStoreId: number | null,
 ): Promise<string | null> {
-  if (isSuperAdmin || role === 'admin' || role === 'hr') return null;
-
-  if (role === 'store_manager') {
-    if (requestStoreId == null || requestStoreId !== req.user!.storeId) {
-      return 'Questa richiesta non appartiene al tuo negozio';
-    }
-    return null;
-  }
-
-  if (role === 'area_manager') {
-    if (allowedCompanyIds.length > 1) return null;   // group-wide by design
-    if (requestStoreId == null) return null;          // company-level request
-    const amStores = await query<{ store_id: number }>(
-      `SELECT DISTINCT store_id FROM users
-       WHERE role = 'store_manager' AND supervisor_id = $1
-         AND company_id = $2 AND status = 'active' AND store_id IS NOT NULL`,
-      [req.user!.userId, req.user!.companyId],
-    );
-    if (!amStores.some((s) => s.store_id === requestStoreId)) {
-      return 'Questa richiesta non è tra i negozi che gestisci';
-    }
-  }
-
+  // Approval is scoped by COMPANY, not by store.
+  //
+  // This used to refuse a store manager acting outside their own store, and an
+  // area manager acting outside the stores linked to them by supervisor_id.
+  // Both checks contradicted the router: findNextActiveApprover assigns to any
+  // active manager in the company when there is no store or supervisor link,
+  // so requests were routinely handed to someone this guard then blocked —
+  // visible in the queue, refused on click.
+  //
+  // The company boundary is the one that matters for data separation, and it
+  // is already enforced by every query loading the request
+  // (`company_id = ANY(allowedCompanyIds)`), so nothing is widened beyond it.
   return null;
 }
 
@@ -1171,47 +1160,26 @@ export const getPendingApprovals = asyncHandler(async (req: Request, res: Respon
     scopeParams = [allowedCompanyIds];
   } else {
     switch (role) {
+      // Approval visibility is scoped by COMPANY only, deliberately. Scoping by
+      // store meant a request could be assigned to a role that could not see
+      // it: the router falls back to "any active manager in the company" when
+      // there is no store or supervisor link, while the queue demanded an exact
+      // store match. Company scoping keeps the two consistent, and the company
+      // boundary is the one that actually matters for data separation.
       case 'store_manager':
-        scopeWhere = `lr.company_id = ANY($1) AND lr.current_approver_role = 'store_manager' AND lr.store_id = $2`;
-        scopeParams = [allowedCompanyIds, effectiveStoreId];
+        scopeWhere = `lr.company_id = ANY($1) AND lr.current_approver_role = 'store_manager'`;
+        scopeParams = [allowedCompanyIds];
         break;
-      case 'area_manager': {
-        const hasCrossCompany = allowedCompanyIds.length > 1;
-
-        if (hasCrossCompany) {
-          // Cross-company area manager keeps group-wide visibility by design.
-          scopeWhere = `lr.company_id = ANY($1) AND lr.current_approver_role = 'area_manager'`;
-          scopeParams = [allowedCompanyIds];
-        } else {
-          // Single-company area manager: restrict to the stores they supervise
-          // (plus company-level requests with no store), matching listLeaveRequests.
-          const amStores = await query<{ store_id: number }>(
-            `SELECT DISTINCT store_id FROM users
-             WHERE role = 'store_manager' AND supervisor_id = $1
-               AND company_id = $2 AND status = 'active' AND store_id IS NOT NULL`,
-            [userId, req.user!.companyId],
-          );
-          const supervisedStoreIds = amStores.map((s) => s.store_id);
-          if (supervisedStoreIds.length === 0) {
-            // No store manager names this person as their supervisor — a very
-            // common state, because supervisor_id is optional and often left
-            // blank. The old query then narrowed to store_id IS NULL, i.e.
-            // nothing, so the area manager saw an empty queue while requests
-            // were sitting assigned to them.
-            //
-            // findNextActiveApprover already falls back to "any active area
-            // manager in the company" when there is no supervisor link, so
-            // requests ARE routed here. Visibility now follows the same rule:
-            // whatever the router can assign to them, they can see.
-            scopeWhere = `lr.company_id = ANY($1) AND lr.current_approver_role = 'area_manager'`;
-            scopeParams = [allowedCompanyIds];
-          } else {
-            scopeWhere = `lr.company_id = ANY($1) AND lr.current_approver_role = 'area_manager' AND (lr.store_id = ANY($2::int[]) OR lr.store_id IS NULL)`;
-            scopeParams = [allowedCompanyIds, supervisedStoreIds];
-          }
-        }
+      case 'area_manager':
+        // Company-scoped, like the store manager above. This used to derive a
+        // list of supervised stores from users.supervisor_id and, when that
+        // came back empty — the normal state, since supervisor_id is optional
+        // and usually blank — narrow to requests with no store at all, i.e.
+        // nothing. Area managers saw an empty queue while requests sat
+        // assigned to them.
+        scopeWhere = `lr.company_id = ANY($1) AND lr.current_approver_role = 'area_manager'`;
+        scopeParams = [allowedCompanyIds];
         break;
-      }
       case 'hr':
       case 'admin':
       default:
@@ -1372,16 +1340,36 @@ export const approveLeave = asyncHandler(async (req: Request, res: Response) => 
   const stageRole = leaveRequest.current_approver_role;
   const isOverride = (role === 'admin' || role === 'hr') && (emergency_override === true);
 
-  if (!isSuperAdmin && !isOverride && role !== 'admin' && stageRole !== effectiveRole) {
-    // Naming the current approver turns a dead end into something actionable:
-    // the reader knows who to chase instead of just being refused.
-    res.status(403).json({
-      success: false,
-      error: `Questa richiesta è in attesa di ${stageRole ?? 'un altro livello'}, non del tuo ruolo (${effectiveRole}). Potrai intervenire quando arriverà al tuo livello.`,
-      code: 'LEAVE_NOT_RESPONSIBLE',
-      details: { yourRole: effectiveRole, waitingOn: stageRole },
-    });
-    return;
+  // Any role that is part of this company's approval chain may act, without
+  // waiting for the request to reach its own step — an HR user or area manager
+  // can decide a request still sitting with a store manager. What is refused is
+  // acting from BEHIND the current stage: a store manager "approving" a request
+  // already at HR would drag it backwards down the chain, undoing a decision
+  // that has already been taken.
+  if (!isSuperAdmin && !isOverride && role !== 'admin') {
+    const chainForCaller = await getApprovalChain(leaveRequest.company_id);
+    const callerIdx = chainForCaller.indexOf(effectiveRole);
+    const stageIdx = stageRole ? chainForCaller.indexOf(stageRole) : -1;
+
+    if (callerIdx === -1) {
+      res.status(403).json({
+        success: false,
+        error: `Il tuo ruolo (${effectiveRole}) non fa parte della catena di approvazione di questa azienda (${chainForCaller.join(' → ')}).`,
+        code: 'ROLE_NOT_IN_CHAIN',
+        details: { yourRole: effectiveRole, chain: chainForCaller },
+      });
+      return;
+    }
+
+    if (stageIdx > callerIdx) {
+      res.status(403).json({
+        success: false,
+        error: `Questa richiesta è già stata approvata fino al livello ${stageRole}, successivo al tuo (${effectiveRole}). Non puoi riportarla indietro.`,
+        code: 'LEAVE_STAGE_ALREADY_PASSED',
+        details: { yourRole: effectiveRole, waitingOn: stageRole },
+      });
+      return;
+    }
   }
 
   // Store scoping (server-side): a store manager may only act on requests from
@@ -1757,16 +1745,36 @@ export const rejectLeave = asyncHandler(async (req: Request, res: Response) => {
 
   const stageRole = leaveRequest.current_approver_role;
   const isOverride = (role === 'admin' || role === 'hr') && (emergency_override === true);
-  if (!isSuperAdmin && !isOverride && role !== 'admin' && stageRole !== effectiveRole) {
-    // Naming the current approver turns a dead end into something actionable:
-    // the reader knows who to chase instead of just being refused.
-    res.status(403).json({
-      success: false,
-      error: `Questa richiesta è in attesa di ${stageRole ?? 'un altro livello'}, non del tuo ruolo (${effectiveRole}). Potrai intervenire quando arriverà al tuo livello.`,
-      code: 'LEAVE_NOT_RESPONSIBLE',
-      details: { yourRole: effectiveRole, waitingOn: stageRole },
-    });
-    return;
+  // Any role that is part of this company's approval chain may act, without
+  // waiting for the request to reach its own step — an HR user or area manager
+  // can decide a request still sitting with a store manager. What is refused is
+  // acting from BEHIND the current stage: a store manager "approving" a request
+  // already at HR would drag it backwards down the chain, undoing a decision
+  // that has already been taken.
+  if (!isSuperAdmin && !isOverride && role !== 'admin') {
+    const chainForCaller = await getApprovalChain(leaveRequest.company_id);
+    const callerIdx = chainForCaller.indexOf(effectiveRole);
+    const stageIdx = stageRole ? chainForCaller.indexOf(stageRole) : -1;
+
+    if (callerIdx === -1) {
+      res.status(403).json({
+        success: false,
+        error: `Il tuo ruolo (${effectiveRole}) non fa parte della catena di approvazione di questa azienda (${chainForCaller.join(' → ')}).`,
+        code: 'ROLE_NOT_IN_CHAIN',
+        details: { yourRole: effectiveRole, chain: chainForCaller },
+      });
+      return;
+    }
+
+    if (stageIdx > callerIdx) {
+      res.status(403).json({
+        success: false,
+        error: `Questa richiesta è già stata approvata fino al livello ${stageRole}, successivo al tuo (${effectiveRole}). Non puoi riportarla indietro.`,
+        code: 'LEAVE_STAGE_ALREADY_PASSED',
+        details: { yourRole: effectiveRole, waitingOn: stageRole },
+      });
+      return;
+    }
   }
 
   // Store scoping (server-side): mirror approveLeave — a store/area manager may
