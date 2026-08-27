@@ -1152,14 +1152,28 @@ export const getPendingApprovals = asyncHandler(async (req: Request, res: Respon
   let scopeWhere: string;
   let scopeParams: any[];
 
+  // The caller's store comes from their JWT, which is a snapshot taken at
+  // login. A manager whose store was assigned or changed after they signed in
+  // carries a stale (often null) value, and every store-scoped query then
+  // matches nothing — the queue looks empty rather than wrong. Read the
+  // current value instead, falling back to the token.
+  const liveStore = await queryOne<{ store_id: number | null }>(
+    `SELECT store_id FROM users WHERE id = $1`,
+    [userId],
+  );
+  const effectiveStoreId = liveStore?.store_id ?? storeId;
+
   if (isSuperAdmin) {
-    scopeWhere = `lr.company_id = ANY($1) AND lr.status IN ('pending','store manager approved','area manager approved')`;
+    // Keyed on "has a pending approver", not on a list of status strings: the
+    // status vocabulary varies by chain, and the old list silently omitted
+    // requests waiting on admin.
+    scopeWhere = `lr.company_id = ANY($1) AND lr.current_approver_role IS NOT NULL`;
     scopeParams = [allowedCompanyIds];
   } else {
     switch (role) {
       case 'store_manager':
         scopeWhere = `lr.company_id = ANY($1) AND lr.current_approver_role = 'store_manager' AND lr.store_id = $2`;
-        scopeParams = [allowedCompanyIds, storeId];
+        scopeParams = [allowedCompanyIds, effectiveStoreId];
         break;
       case 'area_manager': {
         const hasCrossCompany = allowedCompanyIds.length > 1;
@@ -1179,7 +1193,17 @@ export const getPendingApprovals = asyncHandler(async (req: Request, res: Respon
           );
           const supervisedStoreIds = amStores.map((s) => s.store_id);
           if (supervisedStoreIds.length === 0) {
-            scopeWhere = `lr.company_id = ANY($1) AND lr.current_approver_role = 'area_manager' AND lr.store_id IS NULL`;
+            // No store manager names this person as their supervisor — a very
+            // common state, because supervisor_id is optional and often left
+            // blank. The old query then narrowed to store_id IS NULL, i.e.
+            // nothing, so the area manager saw an empty queue while requests
+            // were sitting assigned to them.
+            //
+            // findNextActiveApprover already falls back to "any active area
+            // manager in the company" when there is no supervisor link, so
+            // requests ARE routed here. Visibility now follows the same rule:
+            // whatever the router can assign to them, they can see.
+            scopeWhere = `lr.company_id = ANY($1) AND lr.current_approver_role = 'area_manager'`;
             scopeParams = [allowedCompanyIds];
           } else {
             scopeWhere = `lr.company_id = ANY($1) AND lr.current_approver_role = 'area_manager' AND (lr.store_id = ANY($2::int[]) OR lr.store_id IS NULL)`;
