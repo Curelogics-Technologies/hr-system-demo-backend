@@ -2239,8 +2239,10 @@ export const setBalance = asyncHandler(async (req: Request, res: Response) => {
     badRequest(res, `Anno non valido (${currentYear - 10}–${currentYear + 5})`, 'INVALID_YEAR');
     return;
   }
-  if (typeof total_days !== 'number' || total_days <= 0 || !Number.isFinite(total_days)) {
-    badRequest(res, 'Il totale dei giorni deve essere un numero positivo', 'INVALID_TOTAL_DAYS');
+  // 0 is now a legitimate input: it means "clear this allocation", taking the
+  // employee back to not-configured. Negative and non-finite are still refused.
+  if (typeof total_days !== 'number' || total_days < 0 || !Number.isFinite(total_days)) {
+    badRequest(res, 'Il totale dei giorni non può essere negativo', 'INVALID_TOTAL_DAYS');
     return;
   }
 
@@ -2255,6 +2257,48 @@ export const setBalance = asyncHandler(async (req: Request, res: Response) => {
   }
 
   const effectiveCompanyId = targetUser.company_id;
+
+  // ── Clearing an allocation ────────────────────────────────────────────────
+  // Removing the row is what takes the employee back to "not configured", which
+  // in turn blocks HR/Admin approval until someone sets real days. That is a
+  // heavier action than editing a number, so it is admin-only, and it is
+  // refused outright once leave has been booked against the allocation —
+  // deleting then would silently orphan days the employee has already taken.
+  if (total_days === 0) {
+    const isAdmin = req.user!.role === 'admin' || req.user!.is_super_admin === true;
+    if (!isAdmin) {
+      forbidden(
+        res,
+        'Solo un amministratore può azzerare (rimuovere) il saldo di un dipendente',
+        'BALANCE_CLEAR_ADMIN_ONLY',
+      );
+      return;
+    }
+
+    const existing = await queryOne<{ used_days: string }>(
+      `SELECT used_days FROM leave_balances
+        WHERE company_id=$1 AND user_id=$2 AND year=$3 AND leave_type=$4`,
+      [effectiveCompanyId, user_id, year, leave_type],
+    );
+
+    if (existing && parseFloat(existing.used_days) > 0) {
+      res.status(422).json({
+        success: false,
+        error: `Impossibile rimuovere il saldo: ${parseFloat(existing.used_days)} giorni risultano già utilizzati.`,
+        code: 'BALANCE_CLEAR_HAS_USAGE',
+      });
+      return;
+    }
+
+    await query(
+      `DELETE FROM leave_balances
+        WHERE company_id=$1 AND user_id=$2 AND year=$3 AND leave_type=$4`,
+      [effectiveCompanyId, user_id, year, leave_type],
+    );
+
+    ok(res, { cleared: true, user_id, year, leave_type }, 'Saldo rimosso');
+    return;
+  }
 
   const result = await query<{
     id: number; company_id: number; user_id: number; year: number;

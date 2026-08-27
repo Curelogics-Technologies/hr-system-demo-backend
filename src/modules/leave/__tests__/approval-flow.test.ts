@@ -209,3 +209,51 @@ describe('HR approval requires a configured balance', () => {
     expect(res.status).toBe(200);   // not blocked — only HR/Admin are gated
   });
 });
+
+describe('clearing an allocation (total_days = 0)', () => {
+  async function putBalance(email: string, totalDays: number) {
+    const token = await login(email);
+    return request
+      .put('/api/leave/balance')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ user_id: seeds.employee1Id, year: 2026, leave_type: 'vacation', total_days: totalDays });
+  }
+
+  it('admin can clear an unused allocation, returning the employee to not-configured', async () => {
+    await allocate(seeds.employee1Id, 2026, 25);
+
+    const res = await putBalance('admin@acme-test.com', 0);
+    expect(res.status).toBe(200);
+
+    const { rows } = await testPool.query(
+      `SELECT 1 FROM leave_balances WHERE user_id = $1 AND year = 2026 AND leave_type = 'vacation'`,
+      [seeds.employee1Id],
+    );
+    expect(rows).toHaveLength(0);
+  });
+
+  it('HR cannot clear an allocation — that is an admin action', async () => {
+    await allocate(seeds.employee1Id, 2026, 25);
+
+    const res = await putBalance('hr@acme-test.com', 0);
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe('BALANCE_CLEAR_ADMIN_ONLY');
+  });
+
+  it('refuses to clear once days have been used, rather than orphaning them', async () => {
+    await allocate(seeds.employee1Id, 2026, 25);
+    await testPool.query(
+      `UPDATE leave_balances SET used_days = 3 WHERE user_id = $1 AND year = 2026 AND leave_type='vacation'`,
+      [seeds.employee1Id],
+    );
+
+    const res = await putBalance('admin@acme-test.com', 0);
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe('BALANCE_CLEAR_HAS_USAGE');
+  });
+
+  it('still refuses a negative total', async () => {
+    const res = await putBalance('admin@acme-test.com', -5);
+    expect(res.status).toBe(400);
+  });
+});

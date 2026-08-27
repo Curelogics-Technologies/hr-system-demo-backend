@@ -187,7 +187,7 @@ export async function computeAnomalies(
     const dayEvents = byUserDay.get(`${shift.user_id}_${shift.date}`) ?? [];
     const checkins = dayEvents.filter(e => e.event_type === 'checkin');
     const checkouts = dayEvents.filter(e => e.event_type === 'checkout');
-    const userName = `${shift.user_surname ?? ''} ${shift.user_name}`.trim();
+    const userName = `${shift.user_name ?? ''} ${shift.user_surname ?? ''}`.trim();
     // pdf-lib standard fonts are WinAnsi-encoded and throw outside it, so ASCII placeholders.
     const storeName = shift.store_name ?? '-';
 
@@ -589,7 +589,7 @@ export async function buildExceptions(
   for (const c of contracts) {
     items.push({
       status: ragDescending(Number(c.days_left), thresholds.contractExpiryAmber, thresholds.contractExpiryRed),
-      title: `Contratto in scadenza: ${c.surname ?? ''} ${c.name}`.trim(),
+      title: `Contratto in scadenza: ${c.name ?? ''} ${c.surname ?? ''}`.trim(),
       detail: `Scade tra ${c.days_left} giorni (${new Date(c.contract_end_date).toLocaleDateString('it-IT')})`,
       scope: 'Contratti',
     });
@@ -609,7 +609,7 @@ export async function buildExceptions(
   for (const l of staleLeave) {
     items.push({
       status: ragAscending(Number(l.age_days), thresholds.pendingLeaveAgeAmber, thresholds.pendingLeaveAgeRed),
-      title: `Richiesta ferie non evasa: ${l.surname ?? ''} ${l.name}`.trim(),
+      title: `Richiesta ferie non evasa: ${l.name ?? ''} ${l.surname ?? ''}`.trim(),
       detail: `In attesa da ${l.age_days} giorni`,
       scope: 'Ferie & permessi',
     });

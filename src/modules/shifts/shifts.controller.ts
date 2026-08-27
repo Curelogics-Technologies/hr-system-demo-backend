@@ -1958,7 +1958,7 @@ export const exportShifts = asyncHandler(async (req: Request, res: Response) => 
       });
 
       // 2. Draw Cell Texts
-      const fullName = `${user.surname} ${user.name}`;
+      const fullName = `${user.name} ${user.surname}`;
       const dispName = fullName.length > 20 ? fullName.slice(0, 18) + '..' : fullName;
       page.drawText(dispName, {
         x: colX(0) + 5,
