@@ -298,3 +298,51 @@ describe('zero days is an allocation, not a removal', () => {
     expect(res.body.code).toBe('LEAVES_FULL');
   });
 });
+
+describe('admins can approve on a chain that has no admin step', () => {
+  // The seeded chain is store_manager -> area_manager -> hr, which is how most
+  // companies are configured. An admin used to be forced onto a non-existent
+  // 'admin' step and refused with "Ruolo non autorizzato ad approvare",
+  // meaning no admin could approve anything at all.
+  async function walkToHr(start: string, end: string): Promise<number> {
+    const id = await submitAs('employee1@acme-test.com', start, end);
+    await makeStale(id); await processEscalationLogic();
+    await makeStale(id); await processEscalationLogic();
+    return id;
+  }
+
+  it('lets a company admin approve a request sitting at HR', async () => {
+    await allocate(seeds.employee1Id, 2026, 30);
+    const id = await walkToHr('2026-10-05', '2026-10-06');
+
+    const token = await login('admin@acme-test.com');
+    const res = await request.put(`/api/leave/${id}/approve`).set('Authorization', `Bearer ${token}`).send({});
+
+    expect(res.status).toBe(200);
+    const r = await readRequest(id);
+    expect(r.approved_by).not.toBeNull();
+  });
+
+  it('lets a super admin approve one too', async () => {
+    await allocate(seeds.employee1Id, 2026, 30);
+    const id = await walkToHr('2026-10-12', '2026-10-13');
+
+    const token = await login('superadmin@acme-test.com');
+    const res = await request.put(`/api/leave/${id}/approve`).set('Authorization', `Bearer ${token}`).send({});
+
+    expect(res.status).toBe(200);
+    expect((await readRequest(id)).approved_by).not.toBeNull();
+  });
+
+  it('tells a store manager WHO the request is waiting on, not just "no permission"', async () => {
+    const id = await walkToHr('2026-10-19', '2026-10-20');
+
+    const token = await login('manager.roma@acme-test.com');
+    const res = await request.put(`/api/leave/${id}/approve`).set('Authorization', `Bearer ${token}`).send({});
+
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe('LEAVE_NOT_RESPONSIBLE');
+    expect(res.body.details.waitingOn).toBe('hr');   // actionable, not a dead end
+    expect(res.body.error).toContain('hr');
+  });
+});
