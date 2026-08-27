@@ -16,3 +16,13 @@ temp_auto_push.bat
 temp_interactive_push.bat
 config.bat
 branch_structure.json
+
+# Secrets. .env holds the live database password, JWT/QR secrets and Stripe
+# keys — it was previously ignored only by luck (never staged), which one
+# `git add .` would have undone. .env.example stays tracked as the template,
+# and .env.test carries throwaway test credentials only.
+.env
+.env.local
+.env.*.local
+!.env.example
+!.env.test
