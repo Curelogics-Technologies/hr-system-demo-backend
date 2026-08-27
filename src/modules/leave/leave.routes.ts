@@ -21,6 +21,7 @@ import {
   importTemplate,
   importLeaveBalances,
   cancelLeave,
+  reopenLeave,
   executeEscalation,
   getApprovalConfig,
   updateApprovalConfig,
@@ -241,6 +242,16 @@ router.delete(
   requireRole(...allRoles),
   requireModulePermission('permessi', 'write'),
   deleteLeaveRequest,
+);
+
+// PUT /api/leave/:id/reopen — admin sends an auto-approved request back to HR
+router.put(
+  '/:id/reopen',
+  authenticate,
+  enforceCompany,
+  requireRole('admin'),
+  requireModulePermission('permessi', 'write'),
+  reopenLeave,
 );
 
 // PUT /api/leave/:id/archive — archive request (admin/hr only)
