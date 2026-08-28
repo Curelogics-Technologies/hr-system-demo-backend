@@ -6,6 +6,7 @@ import path from 'path';
 import { pool, query, queryOne } from '../../config/database';
 import { ok, created, notFound, conflict, forbidden, badRequest } from '../../utils/response';
 import { asyncHandler } from '../../utils/asyncHandler';
+import { resolveAreaManagerStoreIds } from '../../utils/storeScope';
 import { UserRole } from '../../config/jwt';
 import {
   resolveAllowedCompanyIds,
@@ -244,15 +245,7 @@ export const listEmployees = asyncHandler(async (req: Request, res: Response) =>
   const forShiftPlanning = for_shift_planning === 'true' || for_shift_planning === '1';
 
   if (forShiftPlanning && role === 'area_manager') {
-    const managedStores = await query<{ store_id: number }>(
-      `SELECT DISTINCT store_id FROM users
-       WHERE role = 'store_manager'
-         AND supervisor_id = $1
-         AND company_id = ANY($2)
-         AND status = 'active' AND store_id IS NOT NULL`,
-      [userId, allowedCompanyIds],
-    );
-    const storeIds = managedStores.map((r) => r.store_id);
+    const storeIds = await resolveAreaManagerStoreIds(userId, allowedCompanyIds);
     if (storeIds.length === 0) {
       ok(res, { employees: [], total: 0, page: pageNum, limit: limitNum, pages: 0 });
       return;
