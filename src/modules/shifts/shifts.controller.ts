@@ -381,7 +381,8 @@ async function buildShiftScope(
 export const listShifts = asyncHandler(async (req: Request, res: Response) => {
   const { role, userId, storeId } = req.user!;
   const { week, month, start_date, end_date, store_id, user_id, company_id, timezone } = req.query as Record<string, string>;
-  const displayTimezone = normalizeShiftTimezone(timezone, DEFAULT_SHIFT_TIMEZONE);
+  // `timezone` is still accepted so an older cached bundle keeps working, but it
+  // no longer influences which shifts come back — see the date filter below.
 
   const allowedCompanyIds = await resolveAllowedCompanyIds(req.user!);
   const { where, params } = await buildShiftScope(role, allowedCompanyIds, userId, storeId);
@@ -399,20 +400,27 @@ export const listShifts = asyncHandler(async (req: Request, res: Response) => {
       if (weekNum < 1 || weekNum > 53) {
         badRequest(res, 'Settimana non valida: deve essere tra 1 e 53'); return;
       }
+      // A shift belongs to the week its DATE falls in — a property of the shift,
+      // not of whoever is looking at it. Bounding by instants converted through the
+      // viewer's timezone made the answer depend on the viewer: a browser west of
+      // the store pushed the boundary forward and dropped early-Monday shifts off
+      // the calendar. This matches the start_date/end_date branch below and is
+      // correct for a store in any country.
       const weekToken = `${yr}-${wk.padStart(2, '0')}`;
-      extraWhere += ` AND ${SHIFT_START_UTC_SQL} >= ((DATE_TRUNC('week', TO_DATE($${idx}, 'IYYY-IW'))::DATE)::timestamp AT TIME ZONE $${idx + 1})`;
-      extraWhere += ` AND ${SHIFT_START_UTC_SQL} < (((DATE_TRUNC('week', TO_DATE($${idx}, 'IYYY-IW'))::DATE + INTERVAL '7 days')::timestamp) AT TIME ZONE $${idx + 1})`;
-      extra.push(weekToken, displayTimezone);
-      idx += 2;
+      extraWhere += ` AND s.date >= DATE_TRUNC('week', TO_DATE($${idx}, 'IYYY-IW'))::DATE`;
+      extraWhere += ` AND s.date < (DATE_TRUNC('week', TO_DATE($${idx}, 'IYYY-IW'))::DATE + INTERVAL '7 days')`;
+      extra.push(weekToken);
+      idx += 1;
     }
   } else if (month) {
     const match = month.match(/^(\d{4})-(\d{2})$/);
     if (match) {
+      // Same reasoning as the week branch: filter on the shift's own calendar date.
       const monthStart = `${month}-01`;
-      extraWhere += ` AND ${SHIFT_START_UTC_SQL} >= (($${idx}::DATE)::timestamp AT TIME ZONE $${idx + 1})`;
-      extraWhere += ` AND ${SHIFT_START_UTC_SQL} < (((DATE_TRUNC('month', $${idx}::DATE) + INTERVAL '1 month')::timestamp) AT TIME ZONE $${idx + 1})`;
-      extra.push(monthStart, displayTimezone);
-      idx += 2;
+      extraWhere += ` AND s.date >= $${idx}::DATE`;
+      extraWhere += ` AND s.date < (DATE_TRUNC('month', $${idx}::DATE) + INTERVAL '1 month')`;
+      extra.push(monthStart);
+      idx += 1;
     }
   } else if (start_date && end_date) {
     extraWhere += ` AND s.date >= $${idx}::DATE AND s.date <= $${idx + 1}::DATE`;
