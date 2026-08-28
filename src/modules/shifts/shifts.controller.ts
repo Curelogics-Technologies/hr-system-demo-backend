@@ -6,7 +6,7 @@ import { asyncHandler } from '../../utils/asyncHandler';
 import { UserRole } from '../../config/jwt';
 import { resolveAllowedCompanyIds } from '../../utils/companyScope';
 import { validateShiftCrossFields } from './shifts.routes';
-import { coalescedShiftPointUtcSql, DEFAULT_SHIFT_TIMEZONE, normalizeShiftTimezone } from '../../utils/shiftTimezone';
+import { coalescedShiftPointUtcSql, DEFAULT_SHIFT_TIMEZONE, normalizeShiftTimezone, resolveStoreTimezone } from '../../utils/shiftTimezone';
 import { sendNotification } from '../notifications/notifications.service';
 import { sendShiftCreatedAutomation } from '../automations/shiftNotification';
 import { t } from '../../utils/i18n';
@@ -653,7 +653,10 @@ export const createShift = asyncHandler(async (req: Request, res: Response) => {
   }
 
   const isFlexible = body.break_type === 'flexible';
-  const shiftTimezone = normalizeShiftTimezone(body.timezone, DEFAULT_SHIFT_TIMEZONE);
+  // The zone belongs to the shop the shift is worked at, never to the browser
+  // that created it. body.timezone is still accepted so an older cached bundle
+  // keeps working, but it no longer decides anything.
+  const shiftTimezone = await resolveStoreTimezone(body.store_id, effectiveCompanyId, query);
   const nBreakStart = normalizeTime(body.break_start);
   const nBreakEnd = normalizeTime(body.break_end);
   const nSplitS2 = normalizeTime(body.split_start2);
@@ -840,7 +843,9 @@ export const updateShift = asyncHandler(async (req: Request, res: Response) => {
   const targetStatus = (targetIsOffDay
     ? 'cancelled'
     : (body.status ?? existing.status)) as 'scheduled' | 'confirmed' | 'cancelled';
-  const targetShiftTimezone = normalizeShiftTimezone(body.timezone, existing.timezone ?? DEFAULT_SHIFT_TIMEZONE);
+  // Resolved from the TARGET store, so moving a shift to another shop moves its
+  // clock with it — previously the zone stayed behind on the old store.
+  const targetShiftTimezone = await resolveStoreTimezone(targetStoreId, effectiveCompanyId, query);
 
   const targetStart = body.start_time ?? existing.start_time;
   const targetEnd = body.end_time ?? existing.end_time;
@@ -1295,6 +1300,13 @@ export const copyWeek = asyncHandler(async (req: Request, res: Response) => {
 
   const source_monday = sourceMondayRow!.source_monday;
   const target_monday = targetMondayRow!.target_monday;
+  // Copy-week never crosses stores — the same store_id filters the source and is
+  // written to the copies — so this is resolved once for the whole batch. Taking
+  // it from the source shift instead would clone a bad zone into the new week and
+  // lock the same employees out all over again.
+  // Scoped by the company that actually owns these shifts, not allowedCompanyIds[0],
+  // which is the wrong entry for a caller who spans more than one company.
+  const copyTargetTimezone = await resolveStoreTimezone(store_id, sourceShifts[0].company_id, query);
   const sourceMondayDate = new Date(`${source_monday}T12:00:00`);
   const targetMondayDate = new Date(`${target_monday}T12:00:00`);
   let skippedOffDay = 0;
@@ -1329,7 +1341,7 @@ export const copyWeek = asyncHandler(async (req: Request, res: Response) => {
       continue;
     }
 
-    const copiedTimezone = normalizeShiftTimezone(s.timezone, DEFAULT_SHIFT_TIMEZONE);
+    const copiedTimezone = copyTargetTimezone;
     const overlapMain = await queryOne<{ id: number }>(
       `SELECT id FROM shifts
        WHERE company_id = $1
@@ -2211,7 +2223,8 @@ export const importTemplate = asyncHandler(async (req: Request, res: Response) =
 export const importShifts = asyncHandler(async (req: Request, res: Response) => {
   const { companyId, userId: callerId, role, storeId: callerStoreId } = req.user!;
   const file = (req as any).file as Express.Multer.File | undefined;
-  const importTimezone = normalizeShiftTimezone((req.body as Record<string, unknown> | undefined)?.timezone, DEFAULT_SHIFT_TIMEZONE);
+  // The multipart `timezone` field is still accepted and ignored: each row now
+  // takes the zone of the store its store_code resolves to.
 
   if (!file) {
     badRequest(res, 'Nessun file fornito', 'VALIDATION_ERROR');
@@ -2323,8 +2336,8 @@ export const importShifts = asyncHandler(async (req: Request, res: Response) => 
         continue;
       }
 
-      const targetStore = await queryOne<{ id: number }>(
-        `SELECT id FROM stores WHERE code = $1 AND company_id = $2 AND is_active = true`,
+      const targetStore = await queryOne<{ id: number; timezone: string | null }>(
+        `SELECT id, timezone FROM stores WHERE code = $1 AND company_id = $2 AND is_active = true`,
         [storeCodeVal, companyId],
       );
       if (!targetStore) {
@@ -2389,7 +2402,10 @@ export const importShifts = asyncHandler(async (req: Request, res: Response) => 
         storeId,
         userId,
         dateVal,
-        importTimezone,
+        // Per row: each spreadsheet line names its own store, so each takes that
+        // store's zone. A single zone for the whole file would be wrong the moment
+        // an import spans two shops in different countries.
+        normalizeShiftTimezone(targetStore.timezone, DEFAULT_SHIFT_TIMEZONE),
         startTime,
         endTime,
         breakStart ?? null,
