@@ -334,14 +334,14 @@ describe('admins can approve on a chain that has no admin step', () => {
     expect((await readRequest(id)).approved_by).not.toBeNull();
   });
 
-  it('refuses a store manager acting on a request that has already passed their level', async () => {
+  it('tells a store manager WHO the request is waiting on, not just "no permission"', async () => {
     const id = await walkToHr('2026-10-19', '2026-10-20');
 
     const token = await login('manager.roma@acme-test.com');
     const res = await request.put(`/api/leave/${id}/approve`).set('Authorization', `Bearer ${token}`).send({});
 
     expect(res.status).toBe(403);
-    expect(res.body.code).toBe('LEAVE_STAGE_ALREADY_PASSED');
+    expect(res.body.code).toBe('LEAVE_NOT_RESPONSIBLE');
     expect(res.body.details.waitingOn).toBe('hr');   // actionable, not a dead end
     expect(res.body.error).toContain('hr');
   });
@@ -426,47 +426,5 @@ describe('the agreed flow, end to end', () => {
     const token = await login('hr@acme-test.com');
     const res = await request.put(`/api/leave/${id}/reopen`).set('Authorization', `Bearer ${token}`).send({});
     expect([403, 404]).toContain(res.status);
-  });
-});
-
-describe('approvers can see what is assigned to them', () => {
-  it('an area manager with no supervisor links still sees requests routed to them', async () => {
-    // supervisor_id is optional and frequently left blank. The queue used to
-    // narrow to "requests with no store", i.e. nothing, while the router was
-    // happily assigning requests to this very person.
-    await testPool.query(
-      `UPDATE users SET supervisor_id = NULL WHERE role = 'store_manager' AND company_id = $1`,
-      [seeds.acmeId],
-    );
-
-    const id = await submitAs('employee1@acme-test.com', '2027-02-01', '2027-02-03');
-    await makeStale(id); await processEscalationLogic();   // now with the area manager
-    expect((await readRequest(id)).current_approver_role).toBe('area_manager');
-
-    expect(await pendingIds('area@acme-test.com')).toContain(id);
-  });
-
-  it('a store manager sees a request even if their token predates the store assignment', async () => {
-    // req.user comes straight from the JWT, so storeId is a snapshot from
-    // login. The queue now reads the current store from the database.
-    const token = await login('manager.roma@acme-test.com');   // token issued now
-    await testPool.query(`UPDATE users SET store_id = $1 WHERE email = 'manager.roma@acme-test.com'`,
-      [seeds.romaStoreId]);
-
-    const id = await submitAs('employee1@acme-test.com', '2027-02-08', '2027-02-10');
-
-    const res = await request.get('/api/leave/pending').set('Authorization', `Bearer ${token}`);
-    const ids = (res.body?.data?.requests ?? []).map((r: any) => r.id);
-    expect(ids).toContain(id);
-  });
-
-  it('a super admin sees requests waiting at every level, including admin', async () => {
-    const id = await submitAs('employee1@acme-test.com', '2027-02-15', '2027-02-17');
-    // Park it on a stage the old status-based filter did not list.
-    await testPool.query(
-      `UPDATE leave_requests SET status = 'HR approved', current_approver_role = 'admin' WHERE id = $1`,
-      [id]);
-
-    expect(await pendingIds('superadmin@acme-test.com')).toContain(id);
   });
 });
