@@ -1443,7 +1443,18 @@ export async function calculateAnomaliesForRange(
     `SELECT s.id, s.company_id, s.user_id, s.store_id, TO_CHAR(s.date, 'YYYY-MM-DD') AS date,
             s.start_time, s.end_time, s.break_start, s.break_end, s.break_minutes,
             u.name AS user_name, u.surname AS user_surname, u.avatar_filename AS user_avatar_filename,
-            st.name AS store_name, COALESCE(NULLIF(BTRIM(st.timezone), ''), '${DEFAULT_SHIFT_TIMEZONE_SQL}') AS store_timezone
+            st.name AS store_name,
+            -- The gate in recordEvent resolves a shift's instants from s.timezone.
+            -- Reading st.timezone here instead meant the two disagreed whenever a
+            -- shift carried the wrong zone: the dashboard called the Varese four
+            -- absent at 09:10 while the terminal was still telling them it was too
+            -- early. One source of truth — the shift's own zone, the store's only
+            -- as a fallback for legacy rows that never had one.
+            COALESCE(
+              NULLIF(BTRIM(s.timezone), ''),
+              NULLIF(BTRIM(st.timezone), ''),
+              '${DEFAULT_SHIFT_TIMEZONE_SQL}'
+            ) AS store_timezone
      FROM shifts s
      LEFT JOIN users u  ON u.id  = s.user_id
      LEFT JOIN stores st ON st.id = s.store_id
