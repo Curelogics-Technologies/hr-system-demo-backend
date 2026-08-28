@@ -2406,17 +2406,28 @@ export const importShifts = asyncHandler(async (req: Request, res: Response) => 
     const COLS = 17;
     const placeholders = validRows.map((_, ri) => {
       const b = ri * COLS + 1;
+      // A point at or before the start time belongs to the following day — a
+      // 22:00-06:00 shift ends at the 06:00 of tomorrow, not of the shift date.
+      // create and update already rolled the date over; the bulk import did not,
+      // so an imported overnight shift was stored as ending before it began.
+      const rollsOver = (idx: number) =>
+        `(CASE WHEN $${idx}::TIME < $${b+5}::TIME THEN INTERVAL '1 day' ELSE INTERVAL '0' END)`;
+      const pointUtc = (idx: number) =>
+        `(($${b+3}::DATE + ${rollsOver(idx)} + $${idx}::TIME) AT TIME ZONE $${b+4})`;
+      const nullablePointUtc = (idx: number) =>
+        `CASE WHEN $${idx}::TIME IS NULL THEN NULL ELSE ${pointUtc(idx)} END`;
+
       return `(
         $${b}, $${b+1}, $${b+2}, $${b+3}, $${b+4}, $${b+5}, $${b+6},
         (($${b+3}::DATE + $${b+5}::TIME) AT TIME ZONE $${b+4}),
-        (($${b+3}::DATE + $${b+6}::TIME) AT TIME ZONE $${b+4}),
+        ${pointUtc(b+6)},
         $${b+7}, $${b+8},
-        CASE WHEN $${b+7}::TIME IS NULL THEN NULL ELSE (($${b+3}::DATE + $${b+7}::TIME) AT TIME ZONE $${b+4}) END,
-        CASE WHEN $${b+8}::TIME IS NULL THEN NULL ELSE (($${b+3}::DATE + $${b+8}::TIME) AT TIME ZONE $${b+4}) END,
+        ${nullablePointUtc(b+7)},
+        ${nullablePointUtc(b+8)},
         $${b+9}, $${b+10},
         $${b+11}, $${b+12}, $${b+13},
-        CASE WHEN $${b+12}::TIME IS NULL THEN NULL ELSE (($${b+3}::DATE + $${b+12}::TIME) AT TIME ZONE $${b+4}) END,
-        CASE WHEN $${b+13}::TIME IS NULL THEN NULL ELSE (($${b+3}::DATE + $${b+13}::TIME) AT TIME ZONE $${b+4}) END,
+        ${nullablePointUtc(b+12)},
+        ${nullablePointUtc(b+13)},
         $${b+14}, $${b+15}, $${b+16}
       )`;
     }).join(',');
