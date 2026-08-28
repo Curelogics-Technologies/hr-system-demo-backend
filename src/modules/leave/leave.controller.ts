@@ -5,6 +5,7 @@ import { query, queryOne, pool } from '../../config/database';
 import { ok, created, notFound, forbidden, badRequest } from '../../utils/response';
 import { asyncHandler } from '../../utils/asyncHandler';
 import { resolveAllowedCompanyIds } from '../../utils/companyScope';
+import { resolveAreaManagerStoreIds } from '../../utils/storeScope';
 import { DEFAULT_SHIFT_TIMEZONE } from '../../utils/shiftTimezone';
 import { sendNotification } from '../notifications/notifications.service';
 import { sendLeaveResultAutomation } from '../automations/leaveNotification';
@@ -883,6 +884,14 @@ export const listLeaveRequests = asyncHandler(async (req: Request, res: Response
   let scopeWhere: string;
   let scopeParams: any[];
 
+  // The store on the JWT is a snapshot from login, so a manager whose store was
+  // assigned afterwards still carries a stale null until they log in again.
+  const liveStoreRow = await queryOne<{ store_id: number | null }>(
+    `SELECT store_id FROM users WHERE id = $1`,
+    [userId],
+  );
+  const effectiveStoreId = liveStoreRow?.store_id ?? storeId;
+
   if (is_super_admin) {
     // Super Admin: All leaves of all users across all companies (allowedCompanyIds handles all companies)
     scopeWhere = `lr.company_id = ANY($1)`;
@@ -901,7 +910,7 @@ export const listLeaveRequests = asyncHandler(async (req: Request, res: Response
       case 'store_manager':
         // Store Manager: Their own leaves + Leaves of employees assigned to their store
         scopeWhere = `((lr.company_id = ANY($1) AND lr.store_id = $2) OR lr.user_id = $3) AND ${buildHierarchyFilter(3)}`;
-        scopeParams = [allowedCompanyIds, storeId, userId];
+        scopeParams = [allowedCompanyIds, effectiveStoreId, userId];
         break;
       case 'area_manager': {
         // Area Manager: Their own leaves + Leaves of store managers under them + Leaves of employees under those store managers
@@ -922,13 +931,7 @@ export const listLeaveRequests = asyncHandler(async (req: Request, res: Response
           scopeParams = [allowedCompanyIds, userId];
         } else {
           // Standard local-only visibility: find managed stores in their own company
-          const amStores = await query<{ store_id: number }>(
-            `SELECT DISTINCT store_id FROM users
-             WHERE role = 'store_manager' AND supervisor_id = $1
-               AND company_id = $2 AND status = 'active' AND store_id IS NOT NULL`,
-            [userId, req.user!.companyId],
-          );
-          const storeIds = amStores.map((s) => s.store_id);
+          const storeIds = await resolveAreaManagerStoreIds(userId, allowedCompanyIds);
           
           if (storeIds.length === 0) {
             scopeWhere = `lr.company_id = ANY($1) AND (lr.user_id = $2 OR lr.current_approver_role = 'area_manager' OR EXISTS (
@@ -1110,7 +1113,14 @@ async function ensureLeaveStoreScope(
   if (isSuperAdmin || role === 'admin' || role === 'hr') return null;
 
   if (role === 'store_manager') {
-    if (requestStoreId == null || requestStoreId !== req.user!.storeId) {
+    // The JWT store is a login snapshot; a manager assigned to a store after
+    // logging in would otherwise be refused until their next login.
+    const live = await queryOne<{ store_id: number | null }>(
+      `SELECT store_id FROM users WHERE id = $1`,
+      [req.user!.userId],
+    );
+    const ownStoreId = live?.store_id ?? req.user!.storeId;
+    if (requestStoreId == null || ownStoreId == null || requestStoreId !== ownStoreId) {
       return 'Questa richiesta non appartiene al tuo negozio';
     }
     return null;
@@ -1119,13 +1129,8 @@ async function ensureLeaveStoreScope(
   if (role === 'area_manager') {
     if (allowedCompanyIds.length > 1) return null;   // group-wide by design
     if (requestStoreId == null) return null;          // company-level request
-    const amStores = await query<{ store_id: number }>(
-      `SELECT DISTINCT store_id FROM users
-       WHERE role = 'store_manager' AND supervisor_id = $1
-         AND company_id = $2 AND status = 'active' AND store_id IS NOT NULL`,
-      [req.user!.userId, req.user!.companyId],
-    );
-    if (!amStores.some((s) => s.store_id === requestStoreId)) {
+    const amStoreIds = await resolveAreaManagerStoreIds(req.user!.userId, allowedCompanyIds);
+    if (!amStoreIds.includes(requestStoreId)) {
       return 'Questa richiesta non è tra i negozi che gestisci';
     }
   }
@@ -1152,14 +1157,33 @@ export const getPendingApprovals = asyncHandler(async (req: Request, res: Respon
   let scopeWhere: string;
   let scopeParams: any[];
 
+  /**
+   * Set when the caller's role is store-scoped but they have no stores to scope
+   * to — a store manager with no store, or an area manager no store manager
+   * reports to. Their queue is then legitimately empty, but "empty" and
+   * "you were never wired up" look identical on screen, which is how a
+   * configuration gap gets mistaken for a broken feature. The UI uses this to
+   * say which one it is.
+   */
+  let scopeIssue: 'no_store_association' | null = null;
+
+  // The store on the JWT is a snapshot from login. A manager whose store was
+  // assigned afterwards carries a stale null, so read the current value.
+  const liveStore = await queryOne<{ store_id: number | null }>(
+    `SELECT store_id FROM users WHERE id = $1`,
+    [userId],
+  );
+  const effectiveStoreId = liveStore?.store_id ?? storeId;
+
   if (isSuperAdmin) {
     scopeWhere = `lr.company_id = ANY($1) AND lr.status IN ('pending','store manager approved','area manager approved')`;
     scopeParams = [allowedCompanyIds];
   } else {
     switch (role) {
       case 'store_manager':
+        if (effectiveStoreId == null) scopeIssue = 'no_store_association';
         scopeWhere = `lr.company_id = ANY($1) AND lr.current_approver_role = 'store_manager' AND lr.store_id = $2`;
-        scopeParams = [allowedCompanyIds, storeId];
+        scopeParams = [allowedCompanyIds, effectiveStoreId];
         break;
       case 'area_manager': {
         const hasCrossCompany = allowedCompanyIds.length > 1;
@@ -1171,14 +1195,12 @@ export const getPendingApprovals = asyncHandler(async (req: Request, res: Respon
         } else {
           // Single-company area manager: restrict to the stores they supervise
           // (plus company-level requests with no store), matching listLeaveRequests.
-          const amStores = await query<{ store_id: number }>(
-            `SELECT DISTINCT store_id FROM users
-             WHERE role = 'store_manager' AND supervisor_id = $1
-               AND company_id = $2 AND status = 'active' AND store_id IS NOT NULL`,
-            [userId, req.user!.companyId],
-          );
-          const supervisedStoreIds = amStores.map((s) => s.store_id);
+          const supervisedStoreIds = await resolveAreaManagerStoreIds(userId, allowedCompanyIds);
           if (supervisedStoreIds.length === 0) {
+            // The area manager is not assigned to a store and no store manager
+            // reports to them, so there are no stores to scope to. Flagged
+            // rather than silently empty.
+            scopeIssue = 'no_store_association';
             scopeWhere = `lr.company_id = ANY($1) AND lr.current_approver_role = 'area_manager' AND lr.store_id IS NULL`;
             scopeParams = [allowedCompanyIds];
           } else {
@@ -1268,7 +1290,9 @@ export const getPendingApprovals = asyncHandler(async (req: Request, res: Respon
     }
   }
 
-  ok(res, { requests: filteredRequests, total: filteredRequests.length });
+  // scope_issue distinguishes "nothing to approve" from "you have no stores
+  // assigned, so nothing could ever appear here".
+  ok(res, { requests: filteredRequests, total: filteredRequests.length, scope_issue: scopeIssue });
 });
 
 // ---------------------------------------------------------------------------
@@ -2016,18 +2040,15 @@ export const getBalance = asyncHandler(async (req: Request, res: Response) => {
         [requestedId, allowedCompanyIds],
       );
     } else {
+      const scopedStoreIds = await resolveAreaManagerStoreIds(userId, allowedCompanyIds);
       allowed = await queryOne<{ id: number }>(
         `SELECT u.id FROM users u
          WHERE u.id = $1 AND u.company_id = ANY($2)
            AND (
-             u.store_id IN (
-               SELECT DISTINCT store_id FROM users
-               WHERE role = 'store_manager' AND supervisor_id = $3
-                 AND company_id = ANY($2) AND status = 'active' AND store_id IS NOT NULL
-             )
+             u.store_id = ANY($4::int[])
              OR u.supervisor_id = $3 -- Direct subordinates (Store Managers)
            )`,
-        [requestedId, allowedCompanyIds, userId],
+        [requestedId, allowedCompanyIds, userId, scopedStoreIds],
       );
     }
 
