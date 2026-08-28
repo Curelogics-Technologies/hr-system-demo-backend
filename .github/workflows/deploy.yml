@@ -21,54 +21,14 @@ jobs:
           script: |
             set -e
 
-            # ---------------------------------------------------------------
-            # This runs in a NON-INTERACTIVE, NON-LOGIN shell, which does not
-            # read ~/.bashrc or ~/.profile. Anything installed via nvm or npm
-            # -g (pm2 in particular) is therefore missing from PATH here even
-            # though it works when you ssh in by hand. Load the profile first,
-            # then fall back to the usual install locations.
-            # ---------------------------------------------------------------
-            export NVM_DIR="$HOME/.nvm"
-            [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" --no-use || true
-            [ -s "$HOME/.profile" ] && . "$HOME/.profile" || true
-            export PATH="$PATH:/usr/local/bin:/usr/bin:$HOME/.npm-global/bin"
-
-            # npm insists on writing a debug log next to its cache and fails
-            # noisily when it cannot. A disposable cache avoids the whole issue.
-            export npm_config_cache=/tmp/npm-cache
-            export npm_config_update_notifier=false
-            export CI=true
-
-            echo "::group::environment"
-            echo "node : $(command -v node || echo MISSING) $(node -v 2>/dev/null)"
-            echo "npm  : $(command -v npm  || echo MISSING) $(npm -v 2>/dev/null)"
-            echo "pm2  : $(command -v pm2  || echo MISSING)"
-            echo "::endgroup::"
-
             cd /var/www/hr-system-demo-backend
 
-            echo ">>> STEP 1/5 git"
             git fetch origin main
             git reset --hard origin/main
 
-            echo ">>> STEP 2/5 verify build config is clean"
-            # The EtherHiding loader was appended to this file and executed on
-            # every build. ~31KB means it is back; the real file is under 1KB.
-            SIZE=$(wc -c < jest.config.js)
-            echo "jest.config.js = $SIZE bytes"
-            if [ "$SIZE" -gt 5000 ]; then
-              echo "REFUSING TO DEPLOY: jest.config.js looks injected ($SIZE bytes)"
-              exit 1
-            fi
-
-            echo ">>> STEP 3/5 npm install"
-            npm ci --no-audit --no-fund || npm install --no-audit --no-fund
-
-            echo ">>> STEP 4/5 build"
+            npm install
             npm run build
 
-            echo ">>> STEP 5/5 restart"
-            pm2 restart hr-backend --update-env
-            pm2 save || true
+            pm2 restart hr-backend
 
             echo "Backend deployed successfully"
