@@ -154,6 +154,9 @@ export const listStoresWithTerminalStatus = asyncHandler(async (req: Request, re
       s.cap, 
       s.max_staff, 
       s.company_id,
+      -- The clock this store's shifts and clock-ins run on. Shown next to the
+      -- terminal so whoever sets it up can see it is not necessarily their own.
+      s.timezone,
       c.name as company_name,
       -- Any terminal account at all, regardless of whether it is currently
       -- enabled. Filtering on status here used to let a store with a disabled
