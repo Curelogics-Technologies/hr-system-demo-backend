@@ -3,6 +3,7 @@ import crypto from 'crypto';
 import bcrypt from 'bcryptjs';
 import { asyncHandler } from '../../utils/asyncHandler';
 import { ok, badRequest, forbidden } from '../../utils/response';
+import { assertLicenseCapacity } from '../billing/license.service';
 import { pool, query } from '../../config/database';
 import { resolveAllowedCompanyIds } from '../../utils/companyScope';
 
@@ -246,6 +247,16 @@ export const bulkImportEmployees = asyncHandler(async (req: Request, res: Respon
   if (valid.length === 0) {
     ok(res, { created: [], createdCount: 0, failures, warnings });
     return;
+  }
+
+  // The whole batch must fit inside the paid allowance. Checking once for the
+  // full count avoids importing half a file and then refusing the rest.
+  const byCompany = new Map<number, number>();
+  for (const row of valid) {
+    byCompany.set(row.companyId, (byCompany.get(row.companyId) || 0) + 1);
+  }
+  for (const [cid, count] of byCompany) {
+    await assertLicenseCapacity(cid, 'employee', count);
   }
 
   // ── Insert pass: one transaction for the whole batch ──────────────────────

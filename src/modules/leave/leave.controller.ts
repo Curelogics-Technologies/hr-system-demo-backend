@@ -5,8 +5,6 @@ import { query, queryOne, pool } from '../../config/database';
 import { ok, created, notFound, forbidden, badRequest } from '../../utils/response';
 import { asyncHandler } from '../../utils/asyncHandler';
 import { resolveAllowedCompanyIds } from '../../utils/companyScope';
-import { resolveAreaManagerStoreIds } from '../../utils/storeScope';
-import { APPROVED_LEAVE_STATUS_SQL } from '../../utils/leaveCoverage';
 import { DEFAULT_SHIFT_TIMEZONE } from '../../utils/shiftTimezone';
 import { sendNotification } from '../notifications/notifications.service';
 import { sendLeaveResultAutomation } from '../automations/leaveNotification';
@@ -90,24 +88,6 @@ const RANK_SQL_CASE = `
     WHEN 'area_manager' THEN 60
     WHEN 'store_manager' THEN 40
     WHEN 'employee' THEN 20
-    ELSE 0
-  END
-`;
-
-/**
- * Rank of the stage a request is currently waiting on.
- *
- * Approvers see a request as soon as it reaches or passes a stage they are at
- * or above, rather than only when it is precisely their turn. A store manager
- * and an area manager both see a new request immediately, and either can act;
- * the chain still records who approved, it just no longer gates who may look.
- */
-const STAGE_RANK_SQL = `
-  CASE LOWER(REPLACE(lr.current_approver_role::text, ' ', '_'))
-    WHEN 'admin' THEN 100
-    WHEN 'hr' THEN 80
-    WHEN 'area_manager' THEN 60
-    WHEN 'store_manager' THEN 40
     ELSE 0
   END
 `;
@@ -407,66 +387,22 @@ function buildTransitions(chain: string[]): Record<string, { nextStatus: string;
 }
 
 /**
- * True when this person is actually away — not merely hoping to be.
- *
- * This used to accept any status that was not an outright rejection, which
- * meant a manager's own unapproved request made the system treat them as
- * absent. A store manager who had asked for next week off silently lost their
- * entire approval queue, with no message explaining it, and approving that
- * request did not restore it either. Only granted leave counts here.
- *
- * The candidate's dates are the question being asked, so the overlap test uses
- * them. The separate "covers today" clause stays, because an approver who is
- * away right now cannot act right now — but it too is limited to granted leave.
+ * Helper to check if a specific user is on leave (Approved) during the requested dates
+ * OR is currently away TODAY.
  */
 async function isUserOnLeave(userId: number, startDate: string, endDate: string) {
   const leave = await queryOne(
-    `SELECT id FROM leave_requests
-     WHERE user_id = $1
-       AND ${APPROVED_LEAVE_STATUS_SQL}
+    `SELECT id FROM leave_requests 
+     WHERE user_id = $1 
+       AND status NOT IN ('rejected', 'cancelled', 'store manager rejected', 'area manager rejected', 'HR rejected')
        AND (
-         (start_date <= $2::date AND end_date >= $3::date) OR -- overlaps the dates asked about
-         (start_date <= CURRENT_DATE AND end_date >= CURRENT_DATE) -- away today
+         (start_date <= $2::date AND end_date >= $3::date) OR -- Overlaps with requested leave dates
+         (start_date <= CURRENT_DATE AND end_date >= CURRENT_DATE)    -- Overlaps with TODAY
        )
      LIMIT 1`,
     [userId, endDate, startDate]
   );
   return !!leave;
-}
-
-/**
- * Approvers for these requests who are on granted leave, so the UI can say who
- * is away and until when instead of leaving a gap in the stepper.
- */
-async function loadApproversOnLeave(
-  companyId: number,
-  storeIds: number[],
-): Promise<Array<{ userId: number; name: string; surname: string; role: string; avatarFilename: string | null; startDate: string; endDate: string }>> {
-  const rows = await query<any>(
-    `SELECT DISTINCT ON (u.id)
-            u.id AS user_id, u.name, u.surname, u.role, u.avatar_filename,
-            TO_CHAR(lr.start_date, 'YYYY-MM-DD') AS start_date,
-            TO_CHAR(lr.end_date, 'YYYY-MM-DD')   AS end_date
-       FROM users u
-       JOIN leave_requests lr ON lr.user_id = u.id
-                              AND ${APPROVED_LEAVE_STATUS_SQL.replace('status =', 'lr.status =')}
-      WHERE u.company_id = $1
-        AND u.status = 'active'
-        AND u.role IN ('store_manager','area_manager','hr','admin')
-        AND (u.store_id IS NULL OR cardinality($2::int[]) = 0 OR u.store_id = ANY($2::int[]))
-        AND lr.start_date <= CURRENT_DATE AND lr.end_date >= CURRENT_DATE
-      ORDER BY u.id, lr.end_date DESC`,
-    [companyId, storeIds],
-  );
-  return rows.map((r) => ({
-    userId: r.user_id,
-    name: r.name,
-    surname: r.surname,
-    role: r.role,
-    avatarFilename: r.avatar_filename ?? null,
-    startDate: r.start_date,
-    endDate: r.end_date,
-  }));
 }
 
 
@@ -947,14 +883,6 @@ export const listLeaveRequests = asyncHandler(async (req: Request, res: Response
   let scopeWhere: string;
   let scopeParams: any[];
 
-  // The store on the JWT is a snapshot from login, so a manager whose store was
-  // assigned afterwards still carries a stale null until they log in again.
-  const liveStoreRow = await queryOne<{ store_id: number | null }>(
-    `SELECT store_id FROM users WHERE id = $1`,
-    [userId],
-  );
-  const effectiveStoreId = liveStoreRow?.store_id ?? storeId;
-
   if (is_super_admin) {
     // Super Admin: All leaves of all users across all companies (allowedCompanyIds handles all companies)
     scopeWhere = `lr.company_id = ANY($1)`;
@@ -973,7 +901,7 @@ export const listLeaveRequests = asyncHandler(async (req: Request, res: Response
       case 'store_manager':
         // Store Manager: Their own leaves + Leaves of employees assigned to their store
         scopeWhere = `((lr.company_id = ANY($1) AND lr.store_id = $2) OR lr.user_id = $3) AND ${buildHierarchyFilter(3)}`;
-        scopeParams = [allowedCompanyIds, effectiveStoreId, userId];
+        scopeParams = [allowedCompanyIds, storeId, userId];
         break;
       case 'area_manager': {
         // Area Manager: Their own leaves + Leaves of store managers under them + Leaves of employees under those store managers
@@ -994,7 +922,13 @@ export const listLeaveRequests = asyncHandler(async (req: Request, res: Response
           scopeParams = [allowedCompanyIds, userId];
         } else {
           // Standard local-only visibility: find managed stores in their own company
-          const storeIds = await resolveAreaManagerStoreIds(userId, allowedCompanyIds);
+          const amStores = await query<{ store_id: number }>(
+            `SELECT DISTINCT store_id FROM users
+             WHERE role = 'store_manager' AND supervisor_id = $1
+               AND company_id = $2 AND status = 'active' AND store_id IS NOT NULL`,
+            [userId, req.user!.companyId],
+          );
+          const storeIds = amStores.map((s) => s.store_id);
           
           if (storeIds.length === 0) {
             scopeWhere = `lr.company_id = ANY($1) AND (lr.user_id = $2 OR lr.current_approver_role = 'area_manager' OR EXISTS (
@@ -1176,14 +1110,7 @@ async function ensureLeaveStoreScope(
   if (isSuperAdmin || role === 'admin' || role === 'hr') return null;
 
   if (role === 'store_manager') {
-    // The JWT store is a login snapshot; a manager assigned to a store after
-    // logging in would otherwise be refused until their next login.
-    const live = await queryOne<{ store_id: number | null }>(
-      `SELECT store_id FROM users WHERE id = $1`,
-      [req.user!.userId],
-    );
-    const ownStoreId = live?.store_id ?? req.user!.storeId;
-    if (requestStoreId == null || ownStoreId == null || requestStoreId !== ownStoreId) {
+    if (requestStoreId == null || requestStoreId !== req.user!.storeId) {
       return 'Questa richiesta non appartiene al tuo negozio';
     }
     return null;
@@ -1192,8 +1119,13 @@ async function ensureLeaveStoreScope(
   if (role === 'area_manager') {
     if (allowedCompanyIds.length > 1) return null;   // group-wide by design
     if (requestStoreId == null) return null;          // company-level request
-    const amStoreIds = await resolveAreaManagerStoreIds(req.user!.userId, allowedCompanyIds);
-    if (!amStoreIds.includes(requestStoreId)) {
+    const amStores = await query<{ store_id: number }>(
+      `SELECT DISTINCT store_id FROM users
+       WHERE role = 'store_manager' AND supervisor_id = $1
+         AND company_id = $2 AND status = 'active' AND store_id IS NOT NULL`,
+      [req.user!.userId, req.user!.companyId],
+    );
+    if (!amStores.some((s) => s.store_id === requestStoreId)) {
       return 'Questa richiesta non è tra i negozi che gestisci';
     }
   }
@@ -1220,61 +1152,37 @@ export const getPendingApprovals = asyncHandler(async (req: Request, res: Respon
   let scopeWhere: string;
   let scopeParams: any[];
 
-  /**
-   * Set when the caller's role is store-scoped but they have no stores to scope
-   * to — a store manager with no store, or an area manager no store manager
-   * reports to. Their queue is then legitimately empty, but "empty" and
-   * "you were never wired up" look identical on screen, which is how a
-   * configuration gap gets mistaken for a broken feature. The UI uses this to
-   * say which one it is.
-   */
-  let scopeIssue: 'no_store_association' | null = null;
-
-  // The store on the JWT is a snapshot from login. A manager whose store was
-  // assigned afterwards carries a stale null, so read the current value.
-  const liveStore = await queryOne<{ store_id: number | null }>(
-    `SELECT store_id FROM users WHERE id = $1`,
-    [userId],
-  );
-  const effectiveStoreId = liveStore?.store_id ?? storeId;
-
   if (isSuperAdmin) {
     scopeWhere = `lr.company_id = ANY($1) AND lr.status IN ('pending','store manager approved','area manager approved')`;
     scopeParams = [allowedCompanyIds];
   } else {
     switch (role) {
       case 'store_manager':
-        if (effectiveStoreId == null) scopeIssue = 'no_store_association';
-        scopeWhere = `lr.company_id = ANY($1) AND lr.current_approver_role IS NOT NULL
-                      AND ${STAGE_RANK_SQL} <= ${getRoleRank('store_manager')}
-                      AND lr.store_id = $2`;
-        scopeParams = [allowedCompanyIds, effectiveStoreId];
+        scopeWhere = `lr.company_id = ANY($1) AND lr.current_approver_role = 'store_manager' AND lr.store_id = $2`;
+        scopeParams = [allowedCompanyIds, storeId];
         break;
       case 'area_manager': {
         const hasCrossCompany = allowedCompanyIds.length > 1;
 
         if (hasCrossCompany) {
           // Cross-company area manager keeps group-wide visibility by design.
-          scopeWhere = `lr.company_id = ANY($1) AND lr.current_approver_role IS NOT NULL
-                        AND ${STAGE_RANK_SQL} <= ${getRoleRank('area_manager')}`;
+          scopeWhere = `lr.company_id = ANY($1) AND lr.current_approver_role = 'area_manager'`;
           scopeParams = [allowedCompanyIds];
         } else {
           // Single-company area manager: restrict to the stores they supervise
           // (plus company-level requests with no store), matching listLeaveRequests.
-          const supervisedStoreIds = await resolveAreaManagerStoreIds(userId, allowedCompanyIds);
+          const amStores = await query<{ store_id: number }>(
+            `SELECT DISTINCT store_id FROM users
+             WHERE role = 'store_manager' AND supervisor_id = $1
+               AND company_id = $2 AND status = 'active' AND store_id IS NOT NULL`,
+            [userId, req.user!.companyId],
+          );
+          const supervisedStoreIds = amStores.map((s) => s.store_id);
           if (supervisedStoreIds.length === 0) {
-            // The area manager is not assigned to a store and no store manager
-            // reports to them, so there are no stores to scope to. Flagged
-            // rather than silently empty.
-            scopeIssue = 'no_store_association';
-            scopeWhere = `lr.company_id = ANY($1) AND lr.current_approver_role IS NOT NULL
-                          AND ${STAGE_RANK_SQL} <= ${getRoleRank('area_manager')}
-                          AND lr.store_id IS NULL`;
+            scopeWhere = `lr.company_id = ANY($1) AND lr.current_approver_role = 'area_manager' AND lr.store_id IS NULL`;
             scopeParams = [allowedCompanyIds];
           } else {
-            scopeWhere = `lr.company_id = ANY($1) AND lr.current_approver_role IS NOT NULL
-                          AND ${STAGE_RANK_SQL} <= ${getRoleRank('area_manager')}
-                          AND (lr.store_id = ANY($2::int[]) OR lr.store_id IS NULL)`;
+            scopeWhere = `lr.company_id = ANY($1) AND lr.current_approver_role = 'area_manager' AND (lr.store_id = ANY($2::int[]) OR lr.store_id IS NULL)`;
             scopeParams = [allowedCompanyIds, supervisedStoreIds];
           }
         }
@@ -1284,9 +1192,8 @@ export const getPendingApprovals = asyncHandler(async (req: Request, res: Respon
       case 'admin':
       default:
         // Updated: allow HR/Admin to see pending requests across all allowed companies in group
-        scopeWhere = `lr.company_id = ANY($1) AND lr.current_approver_role IS NOT NULL
-                      AND ${STAGE_RANK_SQL} <= ${getRoleRank(role)}`;
-        scopeParams = [allowedCompanyIds];
+        scopeWhere = `lr.company_id = ANY($1) AND lr.current_approver_role = $2`;
+        scopeParams = [allowedCompanyIds, role];
         break;
     }
   }
@@ -1351,33 +1258,17 @@ export const getPendingApprovals = asyncHandler(async (req: Request, res: Respon
     scopeParams,
   );
 
-  // The caller is only hidden from their own queue while they are genuinely away
-  // on granted leave. A request they have merely submitted no longer counts.
-  const callerAway = await isUserOnLeave(
-    req.user!.userId,
-    new Date().toISOString().split('T')[0],
-    new Date().toISOString().split('T')[0],
-  );
-  const filteredRequests = callerAway ? [] : requests;
+  const filteredRequests = [];
+  for (const lr of requests) {
+    const startStr = lr.start_date instanceof Date ? lr.start_date.toISOString().split('T')[0] : lr.start_date;
+    const endStr = lr.end_date instanceof Date ? lr.end_date.toISOString().split('T')[0] : lr.end_date;
+    const callerOnLeave = await isUserOnLeave(req.user!.userId, startStr, endStr);
+    if (!callerOnLeave) {
+      filteredRequests.push(lr);
+    }
+  }
 
-  // Who among this company's approvers is away right now, so the UI can say so
-  // by name and dates instead of leaving an unexplained gap.
-  const approversOnLeave = req.user!.companyId
-    ? await loadApproversOnLeave(
-        req.user!.companyId,
-        Array.from(new Set(requests.map((r: any) => r.store_id).filter((v: any) => v != null))) as number[],
-      )
-    : [];
-
-  // scope_issue distinguishes "nothing to approve" from "you have no stores
-  // assigned, so nothing could ever appear here".
-  ok(res, {
-    requests: filteredRequests,
-    total: filteredRequests.length,
-    scope_issue: scopeIssue,
-    caller_on_leave: callerAway,
-    approvers_on_leave: approversOnLeave,
-  });
+  ok(res, { requests: filteredRequests, total: filteredRequests.length });
 });
 
 // ---------------------------------------------------------------------------
@@ -1457,21 +1348,13 @@ export const approveLeave = asyncHandler(async (req: Request, res: Response) => 
   const stageRole = leaveRequest.current_approver_role;
   const isOverride = (role === 'admin' || role === 'hr') && (emergency_override === true);
 
-  // Anyone at or above the current stage may act. An area manager does not have
-  // to wait for the store manager: the request is visible to both from the
-  // moment it is created, and whoever gets to it first decides. Approving from
-  // a higher rung simply skips the rungs below, which is what "approve directly"
-  // means. Only someone whose own stage has already been passed is refused.
-  const stageRank = getRoleRank(stageRole ?? undefined);
-  const callerRank = getRoleRank(effectiveRole);
-
-  if (!isSuperAdmin && !isOverride && role !== 'admin' && callerRank < stageRank) {
+  if (!isSuperAdmin && !isOverride && role !== 'admin' && stageRole !== effectiveRole) {
     // Naming the current approver turns a dead end into something actionable:
     // the reader knows who to chase instead of just being refused.
     res.status(403).json({
       success: false,
-      error: `Questa richiesta è già passata al livello ${stageRole ?? 'successivo'}: il tuo ruolo (${effectiveRole}) ha già avuto la possibilità di intervenire.`,
-      code: 'LEAVE_STAGE_ALREADY_PASSED',
+      error: `Questa richiesta è in attesa di ${stageRole ?? 'un altro livello'}, non del tuo ruolo (${effectiveRole}). Potrai intervenire quando arriverà al tuo livello.`,
+      code: 'LEAVE_NOT_RESPONSIBLE',
       details: { yourRole: effectiveRole, waitingOn: stageRole },
     });
     return;
@@ -1850,13 +1733,13 @@ export const rejectLeave = asyncHandler(async (req: Request, res: Response) => {
 
   const stageRole = leaveRequest.current_approver_role;
   const isOverride = (role === 'admin' || role === 'hr') && (emergency_override === true);
-  // Mirror approveLeave: any rung at or above the current stage may reject.
-  if (!isSuperAdmin && !isOverride && role !== 'admin'
-      && getRoleRank(effectiveRole) < getRoleRank(stageRole ?? undefined)) {
+  if (!isSuperAdmin && !isOverride && role !== 'admin' && stageRole !== effectiveRole) {
+    // Naming the current approver turns a dead end into something actionable:
+    // the reader knows who to chase instead of just being refused.
     res.status(403).json({
       success: false,
-      error: `Questa richiesta è già passata al livello ${stageRole ?? 'successivo'}: il tuo ruolo (${effectiveRole}) ha già avuto la possibilità di intervenire.`,
-      code: 'LEAVE_STAGE_ALREADY_PASSED',
+      error: `Questa richiesta è in attesa di ${stageRole ?? 'un altro livello'}, non del tuo ruolo (${effectiveRole}). Potrai intervenire quando arriverà al tuo livello.`,
+      code: 'LEAVE_NOT_RESPONSIBLE',
       details: { yourRole: effectiveRole, waitingOn: stageRole },
     });
     return;
@@ -2133,15 +2016,18 @@ export const getBalance = asyncHandler(async (req: Request, res: Response) => {
         [requestedId, allowedCompanyIds],
       );
     } else {
-      const scopedStoreIds = await resolveAreaManagerStoreIds(userId, allowedCompanyIds);
       allowed = await queryOne<{ id: number }>(
         `SELECT u.id FROM users u
          WHERE u.id = $1 AND u.company_id = ANY($2)
            AND (
-             u.store_id = ANY($4::int[])
+             u.store_id IN (
+               SELECT DISTINCT store_id FROM users
+               WHERE role = 'store_manager' AND supervisor_id = $3
+                 AND company_id = ANY($2) AND status = 'active' AND store_id IS NOT NULL
+             )
              OR u.supervisor_id = $3 -- Direct subordinates (Store Managers)
            )`,
-        [requestedId, allowedCompanyIds, userId, scopedStoreIds],
+        [requestedId, allowedCompanyIds, userId],
       );
     }
 

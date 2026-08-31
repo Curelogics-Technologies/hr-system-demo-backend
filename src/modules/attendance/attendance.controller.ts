@@ -6,7 +6,6 @@ import { ok, created, badRequest, conflict, forbidden, notFound } from '../../ut
 import { asyncHandler } from '../../utils/asyncHandler';
 import { signQrToken2, verifyQrToken2 } from '../../config/jwt';
 import { resolveAllowedCompanyIds } from '../../utils/companyScope';
-import { resolveAreaManagerStoreIds } from '../../utils/storeScope';
 import { coalescedShiftPointUtcSql, DEFAULT_SHIFT_TIMEZONE, normalizeShiftTimezone } from '../../utils/shiftTimezone';
 import { sendNotification } from '../notifications/notifications.service';
 import { t } from '../../utils/i18n';
@@ -797,7 +796,13 @@ export const listAttendanceEvents = asyncHandler(async (req: Request, res: Respo
     params.push(storeId);
     idx++;
   } else if (role === 'area_manager') {
-    const managedIds = await resolveAreaManagerStoreIds(userId, allowedCompanyIds);
+    const managedRows = await query<{ store_id: number }>(
+      `SELECT DISTINCT store_id FROM users
+       WHERE role = 'store_manager' AND supervisor_id = $1 AND company_id = ANY($2)
+         AND status = 'active' AND store_id IS NOT NULL`,
+      [userId, allowedCompanyIds],
+    );
+    const managedIds = managedRows.map((r) => r.store_id);
     if (managedIds.length === 0) {
       ok(res, { events: [], total: 0, has_more: false });
       return;
@@ -1753,7 +1758,13 @@ export const getAnomalies = asyncHandler(async (req: Request, res: Response) => 
   // Resolve managed store IDs once (used for both shifts and events scoping)
   let managedStoreIds: number[] | null = null;
   if (role === 'area_manager') {
-    managedStoreIds = await resolveAreaManagerStoreIds(userId, allowedCompanyIds);
+    const rows = await query<{ store_id: number }>(
+      `SELECT DISTINCT store_id FROM users
+       WHERE role = 'store_manager' AND supervisor_id = $1 AND company_id = ANY($2)
+         AND status = 'active' AND store_id IS NOT NULL`,
+      [userId, allowedCompanyIds],
+    );
+    managedStoreIds = rows.map((r) => r.store_id);
     if (managedStoreIds.length === 0) {
       ok(res, { anomalies: [], total: 0 });
       return;
