@@ -87,3 +87,32 @@ export function coalescedShiftPointUtcSql(
 ): string {
   return `COALESCE(${utcExpression}, ${shiftPointToUtcSql(dateExpression, timeExpression, timezoneExpression)})`;
 }
+
+/**
+ * The timezone a shift must be stored in: the one configured on the store it
+ * belongs to, never the one the caller's browser happens to be set to.
+ *
+ * A shift is an instruction to be somewhere at a wall-clock time — "09:00 at
+ * Varese". The only zone that can turn that into a real instant is the store's.
+ * Sourcing it from the client meant a manager on a laptop set to America/Chicago
+ * stored "09:00 Chicago" (14:00 UTC) for an Italian shop, and the clock-in gate
+ * opened at 15:45 Italian time. Her own calendar converted it back to her own
+ * zone, so it looked correct to the only person able to see it.
+ *
+ * Falls back to the default when the store row carries no timezone: `stores`
+ * was backfilled by migration 051 and both store write paths normalise it, but
+ * the column is still nullable and the seed script inserts without it.
+ */
+export async function resolveStoreTimezone(
+  storeId: number | null | undefined,
+  companyId: number | null | undefined,
+  runQuery: (sql: string, params: unknown[]) => Promise<Array<{ timezone: string | null }>>,
+  fallback: string = DEFAULT_SHIFT_TIMEZONE,
+): Promise<string> {
+  if (storeId == null || companyId == null) return fallback;
+  const rows = await runQuery(
+    `SELECT timezone FROM stores WHERE id = $1 AND company_id = $2 LIMIT 1`,
+    [storeId, companyId],
+  );
+  return normalizeShiftTimezone(rows[0]?.timezone, fallback);
+}
