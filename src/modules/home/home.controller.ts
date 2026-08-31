@@ -962,8 +962,11 @@ export const getHomeData = asyncHandler(async (req: Request, res: Response) => {
         ok(res, { store: null });
         break;
       }
+      // The terminal screen shows a clock, and the clock-in window it is about to
+      // open is enforced in the store's zone — so the screen has to know which zone
+      // that is, or it silently shows the tablet's own clock instead.
       const store = await queryOne(
-        `SELECT id, name, code FROM stores WHERE id = $1 AND company_id = $2`,
+        `SELECT id, name, code, timezone FROM stores WHERE id = $1 AND company_id = $2`,
         [storeId, companyId]
       );
       ok(res, { store });
