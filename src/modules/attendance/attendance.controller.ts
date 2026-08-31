@@ -6,6 +6,7 @@ import { ok, created, badRequest, conflict, forbidden, notFound } from '../../ut
 import { asyncHandler } from '../../utils/asyncHandler';
 import { signQrToken2, verifyQrToken2 } from '../../config/jwt';
 import { resolveAllowedCompanyIds } from '../../utils/companyScope';
+import { resolveAreaManagerStoreIds } from '../../utils/storeScope';
 import { coalescedShiftPointUtcSql, DEFAULT_SHIFT_TIMEZONE, normalizeShiftTimezone } from '../../utils/shiftTimezone';
 import { sendNotification } from '../notifications/notifications.service';
 import { t } from '../../utils/i18n';
@@ -103,16 +104,6 @@ function isSameRegisteredDeviceProfile(registeredMetadata: any, currentMetadata:
     || (osMatches && deviceMatchCount >= 2 && score >= 4);
 }
 
-function subtractMinutesFromTime(timeStr: string, minutes: number): string {
-  const [h, m] = timeStr.split(':').map(Number);
-  let totalMinutes = h * 60 + m - minutes;
-  if (totalMinutes < 0) {
-    totalMinutes += 24 * 60;
-  }
-  const nh = Math.floor(totalMinutes / 60);
-  const nm = totalMinutes % 60;
-  return `${String(nh).padStart(2, '0')}:${String(nm).padStart(2, '0')}`;
-}
 
 // ---------------------------------------------------------------------------
 // GET /api/qr/generate?store_id=N
@@ -464,29 +455,60 @@ export const checkin = asyncHandler(async (req: Request, res: Response) => {
       return;
     }
 
-    // Check if there is ANY shift scheduled for this user today at this store in their local timezone date
-    const todayShift = await queryOne<{ start_time: string }>(
-      `SELECT start_time
+    // Check if there is ANY shift scheduled for this user today at this store in their local timezone date.
+    // The gate above admits [start_at_utc - 15min, end_at_utc]; this message must be
+    // derived from those same instants, not from wall-clock string arithmetic, or it
+    // contradicts the very check that rejected the employee. It also has to say WHICH
+    // side of the window they are on: before the fix, arriving after the shift had
+    // ended produced 'you can clock in from 08:45, try later' at six in the evening.
+    const todayShift = await queryOne<{
+      start_time: string;
+      shift_timezone: string;
+      start_at_utc: string;
+      end_at_utc: string;
+    }>(
+      `SELECT start_time,
+              ${SHIFT_TIMEZONE_SQL} AS shift_timezone,
+              ${SHIFT_START_UTC_SQL} AS start_at_utc,
+              ${SHIFT_END_UTC_SQL} AS end_at_utc
        FROM shifts s
        WHERE s.company_id = $1
          AND s.user_id = $2
          AND s.store_id = $3
          AND s.status != 'cancelled'
          AND s.date = (NOW() AT TIME ZONE ${SHIFT_TIMEZONE_SQL})::DATE
+       ORDER BY ${SHIFT_START_UTC_SQL}
        LIMIT 1`,
       [companyId, user_id, payload.storeId],
     );
 
     if (todayShift && event_type === 'checkin') {
-      const allowedFrom = subtractMinutesFromTime(todayShift.start_time, 15);
+      const tz = normalizeShiftTimezone(todayShift.shift_timezone, DEFAULT_SHIFT_TIMEZONE);
+      const startUtc = new Date(todayShift.start_at_utc);
+      const endUtc = new Date(todayShift.end_at_utc);
+      const opensUtc = new Date(startUtc.getTime() - 15 * 60 * 1000);
+      const now = new Date();
+
+      const shiftStart = formatInTimezone(startUtc, tz);
+      const shiftEnd = formatInTimezone(endUtc, tz);
+      const allowedFrom = formatInTimezone(opensUtc, tz);
+      const currentTime = formatInTimezone(now, tz);
+
+      if (now.getTime() > endUtc.getTime()) {
+        badRequest(
+          res,
+          `Il tuo turno di oggi (${shiftStart}-${shiftEnd}, ora di ${tz}) è già terminato. Adesso sono le ${currentTime}. Contatta il responsabile.`,
+          'SHIFT_ALREADY_ENDED',
+          { shiftStart, shiftEnd, currentTime, storeTimezone: tz },
+        );
+        return;
+      }
+
       badRequest(
         res,
-        `Il tuo turno per oggi inizia alle ${todayShift.start_time.slice(0, 5)} e puoi timbrare a partire dalle ${allowedFrom}. Riprova più tardi.`,
+        `Il tuo turno inizia alle ${shiftStart} (ora di ${tz}) e puoi timbrare dalle ${allowedFrom}. Adesso sono le ${currentTime}.`,
         'SHIFT_TOO_EARLY',
-        {
-          shiftStart: todayShift.start_time.slice(0, 5),
-          allowedFrom
-        }
+        { shiftStart, shiftEnd, allowedFrom, currentTime, storeTimezone: tz },
       );
       return;
     }
@@ -796,13 +818,7 @@ export const listAttendanceEvents = asyncHandler(async (req: Request, res: Respo
     params.push(storeId);
     idx++;
   } else if (role === 'area_manager') {
-    const managedRows = await query<{ store_id: number }>(
-      `SELECT DISTINCT store_id FROM users
-       WHERE role = 'store_manager' AND supervisor_id = $1 AND company_id = ANY($2)
-         AND status = 'active' AND store_id IS NOT NULL`,
-      [userId, allowedCompanyIds],
-    );
-    const managedIds = managedRows.map((r) => r.store_id);
+    const managedIds = await resolveAreaManagerStoreIds(userId, allowedCompanyIds);
     if (managedIds.length === 0) {
       ok(res, { events: [], total: 0, has_more: false });
       return;
@@ -1427,7 +1443,18 @@ export async function calculateAnomaliesForRange(
     `SELECT s.id, s.company_id, s.user_id, s.store_id, TO_CHAR(s.date, 'YYYY-MM-DD') AS date,
             s.start_time, s.end_time, s.break_start, s.break_end, s.break_minutes,
             u.name AS user_name, u.surname AS user_surname, u.avatar_filename AS user_avatar_filename,
-            st.name AS store_name, COALESCE(NULLIF(BTRIM(st.timezone), ''), '${DEFAULT_SHIFT_TIMEZONE_SQL}') AS store_timezone
+            st.name AS store_name,
+            -- The gate in recordEvent resolves a shift's instants from s.timezone.
+            -- Reading st.timezone here instead meant the two disagreed whenever a
+            -- shift carried the wrong zone: the dashboard called the Varese four
+            -- absent at 09:10 while the terminal was still telling them it was too
+            -- early. One source of truth — the shift's own zone, the store's only
+            -- as a fallback for legacy rows that never had one.
+            COALESCE(
+              NULLIF(BTRIM(s.timezone), ''),
+              NULLIF(BTRIM(st.timezone), ''),
+              '${DEFAULT_SHIFT_TIMEZONE_SQL}'
+            ) AS store_timezone
      FROM shifts s
      LEFT JOIN users u  ON u.id  = s.user_id
      LEFT JOIN stores st ON st.id = s.store_id
@@ -1758,13 +1785,7 @@ export const getAnomalies = asyncHandler(async (req: Request, res: Response) => 
   // Resolve managed store IDs once (used for both shifts and events scoping)
   let managedStoreIds: number[] | null = null;
   if (role === 'area_manager') {
-    const rows = await query<{ store_id: number }>(
-      `SELECT DISTINCT store_id FROM users
-       WHERE role = 'store_manager' AND supervisor_id = $1 AND company_id = ANY($2)
-         AND status = 'active' AND store_id IS NOT NULL`,
-      [userId, allowedCompanyIds],
-    );
-    managedStoreIds = rows.map((r) => r.store_id);
+    managedStoreIds = await resolveAreaManagerStoreIds(userId, allowedCompanyIds);
     if (managedStoreIds.length === 0) {
       ok(res, { anomalies: [], total: 0 });
       return;

@@ -508,7 +508,48 @@ export const updateStore = asyncHandler(async (req: Request, res: Response) => {
     ]
   );
   if (!store) { notFound(res, 'Negozio non trovato'); return; }
-  ok(res, store, 'Negozio aggiornato');
+
+  // Correcting a shop's timezone has to carry its roster with it, or the shifts
+  // keep the old zone and reproduce exactly the fault this release fixes: a
+  // clock-in window that opens at the wrong hour. The wall clock is deliberately
+  // left alone — '09:00 at this shop' still means 09:00 at this shop — only the
+  // instants derived from it move.
+  //
+  // Future shifts only. Past ones are the historical record behind attendance and
+  // reports that have already been read, and are not rewritten.
+  let restampedShifts = 0;
+  if (storeRow?.timezone !== normalizedTimezone) {
+    const restamped = await query<{ id: number }>(
+      `UPDATE shifts s
+       SET timezone = $1,
+           start_at_utc = ((s.date::timestamp + s.start_time) AT TIME ZONE $1),
+           end_at_utc = ((s.date::timestamp
+                          + (CASE WHEN s.end_time < s.start_time THEN INTERVAL '1 day' ELSE INTERVAL '0' END)
+                          + s.end_time) AT TIME ZONE $1),
+           break_start_at_utc = CASE WHEN s.break_start IS NULL THEN NULL ELSE ((s.date::timestamp
+                          + (CASE WHEN s.break_start < s.start_time THEN INTERVAL '1 day' ELSE INTERVAL '0' END)
+                          + s.break_start) AT TIME ZONE $1) END,
+           break_end_at_utc = CASE WHEN s.break_end IS NULL THEN NULL ELSE ((s.date::timestamp
+                          + (CASE WHEN s.break_end < s.start_time THEN INTERVAL '1 day' ELSE INTERVAL '0' END)
+                          + s.break_end) AT TIME ZONE $1) END,
+           split_start2_at_utc = CASE WHEN s.split_start2 IS NULL THEN NULL ELSE ((s.date::timestamp
+                          + (CASE WHEN s.split_start2 < s.start_time THEN INTERVAL '1 day' ELSE INTERVAL '0' END)
+                          + s.split_start2) AT TIME ZONE $1) END,
+           split_end2_at_utc = CASE WHEN s.split_end2 IS NULL THEN NULL ELSE ((s.date::timestamp
+                          + (CASE WHEN s.split_end2 < s.start_time THEN INTERVAL '1 day' ELSE INTERVAL '0' END)
+                          + s.split_end2) AT TIME ZONE $1) END,
+           updated_at = NOW()
+       WHERE s.store_id = $2
+         AND s.company_id = $3
+         AND s.date >= CURRENT_DATE
+         AND COALESCE(NULLIF(BTRIM(s.timezone), ''), '') IS DISTINCT FROM $1
+       RETURNING s.id`,
+      [normalizedTimezone, storeId, targetCompanyId],
+    );
+    restampedShifts = restamped.length;
+  }
+
+  ok(res, { ...store, restamped_shifts: restampedShifts }, 'Negozio aggiornato');
 });
 
 // DELETE /api/stores/:id — Admin/HR (within allowed companies, soft delete)

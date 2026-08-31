@@ -9,6 +9,7 @@ uploads/company-banners/*
 uploads/store-logos/*
 !uploads/.gitkeep
 
+.env
 .claude-flow/
 src/modules/externalAffluence/local-only/
 temp_auto_push.bat
@@ -25,3 +26,6 @@ branch_structure.json
 .env.*.local
 !.env.example
 !.env.test
+
+# rollback snapshots written by repair:shift-timezones
+shift-timezone-rollback-*.json

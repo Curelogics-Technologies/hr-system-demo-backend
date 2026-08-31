@@ -6,6 +6,9 @@ import path from 'path';
 import { pool, query, queryOne } from '../../config/database';
 import { ok, created, notFound, conflict, forbidden, badRequest } from '../../utils/response';
 import { asyncHandler } from '../../utils/asyncHandler';
+import { recordHeadcountEvent } from '../billing/headcount.service';
+import { assertLicenseCapacity } from '../billing/license.service';
+import { resolveAreaManagerStoreIds } from '../../utils/storeScope';
 import { UserRole } from '../../config/jwt';
 import {
   resolveAllowedCompanyIds,
@@ -15,8 +18,6 @@ import {
 import { emitToCompany } from '../../config/socket';
 import { emailService } from '../../services/email.service';
 import { sendWelcomeEmailAutomation } from '../automations/welcomeEmail';
-import { recordHeadcountEvent } from '../billing/headcount.service';
-import { assertLicenseCapacity } from '../billing/license.service';
 
 // Safe fields for list view (NO sensitive data)
 const LIST_FIELDS = `
@@ -246,15 +247,7 @@ export const listEmployees = asyncHandler(async (req: Request, res: Response) =>
   const forShiftPlanning = for_shift_planning === 'true' || for_shift_planning === '1';
 
   if (forShiftPlanning && role === 'area_manager') {
-    const managedStores = await query<{ store_id: number }>(
-      `SELECT DISTINCT store_id FROM users
-       WHERE role = 'store_manager'
-         AND supervisor_id = $1
-         AND company_id = ANY($2)
-         AND status = 'active' AND store_id IS NOT NULL`,
-      [userId, allowedCompanyIds],
-    );
-    const storeIds = managedStores.map((r) => r.store_id);
+    const storeIds = await resolveAreaManagerStoreIds(userId, allowedCompanyIds);
     if (storeIds.length === 0) {
       ok(res, { employees: [], total: 0, page: pageNum, limit: limitNum, pages: 0 });
       return;
@@ -1230,7 +1223,6 @@ export const deactivateEmployee = asyncHandler(async (req: Request, res: Respons
     notFound(res, 'Dipendente non trovato o già disattivato');
     return;
   }
-
   // Billing ledger: the billed headcount just went down. The reduction is not
   // refunded — it takes effect at the next renewal — but it must be recorded.
   void recordHeadcountEvent({
@@ -1349,7 +1341,6 @@ export const activateEmployee = asyncHandler(async (req: Request, res: Response)
     notFound(res, 'Dipendente non trovato o già attivo');
     return;
   }
-
   void recordHeadcountEvent({
     companyId: (employee as any).company_id ?? req.user!.companyId!,
     resourceType: (employee as any).role === 'store_terminal' ? 'terminal' : 'employee',

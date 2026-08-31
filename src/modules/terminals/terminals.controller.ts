@@ -2,9 +2,9 @@ import { Request, Response } from 'express';
 import { pool, query, queryOne } from '../../config/database';
 import { ok, created, badRequest, conflict, notFound } from '../../utils/response';
 import { asyncHandler } from '../../utils/asyncHandler';
+import { assertLicenseCapacity } from '../billing/license.service';
 import bcrypt from 'bcryptjs';
 import { resolveAllowedCompanyIds } from '../../utils/companyScope';
-import { assertLicenseCapacity } from '../billing/license.service';
 
 /**
  * Whether the terminal has actually completed device registration.
@@ -118,7 +118,10 @@ export const listTerminals = asyncHandler(async (req: Request, res: Response) =>
       TRIM(CONCAT(cb.name, ' ', cb.surname)) AS created_by_name,
       TRIM(CONCAT(ub.name, ' ', ub.surname)) AS updated_by_name,
       c.name as company_name,
-      s.name as store_name
+      s.name as store_name,
+      -- The store's clock, shown beside the terminal: the clock-in window this
+      -- terminal opens is judged on it, not on the tablet's own setting.
+      s.timezone as store_timezone
     FROM users u
     LEFT JOIN companies c ON c.id = u.company_id
     LEFT JOIN stores s ON s.id = u.store_id
@@ -155,6 +158,9 @@ export const listStoresWithTerminalStatus = asyncHandler(async (req: Request, re
       s.cap, 
       s.max_staff, 
       s.company_id,
+      -- The clock this store's shifts and clock-ins run on. Shown next to the
+      -- terminal so whoever sets it up can see it is not necessarily their own.
+      s.timezone,
       c.name as company_name,
       -- Any terminal account at all, regardless of whether it is currently
       -- enabled. Filtering on status here used to let a store with a disabled

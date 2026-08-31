@@ -6,7 +6,7 @@ import { asyncHandler } from '../../utils/asyncHandler';
 import { UserRole } from '../../config/jwt';
 import { resolveAllowedCompanyIds } from '../../utils/companyScope';
 import { validateShiftCrossFields } from './shifts.routes';
-import { coalescedShiftPointUtcSql, DEFAULT_SHIFT_TIMEZONE, normalizeShiftTimezone } from '../../utils/shiftTimezone';
+import { coalescedShiftPointUtcSql, DEFAULT_SHIFT_TIMEZONE, normalizeShiftTimezone, resolveStoreTimezone } from '../../utils/shiftTimezone';
 import { sendNotification } from '../notifications/notifications.service';
 import { sendShiftCreatedAutomation } from '../automations/shiftNotification';
 import { t } from '../../utils/i18n';
@@ -381,7 +381,8 @@ async function buildShiftScope(
 export const listShifts = asyncHandler(async (req: Request, res: Response) => {
   const { role, userId, storeId } = req.user!;
   const { week, month, start_date, end_date, store_id, user_id, company_id, timezone } = req.query as Record<string, string>;
-  const displayTimezone = normalizeShiftTimezone(timezone, DEFAULT_SHIFT_TIMEZONE);
+  // `timezone` is still accepted so an older cached bundle keeps working, but it
+  // no longer influences which shifts come back — see the date filter below.
 
   const allowedCompanyIds = await resolveAllowedCompanyIds(req.user!);
   const { where, params } = await buildShiftScope(role, allowedCompanyIds, userId, storeId);
@@ -399,20 +400,27 @@ export const listShifts = asyncHandler(async (req: Request, res: Response) => {
       if (weekNum < 1 || weekNum > 53) {
         badRequest(res, 'Settimana non valida: deve essere tra 1 e 53'); return;
       }
+      // A shift belongs to the week its DATE falls in — a property of the shift,
+      // not of whoever is looking at it. Bounding by instants converted through the
+      // viewer's timezone made the answer depend on the viewer: a browser west of
+      // the store pushed the boundary forward and dropped early-Monday shifts off
+      // the calendar. This matches the start_date/end_date branch below and is
+      // correct for a store in any country.
       const weekToken = `${yr}-${wk.padStart(2, '0')}`;
-      extraWhere += ` AND ${SHIFT_START_UTC_SQL} >= ((DATE_TRUNC('week', TO_DATE($${idx}, 'IYYY-IW'))::DATE)::timestamp AT TIME ZONE $${idx + 1})`;
-      extraWhere += ` AND ${SHIFT_START_UTC_SQL} < (((DATE_TRUNC('week', TO_DATE($${idx}, 'IYYY-IW'))::DATE + INTERVAL '7 days')::timestamp) AT TIME ZONE $${idx + 1})`;
-      extra.push(weekToken, displayTimezone);
-      idx += 2;
+      extraWhere += ` AND s.date >= DATE_TRUNC('week', TO_DATE($${idx}, 'IYYY-IW'))::DATE`;
+      extraWhere += ` AND s.date < (DATE_TRUNC('week', TO_DATE($${idx}, 'IYYY-IW'))::DATE + INTERVAL '7 days')`;
+      extra.push(weekToken);
+      idx += 1;
     }
   } else if (month) {
     const match = month.match(/^(\d{4})-(\d{2})$/);
     if (match) {
+      // Same reasoning as the week branch: filter on the shift's own calendar date.
       const monthStart = `${month}-01`;
-      extraWhere += ` AND ${SHIFT_START_UTC_SQL} >= (($${idx}::DATE)::timestamp AT TIME ZONE $${idx + 1})`;
-      extraWhere += ` AND ${SHIFT_START_UTC_SQL} < (((DATE_TRUNC('month', $${idx}::DATE) + INTERVAL '1 month')::timestamp) AT TIME ZONE $${idx + 1})`;
-      extra.push(monthStart, displayTimezone);
-      idx += 2;
+      extraWhere += ` AND s.date >= $${idx}::DATE`;
+      extraWhere += ` AND s.date < (DATE_TRUNC('month', $${idx}::DATE) + INTERVAL '1 month')`;
+      extra.push(monthStart);
+      idx += 1;
     }
   } else if (start_date && end_date) {
     extraWhere += ` AND s.date >= $${idx}::DATE AND s.date <= $${idx + 1}::DATE`;
@@ -645,7 +653,10 @@ export const createShift = asyncHandler(async (req: Request, res: Response) => {
   }
 
   const isFlexible = body.break_type === 'flexible';
-  const shiftTimezone = normalizeShiftTimezone(body.timezone, DEFAULT_SHIFT_TIMEZONE);
+  // The zone belongs to the shop the shift is worked at, never to the browser
+  // that created it. body.timezone is still accepted so an older cached bundle
+  // keeps working, but it no longer decides anything.
+  const shiftTimezone = await resolveStoreTimezone(body.store_id, effectiveCompanyId, query);
   const nBreakStart = normalizeTime(body.break_start);
   const nBreakEnd = normalizeTime(body.break_end);
   const nSplitS2 = normalizeTime(body.split_start2);
@@ -832,7 +843,9 @@ export const updateShift = asyncHandler(async (req: Request, res: Response) => {
   const targetStatus = (targetIsOffDay
     ? 'cancelled'
     : (body.status ?? existing.status)) as 'scheduled' | 'confirmed' | 'cancelled';
-  const targetShiftTimezone = normalizeShiftTimezone(body.timezone, existing.timezone ?? DEFAULT_SHIFT_TIMEZONE);
+  // Resolved from the TARGET store, so moving a shift to another shop moves its
+  // clock with it — previously the zone stayed behind on the old store.
+  const targetShiftTimezone = await resolveStoreTimezone(targetStoreId, effectiveCompanyId, query);
 
   const targetStart = body.start_time ?? existing.start_time;
   const targetEnd = body.end_time ?? existing.end_time;
@@ -1287,6 +1300,13 @@ export const copyWeek = asyncHandler(async (req: Request, res: Response) => {
 
   const source_monday = sourceMondayRow!.source_monday;
   const target_monday = targetMondayRow!.target_monday;
+  // Copy-week never crosses stores — the same store_id filters the source and is
+  // written to the copies — so this is resolved once for the whole batch. Taking
+  // it from the source shift instead would clone a bad zone into the new week and
+  // lock the same employees out all over again.
+  // Scoped by the company that actually owns these shifts, not allowedCompanyIds[0],
+  // which is the wrong entry for a caller who spans more than one company.
+  const copyTargetTimezone = await resolveStoreTimezone(store_id, sourceShifts[0].company_id, query);
   const sourceMondayDate = new Date(`${source_monday}T12:00:00`);
   const targetMondayDate = new Date(`${target_monday}T12:00:00`);
   let skippedOffDay = 0;
@@ -1321,7 +1341,7 @@ export const copyWeek = asyncHandler(async (req: Request, res: Response) => {
       continue;
     }
 
-    const copiedTimezone = normalizeShiftTimezone(s.timezone, DEFAULT_SHIFT_TIMEZONE);
+    const copiedTimezone = copyTargetTimezone;
     const overlapMain = await queryOne<{ id: number }>(
       `SELECT id FROM shifts
        WHERE company_id = $1
@@ -2203,7 +2223,8 @@ export const importTemplate = asyncHandler(async (req: Request, res: Response) =
 export const importShifts = asyncHandler(async (req: Request, res: Response) => {
   const { companyId, userId: callerId, role, storeId: callerStoreId } = req.user!;
   const file = (req as any).file as Express.Multer.File | undefined;
-  const importTimezone = normalizeShiftTimezone((req.body as Record<string, unknown> | undefined)?.timezone, DEFAULT_SHIFT_TIMEZONE);
+  // The multipart `timezone` field is still accepted and ignored: each row now
+  // takes the zone of the store its store_code resolves to.
 
   if (!file) {
     badRequest(res, 'Nessun file fornito', 'VALIDATION_ERROR');
@@ -2315,8 +2336,8 @@ export const importShifts = asyncHandler(async (req: Request, res: Response) => 
         continue;
       }
 
-      const targetStore = await queryOne<{ id: number }>(
-        `SELECT id FROM stores WHERE code = $1 AND company_id = $2 AND is_active = true`,
+      const targetStore = await queryOne<{ id: number; timezone: string | null }>(
+        `SELECT id, timezone FROM stores WHERE code = $1 AND company_id = $2 AND is_active = true`,
         [storeCodeVal, companyId],
       );
       if (!targetStore) {
@@ -2381,7 +2402,10 @@ export const importShifts = asyncHandler(async (req: Request, res: Response) => 
         storeId,
         userId,
         dateVal,
-        importTimezone,
+        // Per row: each spreadsheet line names its own store, so each takes that
+        // store's zone. A single zone for the whole file would be wrong the moment
+        // an import spans two shops in different countries.
+        normalizeShiftTimezone(targetStore.timezone, DEFAULT_SHIFT_TIMEZONE),
         startTime,
         endTime,
         breakStart ?? null,
@@ -2406,17 +2430,28 @@ export const importShifts = asyncHandler(async (req: Request, res: Response) => 
     const COLS = 17;
     const placeholders = validRows.map((_, ri) => {
       const b = ri * COLS + 1;
+      // A point at or before the start time belongs to the following day — a
+      // 22:00-06:00 shift ends at the 06:00 of tomorrow, not of the shift date.
+      // create and update already rolled the date over; the bulk import did not,
+      // so an imported overnight shift was stored as ending before it began.
+      const rollsOver = (idx: number) =>
+        `(CASE WHEN $${idx}::TIME < $${b+5}::TIME THEN INTERVAL '1 day' ELSE INTERVAL '0' END)`;
+      const pointUtc = (idx: number) =>
+        `(($${b+3}::DATE + ${rollsOver(idx)} + $${idx}::TIME) AT TIME ZONE $${b+4})`;
+      const nullablePointUtc = (idx: number) =>
+        `CASE WHEN $${idx}::TIME IS NULL THEN NULL ELSE ${pointUtc(idx)} END`;
+
       return `(
         $${b}, $${b+1}, $${b+2}, $${b+3}, $${b+4}, $${b+5}, $${b+6},
         (($${b+3}::DATE + $${b+5}::TIME) AT TIME ZONE $${b+4}),
-        (($${b+3}::DATE + $${b+6}::TIME) AT TIME ZONE $${b+4}),
+        ${pointUtc(b+6)},
         $${b+7}, $${b+8},
-        CASE WHEN $${b+7}::TIME IS NULL THEN NULL ELSE (($${b+3}::DATE + $${b+7}::TIME) AT TIME ZONE $${b+4}) END,
-        CASE WHEN $${b+8}::TIME IS NULL THEN NULL ELSE (($${b+3}::DATE + $${b+8}::TIME) AT TIME ZONE $${b+4}) END,
+        ${nullablePointUtc(b+7)},
+        ${nullablePointUtc(b+8)},
         $${b+9}, $${b+10},
         $${b+11}, $${b+12}, $${b+13},
-        CASE WHEN $${b+12}::TIME IS NULL THEN NULL ELSE (($${b+3}::DATE + $${b+12}::TIME) AT TIME ZONE $${b+4}) END,
-        CASE WHEN $${b+13}::TIME IS NULL THEN NULL ELSE (($${b+3}::DATE + $${b+13}::TIME) AT TIME ZONE $${b+4}) END,
+        ${nullablePointUtc(b+12)},
+        ${nullablePointUtc(b+13)},
         $${b+14}, $${b+15}, $${b+16}
       )`;
     }).join(',');
