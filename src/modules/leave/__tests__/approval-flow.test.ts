@@ -98,10 +98,13 @@ describe('who sees a request in "pending approvals"', () => {
     expect(await pendingIds('manager.roma@acme-test.com')).toContain(id);
   });
 
-  it('and NOT for the area manager or HR while it sits with the store manager', async () => {
+  it('and ALSO for the area manager and HR, so any of them can act first', async () => {
+    // Visibility is no longer strictly turn-based. Everyone at or above the
+    // current stage sees a request as soon as it exists, and whoever gets to it
+    // first decides — approving from a higher rung simply skips the ones below.
     const id = await submitAs('employee1@acme-test.com', '2026-11-05', '2026-11-06');
-    expect(await pendingIds('area@acme-test.com')).not.toContain(id);
-    expect(await pendingIds('hr@acme-test.com')).not.toContain(id);
+    expect(await pendingIds('area@acme-test.com')).toContain(id);
+    expect(await pendingIds('hr@acme-test.com')).toContain(id);
   });
 
   it('moves to the area manager once the store manager approves', async () => {
@@ -334,14 +337,16 @@ describe('admins can approve on a chain that has no admin step', () => {
     expect((await readRequest(id)).approved_by).not.toBeNull();
   });
 
-  it('tells a store manager WHO the request is waiting on, not just "no permission"', async () => {
+  it('tells a store manager their rung has already been passed, and by whom', async () => {
+    // Acting from ABOVE the current stage is allowed now; acting from below is
+    // not, because that stage has already had its say.
     const id = await walkToHr('2026-10-19', '2026-10-20');
 
     const token = await login('manager.roma@acme-test.com');
     const res = await request.put(`/api/leave/${id}/approve`).set('Authorization', `Bearer ${token}`).send({});
 
     expect(res.status).toBe(403);
-    expect(res.body.code).toBe('LEAVE_NOT_RESPONSIBLE');
+    expect(res.body.code).toBe('LEAVE_STAGE_ALREADY_PASSED');
     expect(res.body.details.waitingOn).toBe('hr');   // actionable, not a dead end
     expect(res.body.error).toContain('hr');
   });

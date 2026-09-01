@@ -5,6 +5,7 @@ import { ok, created, notFound, conflict, forbidden, badRequest } from '../../ut
 import { asyncHandler } from '../../utils/asyncHandler';
 import { UserRole } from '../../config/jwt';
 import { resolveAllowedCompanyIds } from '../../utils/companyScope';
+import { resolveAreaManagerStoreIds } from '../../utils/storeScope';
 import { validateShiftCrossFields } from './shifts.routes';
 import { coalescedShiftPointUtcSql, DEFAULT_SHIFT_TIMEZONE, normalizeShiftTimezone, resolveStoreTimezone } from '../../utils/shiftTimezone';
 import { sendNotification } from '../notifications/notifications.service';
@@ -1197,13 +1198,7 @@ export const approveWeekForEmployee = asyncHandler(async (req: Request, res: Res
   let extraWhere = '';
 
   if (role === 'area_manager') {
-    const managed = await query<{ store_id: number }>(
-      `SELECT DISTINCT store_id FROM users
-       WHERE role = 'store_manager' AND supervisor_id = $1 AND company_id = $2
-         AND status = 'active' AND store_id IS NOT NULL`,
-      [callerId, companyId],
-    );
-    const ids = managed.map((r) => r.store_id);
+    const ids = await resolveAreaManagerStoreIds(callerId, [companyId]);
     if (ids.length === 0) {
       ok(res, { updated: 0 });
       return;
@@ -1259,13 +1254,8 @@ export const copyWeek = asyncHandler(async (req: Request, res: Response) => {
   }
   // area_manager can only copy stores they supervise (within allowed companies)
   if (role === 'area_manager') {
-    const managedStores = await query<{ store_id: number }>(
-      `SELECT DISTINCT store_id FROM users
-       WHERE role = 'store_manager' AND supervisor_id = $1
-         AND company_id = ANY($2)
-         AND status = 'active' AND store_id IS NOT NULL`,
-      [callerId, allowedCompanyIds],
-    );
+    const managedStores = (await resolveAreaManagerStoreIds(callerId, allowedCompanyIds))
+      .map((store_id) => ({ store_id }));
     if (!managedStores.some((r) => r.store_id === store_id)) {
       forbidden(res, 'Accesso negato'); return;
     }
@@ -2349,12 +2339,8 @@ export const importShifts = asyncHandler(async (req: Request, res: Response) => 
         errors.push(`Riga ${rowNum}: non autorizzato per negozio ${storeCodeVal}`); failed++; continue;
       }
       if (role === 'area_manager') {
-        const managedStores = await query<{ store_id: number }>(
-          `SELECT DISTINCT store_id FROM users
-           WHERE role = 'store_manager' AND supervisor_id = $1
-             AND status = 'active' AND store_id IS NOT NULL`,
-          [callerId],
-        );
+        const managedStores = (await resolveAreaManagerStoreIds(callerId, [companyId]))
+          .map((store_id) => ({ store_id }));
         if (!managedStores.some((r) => r.store_id === storeId)) {
           errors.push(`Riga ${rowNum}: non autorizzato per negozio ${storeCodeVal}`); failed++; continue;
         }
