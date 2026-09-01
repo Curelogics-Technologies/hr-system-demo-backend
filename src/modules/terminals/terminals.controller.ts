@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { pool, query, queryOne } from '../../config/database';
 import { ok, created, badRequest, conflict, notFound } from '../../utils/response';
 import { asyncHandler } from '../../utils/asyncHandler';
+import { assertLicenseCapacity } from '../billing/license.service';
 import bcrypt from 'bcryptjs';
 import { resolveAllowedCompanyIds } from '../../utils/companyScope';
 
@@ -225,6 +226,9 @@ export const createTerminal = asyncHandler(async (req: Request, res: Response) =
     // "Has this terminal actually been registered?" is reported separately, via
     // registration_state, so the list no longer presents an unregistered
     // terminal as ready to use.
+    // A terminal takes one paid license. Refuse before creating anything.
+    await assertLicenseCapacity(store.company_id, 'terminal', 1);
+
     const terminalRes = await client.query(
       `INSERT INTO users (
          company_id, store_id, name, surname, email, password_hash, plain_password, role, status, created_by, updated_by

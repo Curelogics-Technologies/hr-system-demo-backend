@@ -66,6 +66,9 @@ type CompanyProfileInput = {
   discount_percent?: number | null;
   discount_valid_from?: string | null;
   discount_valid_to?: string | null;
+  bill_reminder_days_before?: number | null;
+  grace_period_days?: number | null;
+  billing_enforced?: boolean | string | null;
 };
 
 function normalizeOptionalString(value: unknown): string | null | undefined {
@@ -117,6 +120,14 @@ function extractCompanyProfileInput(payload: Record<string, unknown>): CompanyPr
     discount_percent: normalizeOptionalNumber(payload.discount_percent),
     discount_valid_from: normalizeOptionalString(payload.discount_valid_from),
     discount_valid_to: normalizeOptionalString(payload.discount_valid_to),
+    bill_reminder_days_before: normalizeOptionalNumber(payload.bill_reminder_days_before),
+    grace_period_days: normalizeOptionalNumber(payload.grace_period_days),
+    // Whether this company is on the license/subscription model at all.
+    // Off for every company that predates the billing module.
+    billing_enforced:
+      payload.billing_enforced === undefined || payload.billing_enforced === null
+        ? undefined
+        : payload.billing_enforced === true || payload.billing_enforced === 'true',
   };
 }
 
@@ -152,6 +163,9 @@ const COMPANY_LIST_SELECT = `
     c.discount_percent::float AS discount_percent,
     c.discount_valid_from,
     c.discount_valid_to,
+    COALESCE(c.bill_reminder_days_before, 3)::int AS bill_reminder_days_before,
+    COALESCE(c.grace_period_days, 3)::int AS grace_period_days,
+    COALESCE(c.billing_enforced, false) AS billing_enforced,
     (SELECT COUNT(*) FROM stores s WHERE s.company_id = c.id AND s.is_active = true)::int AS store_count,
     (SELECT COUNT(*) FROM users u WHERE u.company_id = c.id AND u.status = 'active' AND u.role != 'store_terminal')::int AS employee_count,
     (SELECT COUNT(*) FROM users u WHERE u.company_id = c.id AND u.status = 'active' AND u.role = 'store_terminal' AND (u.registered_device_token IS NOT NULL OR u.registered_device_identifier IS NOT NULL))::int AS active_devices_count,
@@ -311,7 +325,9 @@ export const updateCompany = asyncHandler(async (req: Request, res: Response) =>
     nextParam += 1;
   }
 
-  const profileEntries: Array<[keyof CompanyProfileInput, string | number | null | undefined]> = [
+  const profileEntries: Array<
+    [keyof CompanyProfileInput, string | number | boolean | null | undefined]
+  > = [
     ['registration_number', profile.registration_number],
     ['vat_number', profile.vat_number],
     ['sdi_recipient_code', profile.sdi_recipient_code],
@@ -333,6 +349,9 @@ export const updateCompany = asyncHandler(async (req: Request, res: Response) =>
     ['discount_percent', profile.discount_percent],
     ['discount_valid_from', profile.discount_valid_from],
     ['discount_valid_to', profile.discount_valid_to],
+    ['bill_reminder_days_before', profile.bill_reminder_days_before],
+    ['grace_period_days', profile.grace_period_days],
+    ['billing_enforced', profile.billing_enforced],
   ];
 
   for (const [column, value] of profileEntries) {
@@ -461,9 +480,12 @@ export const createCompany = asyncHandler(async (req: Request, res: Response) =>
        access_valid_to,
        discount_percent,
        discount_valid_from,
-       discount_valid_to
+       discount_valid_to,
+       bill_reminder_days_before,
+       grace_period_days,
+       billing_enforced
      )
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
      RETURNING id`,
     [
       name,
@@ -491,6 +513,10 @@ export const createCompany = asyncHandler(async (req: Request, res: Response) =>
       profile.discount_percent ?? 0,
       profile.discount_valid_from ?? null,
       profile.discount_valid_to ?? null,
+      profile.bill_reminder_days_before ?? 3,
+      profile.grace_period_days ?? 3,
+      // New companies are created on the billing model unless told otherwise.
+      profile.billing_enforced ?? true,
     ]
   );
   if (!createdCompanyId) {

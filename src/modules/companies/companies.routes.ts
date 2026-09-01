@@ -17,7 +17,7 @@ import {
 import { authenticate, requireRole, enforceCompany, requireSuperAdmin, requireModulePermission } from '../../middleware/auth';
 import { validate } from '../../middleware/validate';
 import { auditLog } from '../../middleware/auditLog';
-import { isValidPartitaIva, isValidSdiCode, isValidPecEmail } from '../../utils/italianFiscal';
+import { isValidSdiCode, isValidPecEmail, normalizePartitaIva } from '../../utils/italianFiscal';
 import {
   companyLogoUploadMiddleware,
   uploadCompanyLogo,
@@ -44,8 +44,19 @@ const optionalFiscalField = (
     .optional()
     .refine((value) => value == null || value.trim() === '' || isValid(value), { message });
 
+// Milestone 1 stores these fields; it does not transmit them to SDI or run
+// fiscal checks. Enforcing the Partita IVA control digit here only blocks
+// legitimate onboarding, so the rule is the shape: 11 digits once the optional
+// IT prefix and separators are removed.
+const hasElevenDigits = (value: string) =>
+  /^\d{11}$/.test(normalizePartitaIva(value));
+
 const vatNumberField = () =>
-  optionalFiscalField(20, isValidPartitaIva, 'Partita IVA non valida (11 cifre)');
+  optionalFiscalField(
+    20,
+    hasElevenDigits,
+    'Partita IVA non valida: servono 11 cifre (il prefisso IT e gli spazi sono facoltativi)'
+  );
 const sdiRecipientCodeField = () =>
   optionalFiscalField(7, isValidSdiCode, 'Codice Destinatario SDI non valido (6-7 caratteri)');
 const pecEmailField = () =>
@@ -72,6 +83,8 @@ const updateCompanySchema = z.object({
   discount_percent: z.number().min(0).max(100).nullable().optional(),
   discount_valid_from: z.string().nullable().optional(),
   discount_valid_to: z.string().nullable().optional(),
+  bill_reminder_days_before: z.number().int().min(1).max(30).nullable().optional(),
+  grace_period_days: z.number().int().min(0).max(30).nullable().optional(),
   vat_number: vatNumberField(),
   sdi_recipient_code: sdiRecipientCodeField(),
   pec_email: pecEmailField(),
@@ -99,6 +112,8 @@ const createCompanySchema = z.object({
   discount_percent: z.number().min(0).max(100).nullable().optional(),
   discount_valid_from: z.string().nullable().optional(),
   discount_valid_to: z.string().nullable().optional(),
+  bill_reminder_days_before: z.number().int().min(1).max(30).nullable().optional(),
+  grace_period_days: z.number().int().min(0).max(30).nullable().optional(),
   vat_number: vatNumberField(),
   sdi_recipient_code: sdiRecipientCodeField(),
   pec_email: pecEmailField(),

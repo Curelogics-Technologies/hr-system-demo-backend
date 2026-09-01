@@ -270,13 +270,16 @@ describe('GET /api/leave/pending', () => {
     expect(found.current_approver_role).toBe('store_manager');
   });
 
-  it('hr sees no pending items when current_approver_role is store_manager', async () => {
+  it('hr sees items still sitting with the store manager, and can act on them', async () => {
     const token = await login('hr@acme-test.com');
     const res = await request.get('/api/leave/pending').set('Authorization', `Bearer ${token}`);
     expect(res.status).toBe(200);
-    // hr pending queue filters by current_approver_role = 'hr' — should not include store_manager items
+    // HR outranks every earlier stage, so nothing below it is hidden: the queue
+    // may contain store_manager and area_manager items as well as its own.
     const items: any[] = res.body.data.requests;
-    items.forEach((r: any) => expect(r.current_approver_role).toBe('hr'));
+    items.forEach((r: any) =>
+      expect(['store_manager', 'area_manager', 'hr']).toContain(r.current_approver_role),
+    );
   });
 
   it('employee gets 403 — employees cannot be approvers', async () => {
@@ -327,14 +330,15 @@ describe('PUT /api/leave/:id/approve', () => {
     expect(res.status).toBe(403);
   });
 
-  it('approving a request not assigned to your role gets 403', async () => {
-    // Request is assigned to store_manager; area_manager tries to approve
+  it('a higher role can approve directly without waiting its turn', async () => {
+    // Request sits with store_manager; the area manager approves it anyway,
+    // which skips the store-manager rung rather than being refused.
     const token = await login('area@acme-test.com');
     const res = await request
       .put(`/api/leave/${leaveId}/approve`)
       .set('Authorization', `Bearer ${token}`)
       .send({});
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(200);
   });
 
   it('full approval chain: store_manager → area_manager → hr → hr_approved, balance decremented', async () => {

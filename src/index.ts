@@ -47,6 +47,11 @@ import reportsRoutes from './modules/reports/reports.routes';
 import { processEscalationLogic } from './modules/leave/leave.controller';
 import locationRoutes from './modules/location/location.routes';
 import { ssrRendererMiddleware } from './middleware/ssr-renderer.middleware';
+import billingRoutes from './modules/billing/billing.routes';
+import webhookRoutes from './modules/billing/webhook.routes';
+import { billingGuard } from './middleware/billingGuard';
+import { LicenseLimitError } from './modules/billing/license.service';
+import { startBillingCron } from './jobs/billing.job';
 
 dotenv.config();
 
@@ -85,8 +90,10 @@ app.use(cors({
     cb(new Error(`CORS: origin ${origin} not allowed`));
   },
 }));
+app.use('/api/webhooks/stripe', express.raw({ type: 'application/json' }));
+app.use('/api/webhooks/paypal', express.raw({ type: 'application/json' }));
 app.use((req, res, next) => {
-  if (req.path.startsWith('/api/public/indeed-apply/')) {
+  if (req.path.startsWith('/api/public/indeed-apply/') || req.path === '/api/webhooks/stripe' || req.path === '/api/webhooks/paypal') {
     next();
   } else {
     express.json()(req, res, next);
@@ -544,6 +551,14 @@ function resolveFrontendBase(req: express.Request): string {
   return 'http://localhost:5173';
 }
 
+// Billing — Webhook routes (no auth, uses signature verification) + Billing routes
+app.use('/api/webhooks', webhookRoutes);
+app.use('/api/billing', authenticate, billingRoutes);
+
+// Billing access guard — MUST be before all other route handlers
+// Checks subscription status and blocks unpaid companies (except exempt paths/roles)
+app.use('/api', billingGuard);
+
 // Phase 1 API Routes
 app.use('/api/auth', authRoutes);
 app.use('/api/companies', companiesRoutes);
@@ -582,6 +597,17 @@ app.use('/api/location', locationRoutes);
 
 // Global error handler
 app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  // Running out of paid licenses is an expected outcome, not a crash: answer
+  // with 402 and the exact numbers so the UI can offer to buy more.
+  if (err instanceof LicenseLimitError) {
+    res.status(err.statusCode).json({
+      success: false,
+      error: err.message,
+      code: err.code,
+      ...err.details,
+    });
+    return;
+  }
   console.error('Unhandled error:', err);
   res.status(500).json({ success: false, error: 'Errore interno del server', code: 'SERVER_ERROR' });
 });
@@ -640,6 +666,7 @@ async function start() {
   // Start background cron jobs (skip in test environment)
   if (process.env.NODE_ENV !== 'test') {
     startScheduler();
+    startBillingCron();
 
     // Background auto-escalation task (runs every hour)
     setInterval(() => {

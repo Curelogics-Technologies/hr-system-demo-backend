@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { query, queryOne } from '../../config/database';
 import { ok } from '../../utils/response';
 import { asyncHandler } from '../../utils/asyncHandler';
+import { resolveAreaManagerStoreIds } from '../../utils/storeScope';
 import { coalescedShiftPointUtcSql } from '../../utils/shiftTimezone';
 import { resolveAllowedCompanyIds } from '../../utils/companyScope';
 import { loadApprovedLeaveDays, leaveCoverageKey } from '../../utils/leaveCoverage';
@@ -480,12 +481,8 @@ export const getHomeData = asyncHandler(async (req: Request, res: Response) => {
           [userId, companyId]
         );
 
-        const amStores = await query<{ store_id: number }>(
-          `SELECT DISTINCT store_id FROM users
-           WHERE role = 'store_manager' AND supervisor_id = $1 AND company_id = $2
-             AND status = 'active' AND store_id IS NOT NULL`,
-          [userId, companyId],
-        );
+        const amStores = (await resolveAreaManagerStoreIds(userId, [companyId as number]))
+          .map((store_id) => ({ store_id }));
 
         visibleStoreIds = Array.from(new Set([
           ...assignedStores.map(s => s.id),
