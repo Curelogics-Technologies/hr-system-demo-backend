@@ -386,22 +386,29 @@ export class SubscriptionService {
             100
         );
 
+      // Key on the invoice, not the event. The very same first payment also
+      // arrives as invoice.payment_succeeded, and that handler keys on the
+      // invoice id; deduping on the event id here meant the two handlers
+      // could not see each other and recorded one payment as two.
+      const activationKey = event.providerInvoiceId || event.eventId;
+
       const existingTx = await client.query(
         `SELECT id FROM billing_transactions 
-         WHERE subscription_id = $1 AND provider_payment_id = $2`,
-        [sub.id, event.eventId]
+         WHERE subscription_id = $1
+           AND (provider_invoice_id = $2 OR provider_payment_id = $2)`,
+        [sub.id, activationKey]
       );
 
       if (existingTx.rowCount === 0) {
         await client.query(
           `INSERT INTO billing_transactions (
             company_id, subscription_id, provider,
-            provider_payment_id, amount_cents, currency,
+            provider_payment_id, provider_invoice_id, amount_cents, currency,
             status, kind, description,
             seat_quantity, device_quantity,
             unit_price_employee_cents, unit_price_device_cents,
             invoice_url, paid_at
-          ) VALUES ($1, $2, $3, $4, $5, $6, 'paid', 'activation', $7, $8, $9, $10, $11, $12, NOW())`,
+          ) VALUES ($1, $2, $3, $4, $13, $5, $6, 'paid', 'activation', $7, $8, $9, $10, $11, $12, NOW())`,
           [
             sub.company_id,
             sub.id,
@@ -415,6 +422,7 @@ export class SubscriptionService {
             Math.round(parseFloat(sub.unit_price_employee) * 100),
             Math.round(parseFloat(sub.unit_price_device) * 100),
             event.invoiceUrl || null,
+            event.providerInvoiceId || null,
           ]
         );
       }
