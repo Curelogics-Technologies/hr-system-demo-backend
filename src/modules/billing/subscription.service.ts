@@ -395,7 +395,10 @@ export class SubscriptionService {
 
       // Record first transaction if not already recorded for this event
       const totalAmountCents =
-        event.amountCents ||
+      // ?? not ||: a genuine zero is meaningful. When a total falls under
+      // the provider's minimum charge it books the amount to the customer's
+      // balance rather than taking it, and reports amount_paid as 0.
+        event.amountCents ??
         Math.round(
           (sub.seat_quantity * parseFloat(sub.unit_price_employee) +
             sub.device_quantity * parseFloat(sub.unit_price_device)) *
@@ -668,7 +671,7 @@ export class SubscriptionService {
 
       if (existingTx.rowCount === 0) {
         const totalAmountCents =
-          event.amountCents ||
+          event.amountCents ??
           Math.round(
             (nextSeatQty * parseFloat(sub.unit_price_employee) +
               nextDevQty * parseFloat(sub.unit_price_device)) *
@@ -759,7 +762,7 @@ export class SubscriptionService {
         sub.company_id,
         sub.id,
         event.provider,
-        event.amountCents || 0,
+        event.amountCents ?? 0,
         event.currency || sub.currency,
         `Payment attempt failed`,
         event.failureCode || 'payment_failed',
