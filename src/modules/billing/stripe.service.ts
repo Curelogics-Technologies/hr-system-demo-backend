@@ -23,6 +23,7 @@ export class StripeGateway implements IPaymentGateway {
 
   async createCheckoutSession(params: CheckoutParams): Promise<CheckoutResult> {
     const currency = (params.currency || 'EUR').toLowerCase();
+    const currencyLabel = currency.toUpperCase();
     const lineItems: Stripe.Checkout.SessionCreateParams.LineItem[] = [];
 
     // 1. Employee line item
@@ -43,7 +44,10 @@ export class StripeGateway implements IPaymentGateway {
             currency,
             product_data: {
               name: 'Employee Seats (VeylOHR)',
-              description: `Active employee license (€${(params.unitPriceEmployee || 0).toFixed(2)}/seat/month)`,
+              // Never hardcode a symbol here: the same text is shown on the
+              // hosted checkout page, and a PKR subscription labelled in euros
+              // misstates the price the customer is about to pay.
+              description: `Active employee license (${currencyLabel} ${(params.unitPriceEmployee || 0).toFixed(2)}/seat/month)`,
             },
             unit_amount: employeeUnitCents,
             recurring: {
@@ -70,7 +74,7 @@ export class StripeGateway implements IPaymentGateway {
             currency,
             product_data: {
               name: 'Terminal Devices (VeylOHR)',
-              description: `Active store terminal license (€${(params.unitPriceDevice || 0).toFixed(2)}/terminal/month)`,
+              description: `Active store terminal license (${currencyLabel} ${(params.unitPriceDevice || 0).toFixed(2)}/terminal/month)`,
             },
             unit_amount: deviceUnitCents,
             recurring: {
@@ -448,6 +452,39 @@ export class StripeGateway implements IPaymentGateway {
   }
 
   /**
+   * Current period of a subscription.
+   *
+   * Stripe moved these fields off the subscription and onto its items, so
+   * `subscription.current_period_end` is undefined on current API versions.
+   * Reading only there left every renewal date unset, and the caller then
+   * invented "today + 30 days" — which silently overwrote a real period.
+   * Items are checked first and the subscription kept as the fallback.
+   */
+  private resolveSubscriptionPeriod(sub: any): { start?: Date; end?: Date } {
+    const secs = (v: unknown) =>
+      typeof v === 'number' && Number.isFinite(v) && v > 0 ? new Date(v * 1000) : undefined;
+
+    for (const item of sub?.items?.data ?? []) {
+      const start = secs(item?.current_period_start);
+      const end = secs(item?.current_period_end);
+      if (start && end) return { start, end };
+    }
+
+    return {
+      start: secs(sub?.current_period_start),
+      end: secs(sub?.current_period_end),
+    };
+  }
+
+  /** The provider's own view of a subscription's current period. */
+  async getSubscriptionPeriod(
+    providerSubId: string
+  ): Promise<{ start?: Date; end?: Date }> {
+    const sub = await this.stripe.subscriptions.retrieve(providerSubId);
+    return this.resolveSubscriptionPeriod(sub);
+  }
+
+  /**
    * Billing period covered by an invoice, when it genuinely represents one.
    *
    * Only a subscription cycle invoice describes a period. An invoice assembled
@@ -558,12 +595,9 @@ export class StripeGateway implements IPaymentGateway {
         parsed.customerId =
           typeof sub.customer === 'string' ? sub.customer : sub.customer?.id;
         parsed.status = this.mapStripeStatus(sub.status);
-        if (sub.current_period_start) {
-          parsed.currentPeriodStart = new Date(sub.current_period_start * 1000);
-        }
-        if (sub.current_period_end) {
-          parsed.currentPeriodEnd = new Date(sub.current_period_end * 1000);
-        }
+        const period = this.resolveSubscriptionPeriod(sub);
+        parsed.currentPeriodStart = period.start;
+        parsed.currentPeriodEnd = period.end;
         break;
       }
 
@@ -582,6 +616,9 @@ export class StripeGateway implements IPaymentGateway {
             ? invoice.customer
             : invoice.customer?.id;
         parsed.amountCents = invoice.amount_paid;
+        // The invoice's own total, which can exceed what was collected when
+        // the amount sits under the provider's minimum charge.
+        parsed.invoiceTotalCents = invoice.total ?? undefined;
         parsed.currency = invoice.currency?.toUpperCase();
         parsed.status = 'active';
         parsed.invoiceUrl = invoice.hosted_invoice_url || invoice.invoice_pdf || undefined;

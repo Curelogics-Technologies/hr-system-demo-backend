@@ -6,6 +6,22 @@ import {
   SubscriptionStatus,
 } from './gateway.interface';
 import { markHeadcountBilled, countBillableResources } from './headcount.service';
+import { emitToCompany } from '../../config/socket';
+
+/**
+ * Tells a company's open pages that its billing state moved.
+ *
+ * Deliberately carries no data: the client refetches, so there is one source of
+ * truth and no risk of a stale payload overwriting fresher state. Never allowed
+ * to throw — a socket problem must not fail a webhook we have already accepted.
+ */
+export function announceBillingChange(companyId: number, reason: string) {
+  try {
+    emitToCompany(companyId, 'billing:updated', { reason, at: new Date().toISOString() });
+  } catch (err: any) {
+    console.error('[Billing] Could not announce billing change:', err?.message || err);
+  }
+}
 import { priceLicenseChange, getLicenseSnapshot } from './license.service';
 import { resolveIsoCurrency, UnsupportedCurrencyError } from './currency';
 
@@ -352,10 +368,32 @@ export class SubscriptionService {
 
       const sub = subQuery.rows[0];
       const now = new Date();
-      const periodStart = event.currentPeriodStart || now;
+
+      // A billing period belongs to the provider; it is never invented here.
+      // Some checkout events carry no period at all (a card change completes
+      // as a checkout too), and this used to answer that by stamping
+      // "today + 30 days" over a live subscription — moving a real 25 Aug
+      // renewal to 2 Oct. When the event has no period the stored one is
+      // kept, and customer.subscription.created/updated fills it in.
+      const storedStart = sub.current_period_start ? new Date(sub.current_period_start) : null;
+      const storedEnd = sub.current_period_end ? new Date(sub.current_period_end) : null;
+
+      const periodStart = event.currentPeriodStart ?? storedStart ?? now;
       const periodEnd =
-        event.currentPeriodEnd ||
-        new Date(periodStart.getTime() + 30 * 24 * 60 * 60 * 1000);
+        event.currentPeriodEnd ??
+        storedEnd ??
+        // Only reached on a first activation whose event carried no period.
+        // A month, not 30 days: monthly billing follows the calendar.
+        new Date(
+          Date.UTC(
+            periodStart.getUTCFullYear(),
+            periodStart.getUTCMonth() + 1,
+            periodStart.getUTCDate(),
+            periodStart.getUTCHours(),
+            periodStart.getUTCMinutes(),
+            periodStart.getUTCSeconds()
+          )
+        );
 
       // Activate subscription
       await client.query(
@@ -379,29 +417,39 @@ export class SubscriptionService {
 
       // Record first transaction if not already recorded for this event
       const totalAmountCents =
-        event.amountCents ||
+      // ?? not ||: a genuine zero is meaningful. When a total falls under
+      // the provider's minimum charge it books the amount to the customer's
+      // balance rather than taking it, and reports amount_paid as 0.
+        event.amountCents ??
         Math.round(
           (sub.seat_quantity * parseFloat(sub.unit_price_employee) +
             sub.device_quantity * parseFloat(sub.unit_price_device)) *
             100
         );
 
+      // Key on the invoice, not the event. The very same first payment also
+      // arrives as invoice.payment_succeeded, and that handler keys on the
+      // invoice id; deduping on the event id here meant the two handlers
+      // could not see each other and recorded one payment as two.
+      const activationKey = event.providerInvoiceId || event.eventId;
+
       const existingTx = await client.query(
         `SELECT id FROM billing_transactions 
-         WHERE subscription_id = $1 AND provider_payment_id = $2`,
-        [sub.id, event.eventId]
+         WHERE subscription_id = $1
+           AND (provider_invoice_id = $2 OR provider_payment_id = $2)`,
+        [sub.id, activationKey]
       );
 
       if (existingTx.rowCount === 0) {
         await client.query(
           `INSERT INTO billing_transactions (
             company_id, subscription_id, provider,
-            provider_payment_id, amount_cents, currency,
+            provider_payment_id, provider_invoice_id, amount_cents, currency,
             status, kind, description,
             seat_quantity, device_quantity,
             unit_price_employee_cents, unit_price_device_cents,
             invoice_url, paid_at
-          ) VALUES ($1, $2, $3, $4, $5, $6, 'paid', 'activation', $7, $8, $9, $10, $11, $12, NOW())`,
+          ) VALUES ($1, $2, $3, $4, $13, $5, $6, 'paid', 'activation', $7, $8, $9, $10, $11, $12, NOW())`,
           [
             sub.company_id,
             sub.id,
@@ -415,6 +463,7 @@ export class SubscriptionService {
             Math.round(parseFloat(sub.unit_price_employee) * 100),
             Math.round(parseFloat(sub.unit_price_device) * 100),
             event.invoiceUrl || null,
+            event.providerInvoiceId || null,
           ]
         );
       }
@@ -450,6 +499,7 @@ export class SubscriptionService {
       }
 
       await client.query('COMMIT');
+      announceBillingChange(sub.company_id, 'activated');
     } catch (err) {
       await client.query('ROLLBACK');
       throw err;
@@ -577,8 +627,19 @@ export class SubscriptionService {
       const now = new Date();
       const periodStart = event.currentPeriodStart || now;
       const periodEnd =
-        event.currentPeriodEnd ||
-        new Date(periodStart.getTime() + 30 * 24 * 60 * 60 * 1000);
+        event.currentPeriodEnd ??
+        // A month, not 30 days: monthly billing follows the calendar, so a
+        // fixed 30 drifts the renewal earlier every cycle.
+        new Date(
+          Date.UTC(
+            periodStart.getUTCFullYear(),
+            periodStart.getUTCMonth() + 1,
+            periodStart.getUTCDate(),
+            periodStart.getUTCHours(),
+            periodStart.getUTCMinutes(),
+            periodStart.getUTCSeconds()
+          )
+        );
 
       // An upgrade invoice must never move the billing period: once a period
       // has started it runs to its end unchanged. Belt and braces, a period
@@ -642,8 +703,13 @@ export class SubscriptionService {
       );
 
       if (existingTx.rowCount === 0) {
+        // The provider settled the invoice without taking money: the total was
+        // under its minimum charge and has been carried to the next invoice.
+        const collectedNothing =
+          (event.invoiceTotalCents ?? 0) > 0 && (event.amountCents ?? 0) === 0;
+
         const totalAmountCents =
-          event.amountCents ||
+          collectedNothing ? (event.invoiceTotalCents ?? 0) : event.amountCents ??
           Math.round(
             (nextSeatQty * parseFloat(sub.unit_price_employee) +
               nextDevQty * parseFloat(sub.unit_price_device)) *
@@ -658,7 +724,7 @@ export class SubscriptionService {
             seat_quantity, device_quantity,
             unit_price_employee_cents, unit_price_device_cents,
             invoice_url, paid_at
-          ) VALUES ($1, $2, $3, $4, $5, $6, 'paid', $13, $7, $8, $9, $10, $11, $12, NOW())`,
+          ) VALUES ($1, $2, $3, $4, $5, $6, $14, $13, $7, $8, $9, $10, $11, $12, NOW())`,
           [
             sub.company_id,
             sub.id,
@@ -674,12 +740,14 @@ export class SubscriptionService {
             Math.round(parseFloat(sub.unit_price_employee) * 100),
             Math.round(parseFloat(sub.unit_price_device) * 100),
             event.invoiceUrl || null,
-            hasPendingUpgrade ? 'license_upgrade' : 'renewal',
+            collectedNothing ? 'carried_over' : hasPendingUpgrade ? 'license_upgrade' : 'renewal',
+            collectedNothing ? 'pending' : 'paid',
           ]
         );
       }
 
       await client.query('COMMIT');
+      announceBillingChange(sub.company_id, 'payment');
     } catch (err) {
       await client.query('ROLLBACK');
       throw err;
@@ -733,7 +801,7 @@ export class SubscriptionService {
         sub.company_id,
         sub.id,
         event.provider,
-        event.amountCents || 0,
+        event.amountCents ?? 0,
         event.currency || sub.currency,
         `Payment attempt failed`,
         event.failureCode || 'payment_failed',
@@ -1391,6 +1459,7 @@ export class SubscriptionService {
       }
 
       await client.query('COMMIT');
+      announceBillingChange(sub.company_id, 'settled');
     } catch (err) {
       await client.query('ROLLBACK');
       throw err;

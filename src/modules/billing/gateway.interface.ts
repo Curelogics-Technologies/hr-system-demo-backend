@@ -68,7 +68,14 @@ export interface ParsedWebhookEvent {
   subscriptionId?: string;
   customerId?: string;
   status?: SubscriptionStatus;
+  /** What the provider actually collected. Zero is meaningful. */
   amountCents?: number;
+  /**
+   * What the invoice was for. When this exceeds amountCents the provider
+   * declined to collect — typically because the total is under its minimum
+   * charge — and carried the balance to the next invoice.
+   */
+  invoiceTotalCents?: number;
   currency?: string;
   invoiceUrl?: string;
   providerInvoiceId?: string;
@@ -90,6 +97,17 @@ export interface IPaymentGateway {
   cancelSubscription(providerSubId: string, atPeriodEnd?: boolean): Promise<void>;
 
   reactivateSubscription(providerSubId: string): Promise<void>;
+
+  /**
+   * The current billing period as the provider sees it.
+   *
+   * The provider owns the period; our copy is only a cache, and a missed or
+   * period-less webhook can leave that cache wrong. This lets the daily job
+   * compare the two and correct ours.
+   */
+  getSubscriptionPeriod?(
+    providerSubId: string
+  ): Promise<{ start?: Date; end?: Date }>;
 
   verifyWebhook(
     headers: Record<string, string | string[] | undefined>,

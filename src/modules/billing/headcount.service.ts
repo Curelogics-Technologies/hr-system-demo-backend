@@ -148,6 +148,11 @@ export interface HeadcountHistoryRow {
   delta: number;
   resultingCount: number;
   userLabel: string | null;
+  /** Employee photo, read live so a changed photo shows everywhere. */
+  avatarFilename: string | null;
+  /** For a terminal, the logo of the store it belongs to. */
+  storeLogoFilename: string | null;
+  storeName: string | null;
   billedAt: string | null;
   occurredAt: string;
 }
@@ -159,11 +164,16 @@ export async function getHeadcountHistory(
   await backfillHeadcountLedger(companyId);
 
   const res = await pool.query(
-    `SELECT id, resource_type, change_type, delta, resulting_count,
-            user_label, billed_at, occurred_at
-     FROM billing_headcount_events
-     WHERE company_id = $1
-     ORDER BY occurred_at DESC, id DESC
+    `SELECT e.id, e.resource_type, e.change_type, e.delta, e.resulting_count,
+            e.user_label, e.billed_at, e.occurred_at,
+            u.avatar_filename,
+            s.logo_filename AS store_logo_filename,
+            s.name          AS store_name
+     FROM billing_headcount_events e
+     LEFT JOIN users  u ON u.id = e.user_id
+     LEFT JOIN stores s ON s.id = u.store_id
+     WHERE e.company_id = $1
+     ORDER BY e.occurred_at DESC, e.id DESC
      LIMIT $2`,
     [companyId, limit]
   );
@@ -176,6 +186,9 @@ export async function getHeadcountHistory(
       delta: r.delta,
       resultingCount: r.resulting_count,
       userLabel: r.user_label,
+      avatarFilename: r.avatar_filename ?? null,
+      storeLogoFilename: r.store_logo_filename ?? null,
+      storeName: r.store_name ?? null,
       billedAt: r.billed_at,
       occurredAt: r.occurred_at,
     })),
