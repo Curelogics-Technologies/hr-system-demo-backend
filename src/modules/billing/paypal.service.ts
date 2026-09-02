@@ -19,7 +19,21 @@ export class PayPalGateway implements IPaymentGateway {
   constructor() {
     this.clientId = process.env.PAYPAL_CLIENT_ID || 'mock_paypal_client_id';
     this.clientSecret = process.env.PAYPAL_CLIENT_SECRET || 'mock_paypal_secret';
-    this.isProduction = process.env.NODE_ENV === 'production';
+    // Which PayPal to talk to is its own decision, not a side effect of
+    // NODE_ENV: a staging server runs in production mode but must still bill
+    // against the sandbox. PAYPAL_ENV decides, and NODE_ENV is only the
+    // default for deployments that have not set it.
+    const configured = process.env.PAYPAL_ENV?.trim().toLowerCase();
+    if (configured && !['sandbox', 'live'].includes(configured)) {
+      throw new Error(
+        `PAYPAL_ENV must be "sandbox" or "live", received "${process.env.PAYPAL_ENV}"`
+      );
+    }
+
+    this.isProduction = configured
+      ? configured === 'live'
+      : process.env.NODE_ENV === 'production';
+
     this.baseUrl = this.isProduction
       ? 'https://api-m.paypal.com'
       : 'https://api-m.sandbox.paypal.com';
