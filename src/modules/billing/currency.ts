@@ -30,9 +30,28 @@ const ALIASES: Record<string, string> = {
   // Indian rupee
   inr: 'INR', 'indian rupee': 'INR', rupee: 'INR', rupees: 'INR',
   // Others commonly configured
-  sek: 'SEK', nok: 'NOK', dkk: 'DKK', pln: 'PLN', czk: 'CZK',
-  cad: 'CAD', aud: 'AUD', jpy: 'JPY', try: 'TRY', ron: 'RON', huf: 'HUF',
+  sek: 'SEK', 'swedish krona': 'SEK',
+  nok: 'NOK', 'norwegian krone': 'NOK',
+  dkk: 'DKK', 'danish krone': 'DKK',
+  pln: 'PLN', 'polish zloty': 'PLN', 'polish złoty': 'PLN',
+  czk: 'CZK', 'czech koruna': 'CZK',
+  ron: 'RON', 'romanian leu': 'RON',
+  huf: 'HUF', 'hungarian forint': 'HUF',
+  cad: 'CAD', 'canadian dollar': 'CAD',
+  aud: 'AUD', 'australian dollar': 'AUD',
+  jpy: 'JPY', 'japanese yen': 'JPY', '¥': 'JPY',
+  try: 'TRY', 'turkish lira': 'TRY', '₺': 'TRY',
+  '₨': 'PKR', '₹': 'INR',
 };
+
+/**
+ * Codes offered in the admin panel. Kept in step with the list the frontend
+ * shows, so a currency that can be chosen is always one that can be billed.
+ */
+export const SUPPORTED_CURRENCIES = [
+  'EUR', 'GBP', 'USD', 'CHF', 'SEK', 'NOK', 'DKK', 'PLN', 'CZK',
+  'RON', 'HUF', 'CAD', 'AUD', 'AED', 'SAR', 'PKR', 'INR', 'TRY', 'JPY',
+] as const;
 
 export class UnsupportedCurrencyError extends Error {
   public readonly code = 'CURRENCY_NOT_SUPPORTED';
