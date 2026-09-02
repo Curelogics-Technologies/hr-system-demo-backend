@@ -452,14 +452,6 @@ export class StripeGateway implements IPaymentGateway {
   }
 
   /**
-   * Billing period covered by an invoice, when it genuinely represents one.
-   *
-   * Only a subscription cycle invoice describes a period. An invoice assembled
-   * from invoice items — which is how a mid-cycle license top-up is charged —
-   * reports a line period of a single instant, and taking that at face value
-   * collapses the subscription's real cycle to zero length.
-   */
-  /**
    * Current period of a subscription.
    *
    * Stripe moved these fields off the subscription and onto its items, so
@@ -484,6 +476,22 @@ export class StripeGateway implements IPaymentGateway {
     };
   }
 
+  /** The provider's own view of a subscription's current period. */
+  async getSubscriptionPeriod(
+    providerSubId: string
+  ): Promise<{ start?: Date; end?: Date }> {
+    const sub = await this.stripe.subscriptions.retrieve(providerSubId);
+    return this.resolveSubscriptionPeriod(sub);
+  }
+
+  /**
+   * Billing period covered by an invoice, when it genuinely represents one.
+   *
+   * Only a subscription cycle invoice describes a period. An invoice assembled
+   * from invoice items — which is how a mid-cycle license top-up is charged —
+   * reports a line period of a single instant, and taking that at face value
+   * collapses the subscription's real cycle to zero length.
+   */
   private resolveInvoicePeriod(invoice: any): { start?: Date; end?: Date } {
     const line = invoice?.lines?.data?.[0];
     const period = line?.period ?? invoice?.period;

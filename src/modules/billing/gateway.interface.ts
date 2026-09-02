@@ -98,6 +98,17 @@ export interface IPaymentGateway {
 
   reactivateSubscription(providerSubId: string): Promise<void>;
 
+  /**
+   * The current billing period as the provider sees it.
+   *
+   * The provider owns the period; our copy is only a cache, and a missed or
+   * period-less webhook can leave that cache wrong. This lets the daily job
+   * compare the two and correct ours.
+   */
+  getSubscriptionPeriod?(
+    providerSubId: string
+  ): Promise<{ start?: Date; end?: Date }>;
+
   verifyWebhook(
     headers: Record<string, string | string[] | undefined>,
     rawBody: Buffer | string

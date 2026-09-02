@@ -2,7 +2,10 @@ import cron from 'node-cron';
 import { pool } from '../config/database';
 import { getPaymentGateway } from '../modules/billing/gateway.factory';
 import { sendEmailForCompany } from '../services/email.service';
-import { subscriptionService } from '../modules/billing/subscription.service';
+import {
+  subscriptionService,
+  announceBillingChange,
+} from '../modules/billing/subscription.service';
 
 /**
  * Applies license reductions the admin scheduled during the period.
@@ -180,13 +183,104 @@ export async function processBillingGracePeriodExpirations() {
 /**
  * Registers the cron schedule (Runs daily at 02:00 AM)
  */
+/**
+ * Realigns each stored billing period with the provider's.
+ *
+ * The provider owns the period; our copy is a cache that exists so the app can
+ * render a renewal date without a network call. Any cache can go stale — a
+ * webhook that is missed, retried out of order, or arrives without period data
+ * all leave ours wrong, and a wrong renewal date is visible to the customer on
+ * every billing screen.
+ *
+ * Rather than trusting that every write path is correct forever, this asks the
+ * provider what the period actually is and corrects ours when they disagree.
+ * It is read-only at the provider and safe to run repeatedly.
+ */
+export async function processSubscriptionPeriodDrift() {
+  try {
+    const subRes = await pool.query(
+      `SELECT id, company_id, provider, provider_subscription_id,
+              current_period_start, current_period_end
+       FROM subscriptions
+       WHERE status IN ('active', 'past_due')
+         AND provider_subscription_id IS NOT NULL`
+    );
+
+    let corrected = 0;
+
+    for (const sub of subRes.rows) {
+      try {
+        const gateway = getPaymentGateway(sub.provider);
+        if (!gateway.getSubscriptionPeriod) continue;
+
+        const period = await gateway.getSubscriptionPeriod(sub.provider_subscription_id);
+        if (!period.start || !period.end) continue;
+
+        const storedEnd = sub.current_period_end ? new Date(sub.current_period_end) : null;
+        const storedStart = sub.current_period_start ? new Date(sub.current_period_start) : null;
+
+        // A minute of slack: providers report whole seconds, and a rounding
+        // difference is not drift worth rewriting a row for.
+        const drifted =
+          !storedEnd ||
+          !storedStart ||
+          Math.abs(storedEnd.getTime() - period.end.getTime()) > 60_000 ||
+          Math.abs(storedStart.getTime() - period.start.getTime()) > 60_000;
+
+        if (!drifted) continue;
+
+        await pool.query(
+          `UPDATE subscriptions
+           SET current_period_start = $1, current_period_end = $2, updated_at = NOW()
+           WHERE id = $3`,
+          [period.start, period.end, sub.id]
+        );
+        corrected++;
+
+        console.warn(
+          `[BillingJob] Corrected billing period for company ${sub.company_id} ` +
+            `(subscription ${sub.id}): stored ${storedStart?.toISOString() ?? 'none'} -> ` +
+            `${storedEnd?.toISOString() ?? 'none'}, provider ` +
+            `${period.start.toISOString()} -> ${period.end.toISOString()}`
+        );
+
+        // The renewal date is on screen, so push the correction out.
+        announceBillingChange(sub.company_id, 'period_corrected');
+      } catch (err) {
+        console.error(
+          `[BillingJob] Period check failed for subscription ${sub.id}:`,
+          (err as Error)?.message || err
+        );
+      }
+    }
+
+    if (corrected > 0) {
+      console.log(`[BillingJob] Billing periods corrected: ${corrected}`);
+    }
+  } catch (err) {
+    console.error('[BillingJob] processSubscriptionPeriodDrift failed:', err);
+  }
+}
+
+
 export function startBillingCron() {
   cron.schedule('0 2 * * *', async () => {
     console.log('[BillingJob] Running daily billing jobs...');
     await processStuckLicenseUpgrades();
+    await processSubscriptionPeriodDrift();
     await processBillingRenewalReconciliations();
     await processBillingReminders();
     await processBillingGracePeriodExpirations();
   });
+
+  // A deployment is exactly when a period may already be wrong from an
+  // earlier build, so check once on boot instead of waiting until 02:00.
+  // Delayed a little to stay clear of startup.
+  setTimeout(() => {
+    processSubscriptionPeriodDrift().catch((err) =>
+      console.error('[BillingJob] Startup period check failed:', err)
+    );
+  }, 30_000).unref();
+
   console.log('✓ Billing scheduled jobs initialized (daily at 02:00)');
 }

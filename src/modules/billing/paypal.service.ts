@@ -271,6 +271,34 @@ export class PayPalGateway implements IPaymentGateway {
     };
   }
 
+  /**
+   * PayPal exposes the end of the current cycle as next_billing_time, and the
+   * start only indirectly as the last payment. Either may be absent on a
+   * subscription that has not billed yet, so both are optional.
+   */
+  async getSubscriptionPeriod(
+    providerSubId: string
+  ): Promise<{ start?: Date; end?: Date }> {
+    const token = await this.getAccessToken();
+    const res = await fetch(
+      `${this.baseUrl}/v1/billing/subscriptions/${providerSubId}`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (!res.ok) {
+      throw new Error(`PayPal subscription lookup failed: ${res.status}`);
+    }
+    const body: any = await res.json();
+    const at = (v: unknown) => {
+      if (typeof v !== 'string') return undefined;
+      const d = new Date(v);
+      return Number.isNaN(d.getTime()) ? undefined : d;
+    };
+    return {
+      start: at(body?.billing_info?.last_payment?.time),
+      end: at(body?.billing_info?.next_billing_time),
+    };
+  }
+
   async cancelSubscription(
     providerSubId: string,
     _atPeriodEnd?: boolean

@@ -15,7 +15,7 @@ import { emitToCompany } from '../../config/socket';
  * truth and no risk of a stale payload overwriting fresher state. Never allowed
  * to throw — a socket problem must not fail a webhook we have already accepted.
  */
-function announceBillingChange(companyId: number, reason: string) {
+export function announceBillingChange(companyId: number, reason: string) {
   try {
     emitToCompany(companyId, 'billing:updated', { reason, at: new Date().toISOString() });
   } catch (err: any) {
