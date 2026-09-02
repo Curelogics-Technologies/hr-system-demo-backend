@@ -354,21 +354,32 @@ export class PayPalGateway implements IPaymentGateway {
     const bodyStr = typeof rawBody === 'string' ? rawBody : rawBody.toString('utf8');
     const payload = JSON.parse(bodyStr);
 
-    // If webhook ID is configured and headers are present, verify with PayPal API
+    // A webhook endpoint is a public URL, so an unverified event is simply a
+    // stranger telling us a payment succeeded. Every event must be proven to
+    // come from PayPal before it can grant anything, which means refusing to
+    // process one we cannot check rather than letting it through.
     const authAlgo = headers['paypal-auth-algo'];
     const certUrl = headers['paypal-cert-url'];
     const transmissionId = headers['paypal-transmission-id'];
     const transmissionSig = headers['paypal-transmission-sig'];
     const transmissionTime = headers['paypal-transmission-time'];
 
+    if (!webhookId) {
+      // Without it there is no way to tell a real event from a forged one.
+      throw new Error('PAYPAL_WEBHOOK_ID is not configured: refusing to trust PayPal webhooks');
+    }
+
     if (
-      webhookId &&
-      typeof authAlgo === 'string' &&
-      typeof certUrl === 'string' &&
-      typeof transmissionId === 'string' &&
-      typeof transmissionSig === 'string' &&
-      typeof transmissionTime === 'string'
+      typeof authAlgo !== 'string' ||
+      typeof certUrl !== 'string' ||
+      typeof transmissionId !== 'string' ||
+      typeof transmissionSig !== 'string' ||
+      typeof transmissionTime !== 'string'
     ) {
+      throw new Error('PayPal webhook is missing its signature headers');
+    }
+
+    {
       const token = await this.getAccessToken();
       const verifyRes = await fetch(
         `${this.baseUrl}/v1/notifications/verify-webhook-signature`,
@@ -390,11 +401,20 @@ export class PayPalGateway implements IPaymentGateway {
         }
       );
 
-      if (verifyRes.ok) {
-        const verifyData = (await verifyRes.json()) as { verification_status: string };
-        if (verifyData.verification_status !== 'SUCCESS') {
-          throw new Error('PayPal webhook signature verification failed');
-        }
+      // A failed call is not a pass. If PayPal cannot confirm the signature —
+      // an outage, a rejected token, a malformed body — the event stays
+      // unproven, and unproven means rejected. PayPal retries, so a genuine
+      // event survives a temporary failure; a forged one never gets through.
+      if (!verifyRes.ok) {
+        const detail = await verifyRes.text().catch(() => '');
+        throw new Error(
+          `PayPal webhook verification call failed (${verifyRes.status}): ${detail.slice(0, 200)}`
+        );
+      }
+
+      const verifyData = (await verifyRes.json()) as { verification_status?: string };
+      if (verifyData.verification_status !== 'SUCCESS') {
+        throw new Error('PayPal webhook signature verification failed');
       }
     }
 
