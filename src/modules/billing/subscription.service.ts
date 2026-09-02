@@ -368,10 +368,32 @@ export class SubscriptionService {
 
       const sub = subQuery.rows[0];
       const now = new Date();
-      const periodStart = event.currentPeriodStart || now;
+
+      // A billing period belongs to the provider; it is never invented here.
+      // Some checkout events carry no period at all (a card change completes
+      // as a checkout too), and this used to answer that by stamping
+      // "today + 30 days" over a live subscription — moving a real 25 Aug
+      // renewal to 2 Oct. When the event has no period the stored one is
+      // kept, and customer.subscription.created/updated fills it in.
+      const storedStart = sub.current_period_start ? new Date(sub.current_period_start) : null;
+      const storedEnd = sub.current_period_end ? new Date(sub.current_period_end) : null;
+
+      const periodStart = event.currentPeriodStart ?? storedStart ?? now;
       const periodEnd =
-        event.currentPeriodEnd ||
-        new Date(periodStart.getTime() + 30 * 24 * 60 * 60 * 1000);
+        event.currentPeriodEnd ??
+        storedEnd ??
+        // Only reached on a first activation whose event carried no period.
+        // A month, not 30 days: monthly billing follows the calendar.
+        new Date(
+          Date.UTC(
+            periodStart.getUTCFullYear(),
+            periodStart.getUTCMonth() + 1,
+            periodStart.getUTCDate(),
+            periodStart.getUTCHours(),
+            periodStart.getUTCMinutes(),
+            periodStart.getUTCSeconds()
+          )
+        );
 
       // Activate subscription
       await client.query(
@@ -605,8 +627,19 @@ export class SubscriptionService {
       const now = new Date();
       const periodStart = event.currentPeriodStart || now;
       const periodEnd =
-        event.currentPeriodEnd ||
-        new Date(periodStart.getTime() + 30 * 24 * 60 * 60 * 1000);
+        event.currentPeriodEnd ??
+        // A month, not 30 days: monthly billing follows the calendar, so a
+        // fixed 30 drifts the renewal earlier every cycle.
+        new Date(
+          Date.UTC(
+            periodStart.getUTCFullYear(),
+            periodStart.getUTCMonth() + 1,
+            periodStart.getUTCDate(),
+            periodStart.getUTCHours(),
+            periodStart.getUTCMinutes(),
+            periodStart.getUTCSeconds()
+          )
+        );
 
       // An upgrade invoice must never move the billing period: once a period
       // has started it runs to its end unchanged. Belt and braces, a period

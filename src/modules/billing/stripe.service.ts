@@ -459,6 +459,31 @@ export class StripeGateway implements IPaymentGateway {
    * reports a line period of a single instant, and taking that at face value
    * collapses the subscription's real cycle to zero length.
    */
+  /**
+   * Current period of a subscription.
+   *
+   * Stripe moved these fields off the subscription and onto its items, so
+   * `subscription.current_period_end` is undefined on current API versions.
+   * Reading only there left every renewal date unset, and the caller then
+   * invented "today + 30 days" — which silently overwrote a real period.
+   * Items are checked first and the subscription kept as the fallback.
+   */
+  private resolveSubscriptionPeriod(sub: any): { start?: Date; end?: Date } {
+    const secs = (v: unknown) =>
+      typeof v === 'number' && Number.isFinite(v) && v > 0 ? new Date(v * 1000) : undefined;
+
+    for (const item of sub?.items?.data ?? []) {
+      const start = secs(item?.current_period_start);
+      const end = secs(item?.current_period_end);
+      if (start && end) return { start, end };
+    }
+
+    return {
+      start: secs(sub?.current_period_start),
+      end: secs(sub?.current_period_end),
+    };
+  }
+
   private resolveInvoicePeriod(invoice: any): { start?: Date; end?: Date } {
     const line = invoice?.lines?.data?.[0];
     const period = line?.period ?? invoice?.period;
@@ -562,12 +587,9 @@ export class StripeGateway implements IPaymentGateway {
         parsed.customerId =
           typeof sub.customer === 'string' ? sub.customer : sub.customer?.id;
         parsed.status = this.mapStripeStatus(sub.status);
-        if (sub.current_period_start) {
-          parsed.currentPeriodStart = new Date(sub.current_period_start * 1000);
-        }
-        if (sub.current_period_end) {
-          parsed.currentPeriodEnd = new Date(sub.current_period_end * 1000);
-        }
+        const period = this.resolveSubscriptionPeriod(sub);
+        parsed.currentPeriodStart = period.start;
+        parsed.currentPeriodEnd = period.end;
         break;
       }
 
