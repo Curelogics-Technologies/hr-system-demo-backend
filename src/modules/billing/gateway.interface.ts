@@ -68,7 +68,14 @@ export interface ParsedWebhookEvent {
   subscriptionId?: string;
   customerId?: string;
   status?: SubscriptionStatus;
+  /** What the provider actually collected. Zero is meaningful. */
   amountCents?: number;
+  /**
+   * What the invoice was for. When this exceeds amountCents the provider
+   * declined to collect — typically because the total is under its minimum
+   * charge — and carried the balance to the next invoice.
+   */
+  invoiceTotalCents?: number;
   currency?: string;
   invoiceUrl?: string;
   providerInvoiceId?: string;

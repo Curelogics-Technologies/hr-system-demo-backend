@@ -586,6 +586,9 @@ export class StripeGateway implements IPaymentGateway {
             ? invoice.customer
             : invoice.customer?.id;
         parsed.amountCents = invoice.amount_paid;
+        // The invoice's own total, which can exceed what was collected when
+        // the amount sits under the provider's minimum charge.
+        parsed.invoiceTotalCents = invoice.total ?? undefined;
         parsed.currency = invoice.currency?.toUpperCase();
         parsed.status = 'active';
         parsed.invoiceUrl = invoice.hosted_invoice_url || invoice.invoice_pdf || undefined;

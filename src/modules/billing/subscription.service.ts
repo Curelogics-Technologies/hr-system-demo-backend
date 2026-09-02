@@ -670,8 +670,13 @@ export class SubscriptionService {
       );
 
       if (existingTx.rowCount === 0) {
+        // The provider settled the invoice without taking money: the total was
+        // under its minimum charge and has been carried to the next invoice.
+        const collectedNothing =
+          (event.invoiceTotalCents ?? 0) > 0 && (event.amountCents ?? 0) === 0;
+
         const totalAmountCents =
-          event.amountCents ??
+          collectedNothing ? (event.invoiceTotalCents ?? 0) : event.amountCents ??
           Math.round(
             (nextSeatQty * parseFloat(sub.unit_price_employee) +
               nextDevQty * parseFloat(sub.unit_price_device)) *
@@ -686,7 +691,7 @@ export class SubscriptionService {
             seat_quantity, device_quantity,
             unit_price_employee_cents, unit_price_device_cents,
             invoice_url, paid_at
-          ) VALUES ($1, $2, $3, $4, $5, $6, 'paid', $13, $7, $8, $9, $10, $11, $12, NOW())`,
+          ) VALUES ($1, $2, $3, $4, $5, $6, $14, $13, $7, $8, $9, $10, $11, $12, NOW())`,
           [
             sub.company_id,
             sub.id,
@@ -702,7 +707,8 @@ export class SubscriptionService {
             Math.round(parseFloat(sub.unit_price_employee) * 100),
             Math.round(parseFloat(sub.unit_price_device) * 100),
             event.invoiceUrl || null,
-            hasPendingUpgrade ? 'license_upgrade' : 'renewal',
+            collectedNothing ? 'carried_over' : hasPendingUpgrade ? 'license_upgrade' : 'renewal',
+            collectedNothing ? 'pending' : 'paid',
           ]
         );
       }
