@@ -23,6 +23,7 @@ export class StripeGateway implements IPaymentGateway {
 
   async createCheckoutSession(params: CheckoutParams): Promise<CheckoutResult> {
     const currency = (params.currency || 'EUR').toLowerCase();
+    const currencyLabel = currency.toUpperCase();
     const lineItems: Stripe.Checkout.SessionCreateParams.LineItem[] = [];
 
     // 1. Employee line item
@@ -43,7 +44,10 @@ export class StripeGateway implements IPaymentGateway {
             currency,
             product_data: {
               name: 'Employee Seats (VeylOHR)',
-              description: `Active employee license (€${(params.unitPriceEmployee || 0).toFixed(2)}/seat/month)`,
+              // Never hardcode a symbol here: the same text is shown on the
+              // hosted checkout page, and a PKR subscription labelled in euros
+              // misstates the price the customer is about to pay.
+              description: `Active employee license (${currencyLabel} ${(params.unitPriceEmployee || 0).toFixed(2)}/seat/month)`,
             },
             unit_amount: employeeUnitCents,
             recurring: {
@@ -70,7 +74,7 @@ export class StripeGateway implements IPaymentGateway {
             currency,
             product_data: {
               name: 'Terminal Devices (VeylOHR)',
-              description: `Active store terminal license (€${(params.unitPriceDevice || 0).toFixed(2)}/terminal/month)`,
+              description: `Active store terminal license (${currencyLabel} ${(params.unitPriceDevice || 0).toFixed(2)}/terminal/month)`,
             },
             unit_amount: deviceUnitCents,
             recurring: {
