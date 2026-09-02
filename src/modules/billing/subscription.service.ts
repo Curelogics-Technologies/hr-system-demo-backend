@@ -7,6 +7,7 @@ import {
 } from './gateway.interface';
 import { markHeadcountBilled, countBillableResources } from './headcount.service';
 import { priceLicenseChange, getLicenseSnapshot } from './license.service';
+import { resolveIsoCurrency, UnsupportedCurrencyError } from './currency';
 
 /**
  * What an increase actually costs mid-cycle.
@@ -122,7 +123,23 @@ export class SubscriptionService {
 
     const unitPriceEmployee = parseFloat(company.price_per_employee || '0');
     const unitPriceDevice = parseFloat(company.price_per_device || '0');
-    const currency = company.currency || 'EUR';
+
+    // The company currency is free text, so it can be a display name like
+    // "Euro" or "Pakistani Rupee". Providers only accept the ISO code, and the
+    // billing columns store the code, so resolve it here and fail with a clear
+    // message rather than letting the database or Stripe reject it obscurely.
+    let currency: string;
+    try {
+      currency = resolveIsoCurrency(company.currency);
+    } catch (err) {
+      if (err instanceof UnsupportedCurrencyError) {
+        throw new BillingError(err.code, err.message, err.statusCode, {
+          given: err.given,
+          companyId,
+        });
+      }
+      throw err;
+    }
 
     // A2. Preflight: mandatory company billing identity must be complete.
     const missing = missingCompanyFields(company);
