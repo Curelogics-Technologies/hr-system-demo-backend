@@ -6,6 +6,22 @@ import {
   SubscriptionStatus,
 } from './gateway.interface';
 import { markHeadcountBilled, countBillableResources } from './headcount.service';
+import { emitToCompany } from '../../config/socket';
+
+/**
+ * Tells a company's open pages that its billing state moved.
+ *
+ * Deliberately carries no data: the client refetches, so there is one source of
+ * truth and no risk of a stale payload overwriting fresher state. Never allowed
+ * to throw — a socket problem must not fail a webhook we have already accepted.
+ */
+function announceBillingChange(companyId: number, reason: string) {
+  try {
+    emitToCompany(companyId, 'billing:updated', { reason, at: new Date().toISOString() });
+  } catch (err: any) {
+    console.error('[Billing] Could not announce billing change:', err?.message || err);
+  }
+}
 import { priceLicenseChange, getLicenseSnapshot } from './license.service';
 import { resolveIsoCurrency, UnsupportedCurrencyError } from './currency';
 
@@ -458,6 +474,7 @@ export class SubscriptionService {
       }
 
       await client.query('COMMIT');
+      announceBillingChange(sub.company_id, 'activated');
     } catch (err) {
       await client.query('ROLLBACK');
       throw err;
@@ -688,6 +705,7 @@ export class SubscriptionService {
       }
 
       await client.query('COMMIT');
+      announceBillingChange(sub.company_id, 'payment');
     } catch (err) {
       await client.query('ROLLBACK');
       throw err;
@@ -1399,6 +1417,7 @@ export class SubscriptionService {
       }
 
       await client.query('COMMIT');
+      announceBillingChange(sub.company_id, 'settled');
     } catch (err) {
       await client.query('ROLLBACK');
       throw err;
