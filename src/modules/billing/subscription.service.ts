@@ -7,6 +7,7 @@ import {
 } from './gateway.interface';
 import { markHeadcountBilled, countBillableResources } from './headcount.service';
 import { emitToCompany } from '../../config/socket';
+import { resolveCompanyPricing, CompanyPricing } from './pricing';
 
 /**
  * Tells a company's open pages that its billing state moved.
@@ -22,6 +23,99 @@ export function announceBillingChange(companyId: number, reason: string) {
     console.error('[Billing] Could not announce billing change:', err?.message || err);
   }
 }
+
+/**
+ * Brings a subscription's prices back in line with its company's.
+ *
+ * Price lives on the company; the subscription's unit_price_* columns and the
+ * gateway's recurring price are copies kept so a charge, an invoice and a
+ * stored transaction all quote the same figure. Nothing refreshed those copies
+ * when an admin edited a price or a discount, so a company whose rate changed
+ * from 10 to 100 was still quoted, charged and renewed at 10 while every screen
+ * showed 100.
+ *
+ * Returns the effective pricing so callers can price a change straight after.
+ * The gateway is only called when the price actually moved, because pushing an
+ * unchanged price would rewrite the provider's price object for nothing.
+ */
+export async function syncSubscriptionPricing(
+  sub: {
+    id: number;
+    company_id: number;
+    provider: PaymentProvider;
+    provider_subscription_id: string | null;
+    seat_quantity: number;
+    device_quantity: number;
+    unit_price_employee: string | number;
+    unit_price_device: string | number;
+    currency: string;
+    status?: string;
+  },
+  options: { pushToGateway?: boolean } = {}
+): Promise<CompanyPricing> {
+  const pricing = await resolveCompanyPricing(sub.company_id);
+
+  const storedEmployee = parseFloat(String(sub.unit_price_employee)) || 0;
+  const storedDevice = parseFloat(String(sub.unit_price_device)) || 0;
+
+  const changed =
+    Math.abs(storedEmployee - pricing.unitPriceEmployee) >= 0.005 ||
+    Math.abs(storedDevice - pricing.unitPriceDevice) >= 0.005;
+
+  if (!changed) return pricing;
+
+  // A company with no price configured is mid-setup, not free. Leaving the
+  // last known price in place is safer than rewriting a live subscription
+  // down to zero because a field was cleared.
+  if (!(pricing.unitPriceEmployee > 0) && !(pricing.unitPriceDevice > 0)) {
+    console.warn(
+      `[Billing] Company ${sub.company_id} has no pricing configured; leaving subscription ${sub.id} at its stored prices`
+    );
+    return pricing;
+  }
+
+  await pool.query(
+    `UPDATE subscriptions
+     SET unit_price_employee = $1, unit_price_device = $2, updated_at = NOW()
+     WHERE id = $3`,
+    [pricing.unitPriceEmployee, pricing.unitPriceDevice, sub.id]
+  );
+
+  console.log(
+    `[Billing] Subscription ${sub.id} repriced: employee ${storedEmployee} -> ` +
+      `${pricing.unitPriceEmployee}, terminal ${storedDevice} -> ${pricing.unitPriceDevice}` +
+      (pricing.discountActive ? ` (after ${pricing.discountPercent}% discount)` : '')
+  );
+
+  // The provider bills the renewal from its own copy of the price, so a change
+  // that stops here would show correctly in the app and still charge the old
+  // amount next month.
+  if (options.pushToGateway !== false && sub.provider_subscription_id) {
+    try {
+      const gateway = getPaymentGateway(sub.provider);
+      await gateway.updateSubscriptionQuantities({
+        providerSubscriptionId: sub.provider_subscription_id,
+        newSeatQuantity: sub.seat_quantity,
+        newDeviceQuantity: sub.device_quantity,
+        unitPriceEmployee: pricing.unitPriceEmployee,
+        unitPriceDevice: pricing.unitPriceDevice,
+        currency: sub.currency,
+        immediate: false,
+      });
+    } catch (err) {
+      // The stored price is already correct, so the app is consistent; only the
+      // provider's renewal amount is behind. The daily job retries.
+      console.error(
+        `[Billing] Could not push new pricing to ${sub.provider} for subscription ${sub.id}:`,
+        (err as Error)?.message || err
+      );
+    }
+  }
+
+  announceBillingChange(sub.company_id, 'pricing_updated');
+  return pricing;
+}
+
 import { priceLicenseChange, getLicenseSnapshot } from './license.service';
 import { resolveIsoCurrency, UnsupportedCurrencyError } from './currency';
 
@@ -137,8 +231,11 @@ export class SubscriptionService {
 
     const company = compRes.rows[0];
 
-    const unitPriceEmployee = parseFloat(company.price_per_employee || '0');
-    const unitPriceDevice = parseFloat(company.price_per_device || '0');
+    // A discount has to reach the very first payment too, not only later
+    // changes, so checkout prices from the same resolver as everything else.
+    const checkoutPricing = await resolveCompanyPricing(companyId);
+    const unitPriceEmployee = checkoutPricing.unitPriceEmployee;
+    const unitPriceDevice = checkoutPricing.unitPriceDevice;
 
     // The company currency is free text, so it can be a display name like
     // "Euro" or "Pakistani Rupee". Providers only accept the ISO code, and the
@@ -909,8 +1006,12 @@ export class SubscriptionService {
       [companyId]
     );
 
-    const pricePerEmployee = parseFloat(company.price_per_employee || '0');
-    const pricePerDevice = parseFloat(company.price_per_device || '0');
+    // The price a company pays is its list price less any active discount, and
+    // every screen must quote that same figure - the summary card, the licence
+    // modal and the invoice alike.
+    const pricing = await resolveCompanyPricing(companyId);
+    const pricePerEmployee = pricing.unitPriceEmployee;
+    const pricePerDevice = pricing.unitPriceDevice;
     const monthlyTotal =
       liveEmployeeCount * pricePerEmployee + liveDeviceCount * pricePerDevice;
 
@@ -970,6 +1071,10 @@ export class SubscriptionService {
         pecEmail: company.pec_email,
         pricePerEmployee,
         pricePerDevice,
+        listPricePerEmployee: pricing.listPriceEmployee,
+        listPricePerDevice: pricing.listPriceDevice,
+        discountPercent: pricing.discountPercent,
+        discountActive: pricing.discountActive,
       },
       subscription: subscription
         ? {
@@ -1063,6 +1168,12 @@ export class SubscriptionService {
       );
     }
     const sub = subRes.rows[0];
+
+    // Same refresh the quote did, so an admin can never be charged against a
+    // price that changed between seeing the figure and confirming it.
+    const pricing = await syncSubscriptionPricing(sub);
+    sub.unit_price_employee = pricing.unitPriceEmployee;
+    sub.unit_price_device = pricing.unitPriceDevice;
 
     // Never below what is already in use — that would strand existing users.
     const inUse = await countBillableResources(companyId);
@@ -1484,27 +1595,38 @@ export class SubscriptionService {
       [params.companyId]
     );
 
-    const compRes = await pool.query(
-      `SELECT price_per_employee, price_per_device, currency FROM companies WHERE id = $1`,
-      [params.companyId]
-    );
-    const company = compRes.rows[0] || {};
     const sub = subRes.rowCount ? subRes.rows[0] : null;
 
-    return priceLicenseChange({
+    // Price the change against what the company costs today, not against the
+    // figures captured when the subscription was opened. The subscription is
+    // brought back in line first, so the quote the admin approves is the same
+    // number the charge uses a moment later.
+    const pricing = sub
+      ? await syncSubscriptionPricing(sub)
+      : await resolveCompanyPricing(params.companyId);
+
+    const quote = priceLicenseChange({
       currentEmployees: sub ? sub.seat_quantity : 0,
       currentTerminals: sub ? sub.device_quantity : 0,
       newEmployees: Math.floor(params.employeeLicenses),
       newTerminals: Math.floor(params.terminalLicenses),
-      unitPriceEmployee: parseFloat(
-        sub ? sub.unit_price_employee : company.price_per_employee || '0'
-      ),
-      unitPriceDevice: parseFloat(
-        sub ? sub.unit_price_device : company.price_per_device || '0'
-      ),
+      unitPriceEmployee: pricing.unitPriceEmployee,
+      unitPriceDevice: pricing.unitPriceDevice,
       periodStart: sub?.current_period_start ? new Date(sub.current_period_start) : null,
       periodEnd: sub?.current_period_end ? new Date(sub.current_period_end) : null,
     });
+
+    // The modal shows what a licence costs and why, so the discount travels
+    // with the quote instead of being inferred from two numbers.
+    return {
+      ...quote,
+      unitPriceEmployee: pricing.unitPriceEmployee,
+      unitPriceDevice: pricing.unitPriceDevice,
+      listPriceEmployee: pricing.listPriceEmployee,
+      listPriceDevice: pricing.listPriceDevice,
+      discountPercent: pricing.discountPercent,
+      discountActive: pricing.discountActive,
+    };
   }
 
   /**

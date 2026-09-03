@@ -4,6 +4,7 @@ import { ok, created, notFound, badRequest } from '../../utils/response';
 import { asyncHandler } from '../../utils/asyncHandler';
 import { resolveAllowedCompanyIds, resolveCompanyGroupId } from '../../utils/companyScope';
 import { normalizePartitaIva, normalizeSdiCode, normalizePecEmail } from '../../utils/italianFiscal';
+import { syncSubscriptionPricing } from '../billing/subscription.service';
 
 interface CompanyRow {
   id: number;
@@ -374,6 +375,38 @@ export const updateCompany = asyncHandler(async (req: Request, res: Response) =>
     notFound(res, 'Azienda non trovata');
     return;
   }
+
+  // A price or discount edit has to reach the live subscription, or the app
+  // would show the new rate while the provider kept billing the old one. This
+  // never fails the save: the daily job repairs anything that does not stick.
+  const pricingTouched =
+    profile.price_per_employee !== undefined ||
+    profile.price_per_device !== undefined ||
+    profile.discount_percent !== undefined ||
+    profile.discount_valid_from !== undefined ||
+    profile.discount_valid_to !== undefined;
+
+  if (pricingTouched) {
+    try {
+      const subs = await pool.query(
+        `SELECT id, company_id, provider, provider_subscription_id, seat_quantity,
+                device_quantity, unit_price_employee, unit_price_device, currency, status
+         FROM subscriptions
+         WHERE company_id = $1 AND status IN ('active', 'past_due')
+        `,
+        [targetCompanyId]
+      );
+      for (const sub of subs.rows) {
+        await syncSubscriptionPricing(sub);
+      }
+    } catch (err) {
+      console.error(
+        `[Companies] Could not reprice subscriptions for company ${targetCompanyId}:`,
+        (err as Error)?.message || err
+      );
+    }
+  }
+
 
   const company = await getCompanyCardById(targetCompanyId);
   if (!company) { notFound(res, 'Azienda non trovata'); return; }
