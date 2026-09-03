@@ -5,6 +5,7 @@ import { sendEmailForCompany } from '../services/email.service';
 import {
   subscriptionService,
   announceBillingChange,
+  syncSubscriptionPricing,
 } from '../modules/billing/subscription.service';
 
 /**
@@ -263,11 +264,45 @@ export async function processSubscriptionPeriodDrift() {
 }
 
 
+/**
+ * Reprices subscriptions whose company price or discount has since changed.
+ *
+ * Price edits normally reach the subscription the moment they are made, but a
+ * gateway call can fail, and a discount can start or expire on a date with
+ * nobody watching. This closes both gaps: it compares every live subscription
+ * against its company's current pricing and corrects what has drifted.
+ */
+export async function processSubscriptionPricingDrift() {
+  try {
+    const subRes = await pool.query(
+      `SELECT id, company_id, provider, provider_subscription_id, seat_quantity,
+              device_quantity, unit_price_employee, unit_price_device, currency, status
+       FROM subscriptions
+       WHERE status IN ('active', 'past_due')`
+    );
+
+    for (const sub of subRes.rows) {
+      try {
+        await syncSubscriptionPricing(sub);
+      } catch (err) {
+        console.error(
+          `[BillingJob] Repricing failed for subscription ${sub.id}:`,
+          (err as Error)?.message || err
+        );
+      }
+    }
+  } catch (err) {
+    console.error('[BillingJob] processSubscriptionPricingDrift failed:', err);
+  }
+}
+
+
 export function startBillingCron() {
   cron.schedule('0 2 * * *', async () => {
     console.log('[BillingJob] Running daily billing jobs...');
     await processStuckLicenseUpgrades();
     await processSubscriptionPeriodDrift();
+    await processSubscriptionPricingDrift();
     await processBillingRenewalReconciliations();
     await processBillingReminders();
     await processBillingGracePeriodExpirations();

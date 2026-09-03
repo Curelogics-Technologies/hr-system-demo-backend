@@ -203,21 +203,59 @@ export class StripeGateway implements IPaymentGateway {
 
     const updatePromises: Promise<any>[] = [];
 
+    // Stripe bills a renewal from its own price object, so a repriced licence
+    // has to be pushed here or the app and the invoice disagree next month.
+    // price_data is only sent when the figure actually moved: sending it every
+    // time would mint a new Price object on Stripe for an unchanged amount.
+    // Stripe resets quantity to 1 when an item's price changes unless quantity
+    // is sent in the same call, so both always travel together.
+    const repricing = async (
+      item: any,
+      newUnitPrice: number | undefined,
+      quantity: number
+    ): Promise<Record<string, any>> => {
+      const wantedCents = Math.round((newUnitPrice || 0) * 100);
+      const currentCents = item?.price?.unit_amount ?? null;
+      if (!wantedCents || currentCents === null || wantedCents === currentCents) {
+        return { quantity };
+      }
+      const productId =
+        typeof item.price.product === 'string'
+          ? item.price.product
+          : item.price.product?.id;
+      if (!productId) return { quantity };
+      return {
+        quantity,
+        price_data: {
+          currency,
+          product: productId,
+          unit_amount: wantedCents,
+          recurring: { interval: 'month' },
+        },
+      };
+    };
+
     if (seatItem) {
       updatePromises.push(
-        this.stripe.subscriptionItems.update(seatItem.id, {
-          quantity: Math.max(1, params.newSeatQuantity),
-          proration_behavior,
-        })
+        repricing(seatItem, params.unitPriceEmployee, Math.max(1, params.newSeatQuantity)).then(
+          (payload) =>
+            this.stripe.subscriptionItems.update(seatItem.id, {
+              ...payload,
+              proration_behavior,
+            } as any)
+        )
       );
     }
 
     if (deviceItem && params.newDeviceQuantity > 0) {
       updatePromises.push(
-        this.stripe.subscriptionItems.update(deviceItem.id, {
-          quantity: params.newDeviceQuantity,
-          proration_behavior,
-        })
+        repricing(deviceItem, params.unitPriceDevice, params.newDeviceQuantity).then(
+          (payload) =>
+            this.stripe.subscriptionItems.update(deviceItem.id, {
+              ...payload,
+              proration_behavior,
+            } as any)
+        )
       );
     } else if (deviceItem && params.newDeviceQuantity === 0) {
       updatePromises.push(
