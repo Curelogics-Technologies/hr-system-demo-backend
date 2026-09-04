@@ -46,6 +46,10 @@ export const ITALIAN_PROVINCE_BY_CITY: Record<string, string> = {
   'gorizia': 'GO',
   'grosseto': 'GR',
   'imperia': 'IM',
+  // Sanremo is the largest town in the province of Imperia; without these the
+  // resolver fell through to the region fallback and published it as 'GE'.
+  'sanremo': 'IM',
+  'san remo': 'IM',
   'isernia': 'IS',
   'la spezia': 'SP',
   'l\'aquila': 'AQ',
