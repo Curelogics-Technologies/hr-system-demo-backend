@@ -47,15 +47,19 @@ export function salaryPeriodItalianLabel(value: string | null | undefined): stri
   return canonical ? IT_LABEL[canonical] : null;
 }
 
+/**
+ * Plain digits, no thousands separator — this feeds Indeed's <salary> tag and
+ * their spec only ever shows unseparated amounts ("$50000 per year"). An
+ * it-IT grouped amount would read as "€1.000", which their parser can take for
+ * one euro. Not using Intl also keeps the output identical on a Node build
+ * without full ICU data.
+ */
 export function formatItalianAmount(value: number): string {
-  return new Intl.NumberFormat('it-IT', {
-    minimumFractionDigits: 0,
-    maximumFractionDigits: 0,
-  }).format(Math.round(value));
+  return String(Math.round(value));
 }
 
 /**
- * Builds the human-readable salary string, e.g. "€1.800 - €2.400 al mese".
+ * Builds the human-readable salary string, e.g. "€1800 - €2400 al mese".
  * When the period is unset or unrecognised the amount is returned without a
  * period suffix — never guess, a wrong period is worse than none.
  */

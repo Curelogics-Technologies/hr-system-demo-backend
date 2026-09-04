@@ -1771,7 +1771,11 @@ function cleanFeedTitle(rawTitle: string, city: string): string {
   let out = (rawTitle ?? '').replace(/\s+/g, ' ').trim();
   const c = (city ?? '').trim();
   if (c && c.toLowerCase() !== 'remote') {
-    const escaped = c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const escaped = c
+      .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      // A city is often written in the title without its internal separator,
+      // so "San Remo" must also strip a title that says "Sanremo".
+      .replace(/\s+/g, "[\\s'’-]*");
     out = out.replace(new RegExp(`\\s*[-–,]?\\s*\\b${escaped}\\b`, 'gi'), ' ');
   }
   out = out.replace(/\s+/g, ' ').replace(/[\s\-–,]+$/g, '').trim();
@@ -2372,7 +2376,7 @@ export const jobFeedHandler = async (req: Request, res: Response): Promise<void>
           `    <title>${wrapCdata(title)}</title>`,
           `    <date>${wrapCdata(pubDate)}</date>`,
           `    <referencenumber>${wrapCdata(referenceNumber)}</referencenumber>`,
-          `    <requisitionid>REQ-${job.id}</requisitionid>`,
+          `    <requisitionid>${wrapCdata(`REQ-${job.id}`)}</requisitionid>`,
           `    <url>${wrapCdata(jobUrl)}</url>`,
           `    <company>${wrapCdata(job.companyName || company.name)}</company>`,
           `    <sourcename>${wrapCdata(job.companyGroupName || job.companyName || company.name)}</sourcename>`,

@@ -99,8 +99,8 @@ describe('jobFeedHandler — Indeed feed compliance', () => {
     expect(sendMock).toHaveBeenCalled();
     const xml = sendMock.mock.calls[0][0];
 
-    expect(xml).toContain('<requisitionid>REQ-101</requisitionid>');
-    expect(xml).toContain('<requisitionid>REQ-102</requisitionid>');
+    expect(xml).toContain('<requisitionid><![CDATA[REQ-101]]></requisitionid>');
+    expect(xml).toContain('<requisitionid><![CDATA[REQ-102]]></requisitionid>');
   });
 
   it('Test 2 — <date> format is ISO 8601', async () => {
@@ -266,7 +266,7 @@ describe('jobFeedHandler — Indeed feed compliance', () => {
     // published monthly salaries as annual ones.
     expect(await feedSalary(createMockJob({ salaryPeriod: 'monthly' }))).toBe('€1800 - €2400 al mese');
     expect(await feedSalary(createMockJob({ salaryPeriod: 'yearly', salaryMin: 30000, salaryMax: 45000 })))
-      .toBe('€30.000 - €45.000 per anno');
+      .toBe('€30000 - €45000 per anno');
     expect(await feedSalary(createMockJob({ salaryPeriod: 'hourly', salaryMin: 12, salaryMax: 15 })))
       .toBe("€12 - €15 all'ora");
     expect(await feedSalary(createMockJob({ salaryPeriod: 'weekly', salaryMin: 600, salaryMax: 800 })))
@@ -274,7 +274,7 @@ describe('jobFeedHandler — Indeed feed compliance', () => {
     expect(await feedSalary(createMockJob({ salaryPeriod: 'daily', salaryMin: 120, salaryMax: null })))
       .toBe('€120 al giorno');
     expect(await feedSalary(createMockJob({ salaryPeriod: 'annually', salaryMin: 30000, salaryMax: null })))
-      .toBe('€30.000 per anno');
+      .toBe('€30000 per anno');
   });
 
   it('accepts legacy Italian salary period values stored in the database', async () => {
