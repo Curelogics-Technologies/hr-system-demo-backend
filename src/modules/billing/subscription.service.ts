@@ -8,6 +8,7 @@ import {
 import { markHeadcountBilled, countBillableResources } from './headcount.service';
 import { emitToCompany } from '../../config/socket';
 import { resolveCompanyPricing, CompanyPricing } from './pricing';
+import { ProviderSubscriptionMissingError } from './paypal.service';
 
 /**
  * Tells a company's open pages that its billing state moved.
@@ -185,6 +186,26 @@ export class BillingError extends Error {
     super(message);
     this.name = 'BillingError';
   }
+}
+
+/**
+ * Rewrites a provider "no such subscription" into something an admin can act on.
+ *
+ * The raw provider error is a wall of JSON that reads as a server fault. It is
+ * not: the subscription belongs to a different set of provider credentials and
+ * cannot be reached from here at all, so retrying is pointless and the only way
+ * forward is a new subscription. Anything else is rethrown untouched.
+ */
+function asBillingError(err: unknown): unknown {
+  if (err instanceof ProviderSubscriptionMissingError) {
+    return new BillingError(
+      err.code,
+      err.message,
+      409,
+      { providerSubscriptionId: err.providerSubscriptionId }
+    );
+  }
+  return err;
 }
 
 /** Company fields that must be filled before any subscription can be started. */
@@ -528,6 +549,23 @@ export class SubscriptionService {
       // arrives as invoice.payment_succeeded, and that handler keys on the
       // invoice id; deduping on the event id here meant the two handlers
       // could not see each other and recorded one payment as two.
+      // The card is recorded as it was at payment time. Reading it from the
+      // subscription when the receipt is opened would show whatever card is
+      // on file today, which is not what paid this invoice. Best effort: a
+      // receipt missing a card line is better than a webhook that failed.
+      let methodBrand: string | null = null;
+      let methodLast4: string | null = null;
+      try {
+        if (sub.provider === 'stripe' && sub.provider_subscription_id) {
+          const gw = getPaymentGateway(sub.provider) as any;
+          const pm = await gw.describeDefaultPaymentMethod?.(sub.provider_subscription_id);
+          methodBrand = pm?.brand ?? null;
+          methodLast4 = pm?.last4 ?? null;
+        }
+      } catch {
+        // Ignored on purpose: see above.
+      }
+
       const activationKey = event.providerInvoiceId || event.eventId;
 
       const existingTx = await client.query(
@@ -545,8 +583,10 @@ export class SubscriptionService {
             status, kind, description,
             seat_quantity, device_quantity,
             unit_price_employee_cents, unit_price_device_cents,
-            invoice_url, paid_at
-          ) VALUES ($1, $2, $3, $4, $13, $5, $6, 'paid', 'activation', $7, $8, $9, $10, $11, $12, NOW())`,
+            invoice_url, paid_at,
+            period_start, period_end,
+            payment_method_brand, payment_method_last4
+          ) VALUES ($1, $2, $3, $4, $13, $5, $6, 'paid', 'activation', $7, $8, $9, $10, $11, $12, NOW(), $14, $15, $16, $17)`,
           [
             sub.company_id,
             sub.id,
@@ -561,8 +601,18 @@ export class SubscriptionService {
             Math.round(parseFloat(sub.unit_price_device) * 100),
             event.invoiceUrl || null,
             event.providerInvoiceId || null,
+            periodStart,
+            periodEnd,
+            methodBrand,
+            methodLast4,
           ]
         );
+
+        // The first payment settles every resource counted up to this point.
+        // Without this the opening employees and terminals stay "awaiting
+        // billing" for the life of the company, because nothing else ever
+        // marks them: the upgrade path only covers what an upgrade added.
+        await markHeadcountBilled(sub.company_id, sub.id, client);
       }
 
       // Supersede any other still-live subscription for this company. Without
@@ -704,9 +754,9 @@ export class SubscriptionService {
       const hasPendingUpgrade =
         sub.requested_seat_quantity !== null || sub.requested_device_quantity !== null;
 
-      if (hasPendingUpgrade) {
-        await markHeadcountBilled(sub.company_id, sub.id, client);
-      }
+      // Any paid cycle settles the resources counted during it, not only one
+      // that carried an upgrade - a plain renewal pays for them just the same.
+      await markHeadcountBilled(sub.company_id, sub.id, client);
 
       // Licenses are what was bought. They only shrink when the admin asked for
       // a reduction, and only as a new period starts.
@@ -791,6 +841,23 @@ export class SubscriptionService {
       // Key on the invoice, not the event: the same invoice can arrive under
       // several event ids (provider retry, replay, reconcile) and each would
       // otherwise insert its own duplicate payment row.
+      // The card is recorded as it was at payment time. Reading it from the
+      // subscription when the receipt is opened would show whatever card is
+      // on file today, which is not what paid this invoice. Best effort: a
+      // receipt missing a card line is better than a webhook that failed.
+      let methodBrand: string | null = null;
+      let methodLast4: string | null = null;
+      try {
+        if (sub.provider === 'stripe' && sub.provider_subscription_id) {
+          const gw = getPaymentGateway(sub.provider) as any;
+          const pm = await gw.describeDefaultPaymentMethod?.(sub.provider_subscription_id);
+          methodBrand = pm?.brand ?? null;
+          methodLast4 = pm?.last4 ?? null;
+        }
+      } catch {
+        // Ignored on purpose: see above.
+      }
+
       const paymentKey = event.providerInvoiceId || event.eventId;
 
       const existingTx = await client.query(
@@ -820,8 +887,10 @@ export class SubscriptionService {
             status, kind, description,
             seat_quantity, device_quantity,
             unit_price_employee_cents, unit_price_device_cents,
-            invoice_url, paid_at
-          ) VALUES ($1, $2, $3, $4, $5, $6, $14, $13, $7, $8, $9, $10, $11, $12, NOW())`,
+            invoice_url, paid_at,
+            period_start, period_end,
+            payment_method_brand, payment_method_last4
+          ) VALUES ($1, $2, $3, $4, $5, $6, $14, $13, $7, $8, $9, $10, $11, $12, NOW(), $15, $16, $17, $18)`,
           [
             sub.company_id,
             sub.id,
@@ -839,6 +908,10 @@ export class SubscriptionService {
             event.invoiceUrl || null,
             collectedNothing ? 'carried_over' : hasPendingUpgrade ? 'license_upgrade' : 'renewal',
             collectedNothing ? 'pending' : 'paid',
+            periodStart,
+            periodEnd,
+            methodBrand,
+            methodLast4,
           ]
         );
       }
@@ -1120,6 +1193,17 @@ export class SubscriptionService {
         description: tx.description,
         seatQuantity: tx.seat_quantity,
         deviceQuantity: tx.device_quantity,
+        // The unit prices are what turn a total into a receipt somebody can
+        // check. They were stored all along and simply never sent, so the
+        // receipt printed a dash where each line amount belonged.
+        unitPriceEmployeeCents: tx.unit_price_employee_cents,
+        unitPriceDeviceCents: tx.unit_price_device_cents,
+        // The cycle this payment covered, read from the payment rather than
+        // from the subscription, which may since have moved on.
+        periodStart: tx.period_start,
+        periodEnd: tx.period_end,
+        paymentMethodBrand: tx.payment_method_brand,
+        paymentMethodLast4: tx.payment_method_last4,
         invoiceUrl: tx.invoice_url,
         failureMessage: tx.failure_message,
         paidAt: tx.paid_at,
@@ -1243,15 +1327,21 @@ export class SubscriptionService {
     if (sub.provider === 'paypal') {
       if (sub.provider_subscription_id) {
         const gateway = getPaymentGateway(sub.provider);
-        await gateway.updateSubscriptionQuantities({
-          providerSubscriptionId: sub.provider_subscription_id,
-          newSeatQuantity: newEmployees,
-          newDeviceQuantity: newTerminals,
-          unitPriceEmployee: parseFloat(sub.unit_price_employee),
-          unitPriceDevice: parseFloat(sub.unit_price_device),
-          currency: sub.currency,
-          immediate: false,
-        });
+        try {
+          await gateway.updateSubscriptionQuantities({
+            providerSubscriptionId: sub.provider_subscription_id,
+            newSeatQuantity: newEmployees,
+            newDeviceQuantity: newTerminals,
+            unitPriceEmployee: parseFloat(sub.unit_price_employee),
+            unitPriceDevice: parseFloat(sub.unit_price_device),
+            currency: sub.currency,
+            immediate: false,
+          });
+        } catch (err) {
+          // A subscription the provider cannot find is a configuration story,
+          // not a server fault - say so instead of returning a 500.
+          throw asBillingError(err);
+        }
       }
 
       await pool.query(
@@ -1304,25 +1394,32 @@ export class SubscriptionService {
     try {
       if (sub.provider_subscription_id) {
         const gateway = getPaymentGateway(sub.provider);
-        const result = await gateway.updateSubscriptionQuantities({
-          providerSubscriptionId: sub.provider_subscription_id,
-          newSeatQuantity: newEmployees,
-          newDeviceQuantity: newTerminals,
-          unitPriceEmployee: parseFloat(sub.unit_price_employee),
-          unitPriceDevice: parseFloat(sub.unit_price_device),
-          currency: sub.currency,
-          immediate: true,
-          // Bill exactly what was quoted, not the provider's own proration.
-          proratedAmountCents: quote.amountDueNowCents,
-          // Tied to this exact change on this exact period, so pressing the
-          // button twice settles once.
-          idempotencyKey:
-            `lic:${sub.id}:${newEmployees}x${newTerminals}:` +
-            `${sub.current_period_end ? new Date(sub.current_period_end).getTime() : 0}`,
-          chargeDescription:
-            `Licenze aggiuntive: +${quote.extraEmployees} dipendenti, +${quote.extraTerminals} terminali ` +
-            `(${quote.daysRemaining}/${quote.totalDays} giorni)`,
-        });
+        let result: Awaited<ReturnType<typeof gateway.updateSubscriptionQuantities>>;
+        try {
+          result = await gateway.updateSubscriptionQuantities({
+            providerSubscriptionId: sub.provider_subscription_id,
+            newSeatQuantity: newEmployees,
+            newDeviceQuantity: newTerminals,
+            unitPriceEmployee: parseFloat(sub.unit_price_employee),
+            unitPriceDevice: parseFloat(sub.unit_price_device),
+            currency: sub.currency,
+            immediate: true,
+            // Bill exactly what was quoted, not the provider's own proration.
+            proratedAmountCents: quote.amountDueNowCents,
+            // Tied to this exact change on this exact period, so pressing the
+            // button twice settles once.
+            idempotencyKey:
+              `lic:${sub.id}:${newEmployees}x${newTerminals}:` +
+              `${sub.current_period_end ? new Date(sub.current_period_end).getTime() : 0}`,
+            chargeDescription:
+              `Licenze aggiuntive: +${quote.extraEmployees} dipendenti, +${quote.extraTerminals} terminali ` +
+              `(${quote.daysRemaining}/${quote.totalDays} giorni)`,
+          });
+        } catch (err) {
+          // A subscription the provider cannot find is a configuration story,
+          // not a server fault - say so instead of returning a 500.
+          throw asBillingError(err);
+        }
         approveUrl = result.approveUrl;
         chargedInvoiceId = result.proratedInvoiceId;
       }
@@ -1647,7 +1744,13 @@ export class SubscriptionService {
     const sub = subRes.rows[0];
     if (sub.provider_subscription_id) {
       const gateway = getPaymentGateway(sub.provider);
-      await gateway.cancelSubscription(sub.provider_subscription_id, true);
+      try {
+        await gateway.cancelSubscription(sub.provider_subscription_id, true);
+      } catch (err) {
+        // A subscription the provider cannot find is a configuration story,
+        // not a server fault - say so instead of returning a 500.
+        throw asBillingError(err);
+      }
     }
 
     await pool.query(
@@ -1679,7 +1782,13 @@ export class SubscriptionService {
     const sub = subRes.rows[0];
     if (sub.provider_subscription_id) {
       const gateway = getPaymentGateway(sub.provider);
-      await gateway.reactivateSubscription(sub.provider_subscription_id);
+      try {
+        await gateway.reactivateSubscription(sub.provider_subscription_id);
+      } catch (err) {
+        // A subscription the provider cannot find is a configuration story,
+        // not a server fault - say so instead of returning a 500.
+        throw asBillingError(err);
+      }
     }
 
     await pool.query(

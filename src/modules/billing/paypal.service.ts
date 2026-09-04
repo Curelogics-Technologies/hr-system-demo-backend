@@ -9,6 +9,36 @@ import {
   UpdateQuantitiesResult,
 } from './gateway.interface';
 
+/**
+ * The provider has no record of a subscription we hold an id for.
+ *
+ * A PayPal subscription id belongs to the merchant account that created it, so
+ * changing the client id and secret - or moving between sandbox and live -
+ * leaves every earlier subscription unreachable: PayPal answers
+ * RESOURCE_NOT_FOUND rather than saying the credentials changed. It cannot be
+ * revised, cancelled or reactivated, and no retry will help, so it is worth a
+ * distinct type that callers can turn into an explanation.
+ */
+export class ProviderSubscriptionMissingError extends Error {
+  readonly code = 'PROVIDER_SUBSCRIPTION_MISSING';
+  constructor(
+    readonly providerSubscriptionId: string,
+    readonly providerDetail: string
+  ) {
+    super(
+      `PayPal does not recognise subscription ${providerSubscriptionId}. ` +
+        `It was most likely created under different PayPal credentials.`
+    );
+  }
+}
+
+/** True when a PayPal error body says the resource id is unknown. */
+function isMissingResource(body: string): boolean {
+  return (
+    body.includes('RESOURCE_NOT_FOUND') || body.includes('INVALID_RESOURCE_ID')
+  );
+}
+
 export class PayPalGateway implements IPaymentGateway {
   readonly provider: PaymentProvider = 'paypal';
   private clientId: string;
@@ -271,6 +301,9 @@ export class PayPalGateway implements IPaymentGateway {
 
     if (!reviseRes.ok) {
       const err = await reviseRes.text();
+      if (isMissingResource(err)) {
+        throw new ProviderSubscriptionMissingError(params.providerSubscriptionId, err);
+      }
       throw new Error(`Failed to revise PayPal subscription: ${err}`);
     }
 
@@ -334,6 +367,9 @@ export class PayPalGateway implements IPaymentGateway {
 
     if (!res.ok && res.status !== 204) {
       const err = await res.text();
+      if (isMissingResource(err)) {
+        throw new ProviderSubscriptionMissingError(providerSubId, err);
+      }
       throw new Error(`Failed to cancel PayPal subscription: ${err}`);
     }
   }
@@ -356,6 +392,9 @@ export class PayPalGateway implements IPaymentGateway {
 
     if (!res.ok && res.status !== 204) {
       const err = await res.text();
+      if (isMissingResource(err)) {
+        throw new ProviderSubscriptionMissingError(providerSubId, err);
+      }
       throw new Error(`Failed to activate PayPal subscription: ${err}`);
     }
   }
