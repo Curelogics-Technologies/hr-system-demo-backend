@@ -2,6 +2,7 @@ import cron from 'node-cron';
 import { pool } from '../config/database';
 import { getPaymentGateway } from '../modules/billing/gateway.factory';
 import { sendEmailForCompany } from '../services/email.service';
+import { getTaxConfig, taxCentsOnLines, verifyTaxConfiguration } from '../modules/billing/tax';
 import {
   subscriptionService,
   announceBillingChange,
@@ -128,18 +129,27 @@ export async function processBillingReminders() {
 
     for (const sub of subRes.rows) {
       if (sub.company_email) {
-        const nextTotal = (
-          sub.seat_quantity * parseFloat(sub.unit_price_employee) +
-          sub.device_quantity * parseFloat(sub.unit_price_device)
-        ).toFixed(2);
+        // The reminder has to quote what will actually be taken, so it states
+        // the same subtotal / tax / total the provider will charge rather than
+        // the net figure alone.
+        const seatCents = Math.round(sub.seat_quantity * parseFloat(sub.unit_price_employee) * 100);
+        const deviceCents = Math.round(sub.device_quantity * parseFloat(sub.unit_price_device) * 100);
+        const taxCents = taxCentsOnLines([seatCents, deviceCents]);
+        const taxPercent = getTaxConfig().percent;
+        const nextSubtotal = ((seatCents + deviceCents) / 100).toFixed(2);
+        const nextTotal = ((seatCents + deviceCents + taxCents) / 100).toFixed(2);
+        const taxLine =
+          taxCents > 0
+            ? ` (imponibile €${nextSubtotal} + IVA ${taxPercent}% €${(taxCents / 100).toFixed(2)})`
+            : '';
 
         const renewalDate = new Date(sub.current_period_end).toLocaleDateString('it-IT');
 
         await sendEmailForCompany(sub.company_id, {
           to: sub.company_email,
           subject: `Promemoria rinnovo abbonamento VeylOHR - ${sub.company_name}`,
-          html: `<p>Gentile Cliente,</p><p>Ti informiamo che il tuo abbonamento mensile VeylOHR per <strong>${sub.company_name}</strong> si rinnoverà il <strong>${renewalDate}</strong>.</p><p>Importo previsto: <strong>€${nextTotal}</strong> (${sub.seat_quantity} dipendenti attivi, ${sub.device_quantity} terminali).</p><p>Cordiali saluti,<br>Team VeylOHR</p>`,
-          text: `Gentile Cliente,\n\nTi informiamo che il tuo abbonamento mensile VeylOHR per ${sub.company_name} si rinnoverà il ${renewalDate}.\n\nImporto previsto: €${nextTotal} (${sub.seat_quantity} dipendenti attivi, ${sub.device_quantity} terminali).\n\nCordiali saluti,\nTeam VeylOHR`,
+          html: `<p>Gentile Cliente,</p><p>Ti informiamo che il tuo abbonamento mensile VeylOHR per <strong>${sub.company_name}</strong> si rinnoverà il <strong>${renewalDate}</strong>.</p><p>Importo previsto: <strong>€${nextTotal}</strong>${taxLine} (${sub.seat_quantity} dipendenti attivi, ${sub.device_quantity} terminali).</p><p>Cordiali saluti,<br>Team VeylOHR</p>`,
+          text: `Gentile Cliente,\n\nTi informiamo che il tuo abbonamento mensile VeylOHR per ${sub.company_name} si rinnoverà il ${renewalDate}.\n\nImporto previsto: €${nextTotal}${taxLine} (${sub.seat_quantity} dipendenti attivi, ${sub.device_quantity} terminali).\n\nCordiali saluti,\nTeam VeylOHR`,
         })
           .then(async () => {
             // Stamp only on success, so a transient mail failure is retried on
@@ -298,6 +308,15 @@ export async function processSubscriptionPricingDrift() {
 
 
 export function startBillingCron() {
+  // Two settings describe one tax rate and only Stripe's is charged, so a
+  // disagreement between them quotes customers a total they are not billed.
+  // Checking once at boot turns that into a log line instead of a discrepancy
+  // somebody finds on an invoice.
+  void verifyTaxConfiguration(async (id) => {
+    const gateway = getPaymentGateway('stripe') as any;
+    return gateway.describeTaxRate ? gateway.describeTaxRate(id) : null;
+  });
+
   cron.schedule('0 2 * * *', async () => {
     console.log('[BillingJob] Running daily billing jobs...');
     await processStuckLicenseUpgrades();

@@ -1,5 +1,6 @@
 import { pool } from '../../config/database';
 import { countBillableResources } from './headcount.service';
+import { getTaxConfig, taxCentsOn, taxCentsOnLines } from './tax';
 
 export type LicensedResource = 'employee' | 'terminal';
 
@@ -221,6 +222,22 @@ export function priceLicenseChange(params: {
     params.newEmployees * params.unitPriceEmployee +
     params.newTerminals * params.unitPriceDevice;
 
+  // Tax is charged by the provider on top of these figures, so the quote has
+  // to state it: the admin approves a total, and the total that leaves their
+  // account has to be the one they saw. The monthly tax is worked out per
+  // line because that is how both providers invoice a subscription - one line
+  // for employees, one for terminals, each taxed and then added up.
+  const { percent: taxPercent } = getTaxConfig();
+  const taxDueNowCents = taxCentsOn(amountDueNowCents, taxPercent);
+  const newMonthlyTotalCents = Math.round(newMonthlyTotal * 100);
+  const newMonthlyTaxCents = taxCentsOnLines(
+    [
+      Math.round(params.newEmployees * params.unitPriceEmployee * 100),
+      Math.round(params.newTerminals * params.unitPriceDevice * 100),
+    ],
+    taxPercent
+  );
+
   return {
     extraEmployees,
     extraTerminals,
@@ -235,6 +252,17 @@ export function priceLicenseChange(params: {
     remainingRatio,
     daysRemaining,
     totalDays,
+    /** The rate in force, so the UI can label the tax line rather than guess. */
+    taxPercent,
+    /** Tax on the prorated charge, and what will actually be collected now. */
+    taxDueNowCents,
+    taxDueNow: taxDueNowCents / 100,
+    totalDueNowCents: amountDueNowCents + taxDueNowCents,
+    totalDueNow: (amountDueNowCents + taxDueNowCents) / 100,
+    /** Tax on the new recurring price, and the gross the renewal will cost. */
+    newMonthlyTaxCents,
+    newMonthlyTax: newMonthlyTaxCents / 100,
+    newMonthlyTotalWithTax: round2((newMonthlyTotalCents + newMonthlyTaxCents) / 100),
   };
 }
 

@@ -76,6 +76,14 @@ export interface ParsedWebhookEvent {
    * charge — and carried the balance to the next invoice.
    */
   invoiceTotalCents?: number;
+  /**
+   * The invoice split, as the provider reported it: what the licences cost
+   * before tax, and the tax charged on them. Present only when the provider
+   * states them - a receipt showing an invented split would be worse than one
+   * showing only the total.
+   */
+  subtotalCents?: number;
+  taxCents?: number;
   currency?: string;
   invoiceUrl?: string;
   providerInvoiceId?: string;

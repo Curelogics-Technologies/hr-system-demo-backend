@@ -9,6 +9,7 @@ import {
   UpdateQuantitiesParams,
   UpdateQuantitiesResult,
 } from './gateway.interface';
+import { getTaxConfig } from './tax';
 
 export class StripeGateway implements IPaymentGateway {
   readonly provider: PaymentProvider = 'stripe';
@@ -22,6 +23,7 @@ export class StripeGateway implements IPaymentGateway {
   }
 
   async createCheckoutSession(params: CheckoutParams): Promise<CheckoutResult> {
+    const taxRateId = getTaxConfig().stripeTaxRateId;
     const currency = (params.currency || 'EUR').toLowerCase();
     const currencyLabel = currency.toUpperCase();
     const lineItems: Stripe.Checkout.SessionCreateParams.LineItem[] = [];
@@ -101,6 +103,12 @@ export class StripeGateway implements IPaymentGateway {
       customer_email: params.companyEmail || undefined,
       line_items: lineItems,
       subscription_data: {
+        // Tax is a fixed Tax Rate object created once in the Stripe dashboard,
+        // attached here as the subscription's default. Stripe then computes it
+        // on this first invoice and on every renewal after it, and shows the
+        // customer a subtotal, a tax line and the total it charges. Nothing in
+        // this codebase adds tax to an amount; the rate is only ever named.
+        ...(taxRateId ? { default_tax_rates: [taxRateId] } : {}),
         metadata: {
           companyId: String(params.companyId),
           companyName: params.companyName,
@@ -140,11 +148,27 @@ export class StripeGateway implements IPaymentGateway {
       { expand: ['items.data'] }
     );
 
+    const taxRateId = getTaxConfig().stripeTaxRateId;
     const currency = (params.currency || 'EUR').toLowerCase();
     const customerId =
       typeof sub.customer === 'string' ? sub.customer : (sub.customer as any)?.id;
 
     let proratedInvoiceId: string | undefined;
+
+    // A subscription opened before a tax rate was configured would keep
+    // renewing untaxed. Attaching the rate at the first licence change brings
+    // its renewals in line; sending a rate the subscription already carries is
+    // a no-op, so this can never tax anything twice.
+    if (taxRateId) {
+      const attached = ((sub as any).default_tax_rates || []).map((r: any) =>
+        typeof r === 'string' ? r : r?.id
+      );
+      if (!attached.includes(taxRateId)) {
+        await this.stripe.subscriptions.update(params.providerSubscriptionId, {
+          default_tax_rates: [taxRateId],
+        });
+      }
+    }
 
     // Charge BEFORE changing the recurring quantities.
     //
@@ -169,6 +193,10 @@ export class StripeGateway implements IPaymentGateway {
           subscription: params.providerSubscriptionId,
           amount: params.proratedAmountCents,
           currency,
+          // Licences bought mid-period are taxed at the same rate as the
+          // subscription itself. The amount above is the agreed net figure;
+          // Stripe adds the tax to it and collects the total.
+          ...(taxRateId ? { tax_rates: [taxRateId] } : {}),
           description:
             params.chargeDescription || 'Additional licenses (prorated to end of period)',
         },
@@ -362,12 +390,32 @@ export class StripeGateway implements IPaymentGateway {
    */
   async getInvoiceOutcome(
     invoiceId: string
-  ): Promise<{ outcome: 'paid' | 'failed' | 'pending'; hostedUrl?: string; amountCents?: number }> {
+  ): Promise<{
+    outcome: 'paid' | 'failed' | 'pending';
+    hostedUrl?: string;
+    amountCents?: number;
+    subtotalCents?: number;
+    taxCents?: number;
+  }> {
     const invoice = await this.stripe.invoices.retrieve(invoiceId);
     const hostedUrl = invoice.hosted_invoice_url || invoice.invoice_pdf || undefined;
 
     if (invoice.status === 'paid') {
-      return { outcome: 'paid', hostedUrl, amountCents: invoice.amount_paid ?? undefined };
+      // The split travels with the amount so this fallback writes the same
+      // receipt the webhook would have written, rather than a total with no
+      // tax line under it.
+      const anyInvoice = invoice as any;
+      return {
+        outcome: 'paid',
+        hostedUrl,
+        amountCents: invoice.amount_paid ?? undefined,
+        subtotalCents: anyInvoice.subtotal ?? undefined,
+        taxCents:
+          anyInvoice.tax ??
+          (Array.isArray(anyInvoice.total_taxes)
+            ? anyInvoice.total_taxes.reduce((sum: number, t: any) => sum + (t?.amount ?? 0), 0)
+            : undefined),
+      };
     }
     if (invoice.status === 'void' || invoice.status === 'uncollectible') {
       return { outcome: 'failed', hostedUrl };
@@ -657,6 +705,15 @@ export class StripeGateway implements IPaymentGateway {
         // The invoice's own total, which can exceed what was collected when
         // the amount sits under the provider's minimum charge.
         parsed.invoiceTotalCents = invoice.total ?? undefined;
+        // Stripe has already worked the tax out, so the receipt repeats its
+        // split rather than recomputing one that could disagree with the
+        // invoice. `tax` on older API versions, `total_taxes` on newer ones.
+        parsed.subtotalCents = invoice.subtotal ?? undefined;
+        parsed.taxCents =
+          invoice.tax ??
+          (Array.isArray(invoice.total_taxes)
+            ? invoice.total_taxes.reduce((sum: number, t: any) => sum + (t?.amount ?? 0), 0)
+            : undefined);
         parsed.currency = invoice.currency?.toUpperCase();
         parsed.status = 'active';
         parsed.invoiceUrl = invoice.hosted_invoice_url || invoice.invoice_pdf || undefined;
@@ -698,6 +755,22 @@ export class StripeGateway implements IPaymentGateway {
     }
 
     return parsed;
+  }
+
+  /**
+   * The Tax Rate behind STRIPE_TAX_RATE_ID, for the startup consistency check.
+   * Null when the id names nothing on this account.
+   */
+  async describeTaxRate(
+    taxRateId: string
+  ): Promise<{ percentage: number; inclusive: boolean } | null> {
+    try {
+      const rate = await this.stripe.taxRates.retrieve(taxRateId);
+      return { percentage: rate.percentage, inclusive: rate.inclusive };
+    } catch (err: any) {
+      if (err?.statusCode === 404 || err?.code === 'resource_missing') return null;
+      throw err;
+    }
   }
 
   private mapStripeStatus(status: Stripe.Subscription.Status): SubscriptionStatus {

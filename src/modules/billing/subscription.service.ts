@@ -118,6 +118,8 @@ export async function syncSubscriptionPricing(
 }
 
 import { priceLicenseChange, getLicenseSnapshot } from './license.service';
+import { getTaxConfig, taxCentsOnLines } from './tax';
+import { sendPaymentFailedNotices } from './billing.notifications';
 import { resolveIsoCurrency, UnsupportedCurrencyError } from './currency';
 
 /**
@@ -522,6 +524,8 @@ export class SubscriptionService {
              current_period_start = $3,
              current_period_end = $4,
              grace_period_ends_at = NULL,
+             -- Paid: the next failure is a new episode and warns again.
+             payment_failed_notified_at = NULL,
              updated_at = NOW()
          WHERE id = $5`,
         [
@@ -585,8 +589,9 @@ export class SubscriptionService {
             unit_price_employee_cents, unit_price_device_cents,
             invoice_url, paid_at,
             period_start, period_end,
-            payment_method_brand, payment_method_last4
-          ) VALUES ($1, $2, $3, $4, $13, $5, $6, 'paid', 'activation', $7, $8, $9, $10, $11, $12, NOW(), $14, $15, $16, $17)`,
+            payment_method_brand, payment_method_last4,
+            subtotal_cents, tax_cents, tax_percent
+          ) VALUES ($1, $2, $3, $4, $13, $5, $6, 'paid', 'activation', $7, $8, $9, $10, $11, $12, NOW(), $14, $15, $16, $17, $18, $19, $20)`,
           [
             sub.company_id,
             sub.id,
@@ -605,6 +610,13 @@ export class SubscriptionService {
             periodEnd,
             methodBrand,
             methodLast4,
+            // Only the provider's own split is stored. When it reports none -
+            // a subscription created before a tax rate existed, or a provider
+            // that does not break the sale down - the receipt shows the total
+            // by itself rather than a split we invented.
+            event.subtotalCents ?? null,
+            event.taxCents ?? null,
+            event.taxCents !== undefined ? getTaxConfig().percent : null,
           ]
         );
 
@@ -822,6 +834,8 @@ export class SubscriptionService {
              current_period_start = $3,
              current_period_end = $4,
              grace_period_ends_at = NULL,
+             -- Paid: the next failure is a new episode and warns again.
+             payment_failed_notified_at = NULL,
              updated_at = NOW()
          WHERE id = $5`,
         [nextSeatQty, nextDevQty, effectivePeriodStart, effectivePeriodEnd, sub.id, hasPendingUpgrade]
@@ -889,8 +903,9 @@ export class SubscriptionService {
             unit_price_employee_cents, unit_price_device_cents,
             invoice_url, paid_at,
             period_start, period_end,
-            payment_method_brand, payment_method_last4
-          ) VALUES ($1, $2, $3, $4, $5, $6, $14, $13, $7, $8, $9, $10, $11, $12, NOW(), $15, $16, $17, $18)`,
+            payment_method_brand, payment_method_last4,
+            subtotal_cents, tax_cents, tax_percent
+          ) VALUES ($1, $2, $3, $4, $5, $6, $14, $13, $7, $8, $9, $10, $11, $12, NOW(), $15, $16, $17, $18, $19, $20, $21)`,
           [
             sub.company_id,
             sub.id,
@@ -912,6 +927,10 @@ export class SubscriptionService {
             periodEnd,
             methodBrand,
             methodLast4,
+            // As above: the provider's split, or nothing at all.
+            event.subtotalCents ?? null,
+            event.taxCents ?? null,
+            event.taxCents !== undefined ? getTaxConfig().percent : null,
           ]
         );
       }
@@ -933,8 +952,10 @@ export class SubscriptionService {
     if (!event.subscriptionId) return;
 
     const subRes = await pool.query(
-      `SELECT * FROM subscriptions 
-       WHERE provider_subscription_id = $1 AND provider = $2`,
+      `SELECT s.*, c.name AS company_name
+         FROM subscriptions s
+         JOIN companies c ON c.id = s.company_id
+        WHERE s.provider_subscription_id = $1 AND s.provider = $2`,
       [event.subscriptionId, event.provider]
     );
 
@@ -944,7 +965,7 @@ export class SubscriptionService {
     const graceDays = sub.grace_period_days || 3;
     const graceEnd = new Date(Date.now() + graceDays * 24 * 60 * 60 * 1000);
 
-    await pool.query(
+    const updated = await pool.query(
       `UPDATE subscriptions 
        SET status = 'past_due',
            grace_period_ends_at = COALESCE(grace_period_ends_at, $1),
@@ -955,9 +976,17 @@ export class SubscriptionService {
            requested_at = NULL,
            requested_amount_cents = NULL,
            updated_at = NOW()
-       WHERE id = $2`,
+       WHERE id = $2
+       RETURNING grace_period_ends_at`,
       [graceEnd, sub.id]
     );
+
+    // The deadline the customer is told is the one actually stored: a provider
+    // retries a failed invoice for days, and each retry must repeat the
+    // original date rather than push it three days further out.
+    const deadline = updated.rows[0]?.grace_period_ends_at
+      ? new Date(updated.rows[0].grace_period_ends_at)
+      : graceEnd;
 
     // Record failed transaction
     await pool.query(
@@ -978,6 +1007,35 @@ export class SubscriptionService {
         event.failureMessage || 'Payment declined by gateway',
       ]
     );
+
+    // The banner is what the customer sees first, so push the state change out
+    // rather than waiting for their next navigation to poll for it.
+    announceBillingChange(sub.company_id, 'payment_failed');
+
+    // Warn the owner exactly once per grace window. Claiming the stamp in a
+    // conditional update rather than reading it first means two concurrent
+    // retries cannot both decide they are the first. The stamp is cleared
+    // whenever the subscription is paid, so the next failure warns again.
+    const claimed = await pool.query(
+      `UPDATE subscriptions
+          SET payment_failed_notified_at = NOW()
+        WHERE id = $1 AND payment_failed_notified_at IS NULL
+        RETURNING id`,
+      [sub.id]
+    );
+
+    if (claimed.rowCount) {
+      await sendPaymentFailedNotices({
+        companyId: sub.company_id,
+        companyName: sub.company_name,
+        provider: event.provider,
+        amountCents: event.amountCents ?? null,
+        currency: event.currency || sub.currency || 'EUR',
+        gracePeriodEndsAt: deadline,
+        graceDays,
+        failureMessage: event.failureMessage ?? null,
+      });
+    }
   }
 
   /**
@@ -1171,7 +1229,18 @@ export class SubscriptionService {
         employeeCount: liveEmployeeCount,
         deviceCount: liveDeviceCount,
         calculatedMonthlyTotal: monthlyTotal,
+        // The provider charges tax on top of that total, so the page has to be
+        // able to say so. Worked out per line - one for employees, one for
+        // terminals - because that is how the invoice is built, and rounding
+        // the sum instead can land a cent away from what is charged.
+        calculatedTax: taxCentsOnLines([
+          Math.round(liveEmployeeCount * pricePerEmployee * 100),
+          Math.round(liveDeviceCount * pricePerDevice * 100),
+        ]) / 100,
       },
+      // The rate in force, so every screen can label its tax line instead of
+      // hardcoding a percentage that would go stale the day it changes.
+      taxPercent: getTaxConfig().percent,
       readiness: {
         canCheckout:
           missingFields.length === 0 && pricingConfigured && hasBillableQuantity,
@@ -1198,6 +1267,11 @@ export class SubscriptionService {
         // receipt printed a dash where each line amount belonged.
         unitPriceEmployeeCents: tx.unit_price_employee_cents,
         unitPriceDeviceCents: tx.unit_price_device_cents,
+        // How the total splits into licences and tax, exactly as the provider
+        // reported it. Null on payments taken before tax was configured.
+        subtotalCents: tx.subtotal_cents,
+        taxCents: tx.tax_cents,
+        taxPercent: tx.tax_percent !== null ? parseFloat(tx.tax_percent) : null,
         // The cycle this payment covered, read from the payment rather than
         // from the subscription, which may since have moved on.
         periodStart: tx.period_start,
@@ -1483,8 +1557,15 @@ export class SubscriptionService {
       status: applied ? ('applied' as const) : ('awaiting_payment' as const),
       applied,
       amountDueNow: quote.amountDueNow,
+      // What actually left the customer's account: the provider added tax to
+      // the net figure above, so the confirmation has to quote the gross or it
+      // names an amount that appears nowhere on their statement.
+      taxPercent: quote.taxPercent,
+      taxDueNow: quote.taxDueNow,
+      totalDueNow: quote.totalDueNow,
       additionalMonthly: quote.additionalMonthly,
       newMonthlyTotal: quote.newMonthlyTotal,
+      newMonthlyTotalWithTax: quote.newMonthlyTotalWithTax,
       currency: sub.currency,
       extraEmployees: quote.extraEmployees,
       extraTerminals: quote.extraTerminals,
@@ -1602,7 +1683,13 @@ export class SubscriptionService {
     }
 
     const gateway = getPaymentGateway('stripe') as any;
-    let result: { outcome: 'paid' | 'failed' | 'pending'; hostedUrl?: string; amountCents?: number };
+    let result: {
+      outcome: 'paid' | 'failed' | 'pending';
+      hostedUrl?: string;
+      amountCents?: number;
+      subtotalCents?: number;
+      taxCents?: number;
+    };
     try {
       result = await gateway.getInvoiceOutcome(sub.requested_invoice_id);
     } catch (err: any) {
@@ -1640,8 +1727,9 @@ export class SubscriptionService {
             `INSERT INTO billing_transactions (
                company_id, subscription_id, provider, provider_invoice_id,
                amount_cents, currency, status, kind, description,
-               seat_quantity, device_quantity, invoice_url, paid_at
-             ) VALUES ($1,$2,'stripe',$3,$4,$5,'paid','license_upgrade',$6,$7,$8,$9,NOW())`,
+               seat_quantity, device_quantity, invoice_url, paid_at,
+               subtotal_cents, tax_cents, tax_percent
+             ) VALUES ($1,$2,'stripe',$3,$4,$5,'paid','license_upgrade',$6,$7,$8,$9,NOW(),$10,$11,$12)`,
             [
               companyId,
               sub.id,
@@ -1652,6 +1740,9 @@ export class SubscriptionService {
               sub.requested_seat_quantity ?? sub.seat_quantity,
               sub.requested_device_quantity ?? sub.device_quantity,
               result.hostedUrl ?? null,
+              result.subtotalCents ?? null,
+              result.taxCents ?? null,
+              result.taxCents !== undefined ? getTaxConfig().percent : null,
             ]
           );
         }
