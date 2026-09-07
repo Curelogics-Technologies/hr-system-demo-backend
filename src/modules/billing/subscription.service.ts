@@ -118,8 +118,8 @@ export async function syncSubscriptionPricing(
 }
 
 import { priceLicenseChange, getLicenseSnapshot } from './license.service';
-import { getTaxConfig, taxCentsOnLines } from './tax';
-import { sendPaymentFailedNotices } from './billing.notifications';
+import { describeTaxConfig, getTaxConfig, taxCentsOnLines } from './tax';
+import { sendPaymentFailedNotices, recordNoticeDelivery } from './billing.notifications';
 import { resolveIsoCurrency, UnsupportedCurrencyError } from './currency';
 
 /**
@@ -988,14 +988,17 @@ export class SubscriptionService {
       ? new Date(updated.rows[0].grace_period_ends_at)
       : graceEnd;
 
-    // Record failed transaction
-    await pool.query(
+    // Record failed transaction. Its id is kept so the outcome of the warnings
+    // sent below can be written back onto this exact failure - the billing page
+    // shows who was told and whether the mail actually left.
+    const failureRow = await pool.query(
       `INSERT INTO billing_transactions (
         company_id, subscription_id, provider,
         amount_cents, currency,
         status, kind, description,
         failure_code, failure_message
-      ) VALUES ($1, $2, $3, $4, $5, 'failed', 'failed', $6, $7, $8)`,
+      ) VALUES ($1, $2, $3, $4, $5, 'failed', 'failed', $6, $7, $8)
+      RETURNING id`,
       [
         sub.company_id,
         sub.id,
@@ -1008,10 +1011,6 @@ export class SubscriptionService {
       ]
     );
 
-    // The banner is what the customer sees first, so push the state change out
-    // rather than waiting for their next navigation to poll for it.
-    announceBillingChange(sub.company_id, 'payment_failed');
-
     // Warn the owner exactly once per grace window. Claiming the stamp in a
     // conditional update rather than reading it first means two concurrent
     // retries cannot both decide they are the first. The stamp is cleared
@@ -1023,9 +1022,21 @@ export class SubscriptionService {
         RETURNING id`,
       [sub.id]
     );
+    const firstFailureOfThisWindow = (claimed.rowCount ?? 0) > 0;
 
-    if (claimed.rowCount) {
-      await sendPaymentFailedNotices({
+    // Push the state change out rather than waiting for the customer's next
+    // navigation to poll for it. Only the first failure of a grace window
+    // carries the reason that raises a toast: a provider retries a declined
+    // invoice for three days, and every retry sends this webhook again, so
+    // reporting them all would interrupt the admin every few hours with news
+    // they already have. The banner refreshes either way.
+    announceBillingChange(
+      sub.company_id,
+      firstFailureOfThisWindow ? 'payment_failed' : 'payment_failed_retry'
+    );
+
+    if (firstFailureOfThisWindow) {
+      const delivery = await sendPaymentFailedNotices({
         companyId: sub.company_id,
         companyName: sub.company_name,
         provider: event.provider,
@@ -1035,6 +1046,12 @@ export class SubscriptionService {
         graceDays,
         failureMessage: event.failureMessage ?? null,
       });
+
+      await recordNoticeDelivery(failureRow.rows[0]?.id, delivery);
+
+      // Tell the open tabs again, now that the alert has actually gone out, so
+      // the billing page can show the delivery line without a manual refresh.
+      announceBillingChange(sub.company_id, 'payment_failed_notified');
     }
   }
 
@@ -1239,8 +1256,11 @@ export class SubscriptionService {
         ]) / 100,
       },
       // The rate in force, so every screen can label its tax line instead of
-      // hardcoding a percentage that would go stale the day it changes.
+      // hardcoding a percentage that would go stale the day it changes. The
+      // full description travels with it so the page can also say where the
+      // figure came from and when it was last confirmed against Stripe.
       taxPercent: getTaxConfig().percent,
+      tax: describeTaxConfig(),
       readiness: {
         canCheckout:
           missingFields.length === 0 && pricingConfigured && hasBillableQuantity,
@@ -1278,6 +1298,19 @@ export class SubscriptionService {
         periodEnd: tx.period_end,
         paymentMethodBrand: tx.payment_method_brand,
         paymentMethodLast4: tx.payment_method_last4,
+        // Who was warned about this failure, and whether the mail actually
+        // left. Null on anything that is not a recorded failure.
+        notice: tx.notice_email_status
+          ? {
+              emailTo: tx.notice_email_to,
+              emailStatus: tx.notice_email_status,
+              emailError: tx.notice_email_error,
+              emailAt: tx.notice_email_at,
+              copyTo: tx.notice_copy_to,
+              copyStatus: tx.notice_copy_status,
+              inAppCount: tx.notice_in_app_count ?? 0,
+            }
+          : null,
         invoiceUrl: tx.invoice_url,
         failureMessage: tx.failure_message,
         paidAt: tx.paid_at,

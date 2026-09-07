@@ -1,10 +1,28 @@
-import { getTaxConfig, taxCentsOn, taxCentsOnLines, taxed } from '../tax';
+import { pool } from '../../../config/database';
+import {
+  describeTaxConfig,
+  getTaxConfig,
+  loadTaxConfig,
+  resetTaxConfigCache,
+  syncTaxRateFromStripe,
+  taxCentsOn,
+  taxCentsOnLines,
+  taxed,
+} from '../tax';
 import { priceLicenseChange } from '../license.service';
 
+jest.mock('../../../config/database', () => ({
+  pool: { query: jest.fn() },
+  query: jest.fn(),
+  queryOne: jest.fn(),
+}));
+
+const mockQuery = pool.query as unknown as jest.Mock;
+
 /**
- * The tax rate is read from the environment on every call, so each test states
- * the configuration it is describing rather than depending on the order the
- * tests happen to run in.
+ * The rate is read from the environment on every call that has no mirror, so
+ * each test states the configuration it is describing rather than depending on
+ * the order the tests happen to run in.
  */
 function withTax<T>(percent: string | undefined, rateId: string | undefined, fn: () => T): T {
   const prevPercent = process.env.BILLING_TAX_PERCENT;
@@ -22,6 +40,40 @@ function withTax<T>(percent: string | undefined, rateId: string | undefined, fn:
     else process.env.STRIPE_TAX_RATE_ID = prevRate;
   }
 }
+
+/**
+ * The awaiting sibling of `withTax`.
+ *
+ * The synchronous version restores the environment the moment its callback
+ * returns - which for an async callback is before any of its work has run, so
+ * the body would observe the variables already put back.
+ */
+async function withTaxAsync<T>(
+  percent: string | undefined,
+  rateId: string | undefined,
+  fn: () => Promise<T>
+): Promise<T> {
+  const prevPercent = process.env.BILLING_TAX_PERCENT;
+  const prevRate = process.env.STRIPE_TAX_RATE_ID;
+  if (percent === undefined) delete process.env.BILLING_TAX_PERCENT;
+  else process.env.BILLING_TAX_PERCENT = percent;
+  if (rateId === undefined) delete process.env.STRIPE_TAX_RATE_ID;
+  else process.env.STRIPE_TAX_RATE_ID = rateId;
+  try {
+    return await fn();
+  } finally {
+    if (prevPercent === undefined) delete process.env.BILLING_TAX_PERCENT;
+    else process.env.BILLING_TAX_PERCENT = prevPercent;
+    if (prevRate === undefined) delete process.env.STRIPE_TAX_RATE_ID;
+    else process.env.STRIPE_TAX_RATE_ID = prevRate;
+  }
+}
+
+beforeEach(() => {
+  resetTaxConfigCache();
+  mockQuery.mockReset();
+  mockQuery.mockResolvedValue({ rows: [], rowCount: 0 });
+});
 
 describe('billing tax configuration', () => {
   it('is off when no percentage is configured', () => {
@@ -66,10 +118,7 @@ describe('billing tax configuration', () => {
 
   it('taxes each invoice line separately, as the providers do', () => {
     withTax('22', undefined, () => {
-      // Per line: 22% of 1005 = 221, of 1005 = 221 -> 442.
-      // On the sum: 22% of 2010 = 442.2 -> 442. Here they agree.
       expect(taxCentsOnLines([1005, 1005])).toBe(442);
-      // 22% of 23 = 5.06 -> 5, twice = 10; on the sum 22% of 46 = 10.12 -> 10.
       expect(taxCentsOnLines([23, 23])).toBe(10);
       // A line-by-line total that a single rounding would miss by a cent:
       // 22% of 25 = 5.5 -> 6 (half away from zero), twice = 12,
@@ -87,6 +136,147 @@ describe('billing tax configuration', () => {
         totalCents: 12_200,
         taxPercent: 22,
       });
+    });
+  });
+});
+
+describe('mirroring the rate from Stripe', () => {
+  const stripeRate = {
+    percentage: 22,
+    inclusive: false,
+    active: true,
+    displayName: 'IVA',
+    jurisdiction: 'IT',
+  };
+
+  it('stores what Stripe says and serves it from then on', async () => {
+    await withTaxAsync('10', 'txr_live', async () => {
+      mockQuery.mockResolvedValueOnce({
+        rowCount: 1,
+        rows: [
+          {
+            stripe_tax_rate_id: 'txr_live',
+            percent: '22.00',
+            display_name: 'IVA',
+            jurisdiction: 'IT',
+            inclusive: false,
+            active: true,
+            source: 'stripe',
+            synced_at: new Date('2026-09-08T09:00:00Z'),
+            sync_error: null,
+          },
+        ],
+      });
+
+      const cfg = await syncTaxRateFromStripe(async () => stripeRate);
+
+      // Stripe wins over the environment, which is only ever a cold-start
+      // fallback: the provider is what actually charges the customer.
+      expect(cfg.percent).toBe(22);
+      expect(cfg.source).toBe('stripe');
+      expect(getTaxConfig().percent).toBe(22);
+      expect(taxCentsOn(10_000)).toBe(2_200);
+    });
+  });
+
+  it('keeps charging the last known rate when Stripe is unreachable', async () => {
+    await withTaxAsync('22', 'txr_live', async () => {
+      mockQuery.mockResolvedValueOnce({
+        rowCount: 1,
+        rows: [
+          {
+            stripe_tax_rate_id: 'txr_live',
+            percent: '22.00',
+            source: 'stripe',
+            inclusive: false,
+            active: true,
+            synced_at: new Date('2026-09-01T09:00:00Z'),
+            sync_error: null,
+          },
+        ],
+      });
+      await loadTaxConfig();
+
+      const cfg = await syncTaxRateFromStripe(async () => {
+        throw new Error('connect ETIMEDOUT');
+      });
+
+      // A network blip must not silently stop the platform charging tax.
+      expect(cfg.percent).toBe(22);
+      expect(cfg.syncError).toMatch(/ETIMEDOUT/);
+      expect(taxCentsOn(10_000)).toBe(2_200);
+    });
+  });
+
+  it('records a rate id that does not exist on the account', async () => {
+    await withTaxAsync('22', 'txr_typo', async () => {
+      const cfg = await syncTaxRateFromStripe(async () => null);
+      expect(cfg.syncError).toMatch(/no tax rate/i);
+      // Still charging, still flagged: the operator has to see the error, but
+      // the customer's invoice must not silently lose its tax line first.
+      expect(cfg.percent).toBe(22);
+    });
+  });
+
+  it('reports an inclusive or archived rate rather than quietly using it', async () => {
+    await withTaxAsync('22', 'txr_live', async () => {
+      mockQuery.mockResolvedValueOnce({
+        rowCount: 1,
+        rows: [
+          {
+            stripe_tax_rate_id: 'txr_live',
+            percent: '22.00',
+            inclusive: true,
+            active: false,
+            source: 'stripe',
+            synced_at: new Date(),
+            sync_error: null,
+          },
+        ],
+      });
+
+      const cfg = await syncTaxRateFromStripe(async () => ({
+        ...stripeRate,
+        inclusive: true,
+        active: false,
+      }));
+
+      expect(cfg.inclusive).toBe(true);
+      expect(cfg.active).toBe(false);
+      expect(describeTaxConfig(cfg).inclusive).toBe(true);
+    });
+  });
+
+  it('falls back to the environment while the stored row is still a placeholder', async () => {
+    await withTaxAsync('22', 'txr_live', async () => {
+      mockQuery.mockResolvedValueOnce({
+        rowCount: 1,
+        rows: [
+          {
+            stripe_tax_rate_id: null,
+            percent: '0.00',
+            source: 'env',
+            inclusive: false,
+            active: true,
+            synced_at: null,
+            sync_error: null,
+          },
+        ],
+      });
+
+      const cfg = await loadTaxConfig();
+
+      // The seeded row is 0% until the first sync lands. Trusting it would
+      // bill every customer net on a fresh deployment.
+      expect(cfg.percent).toBe(22);
+      expect(cfg.source).toBe('env');
+    });
+  });
+
+  it('reports the PayPal percentage alongside the Stripe one so they can be compared', () => {
+    withTax('22', 'txr_live', () => {
+      const described = describeTaxConfig();
+      expect(described.paypalPercent).toBe(described.percent);
     });
   });
 });

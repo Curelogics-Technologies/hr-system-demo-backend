@@ -1,22 +1,43 @@
 import { pool } from '../../config/database';
-import { sendEmailForCompany } from '../../services/email.service';
+import { sendEmailForCompany, EmailSendResult } from '../../services/email.service';
+import { sendNotification } from '../notifications/notifications.service';
 
 /**
- * The emails that go out when a renewal fails.
+ * What happens when a renewal fails.
  *
  * A failed renewal starts a short grace period and then blocks the company, so
  * the one thing that must not happen is the customer finding out by losing
- * access. Two messages leave here:
+ * access. Three things leave here:
  *
- *   - one to the person who owns the account, carrying the date the payment
- *     has to be settled by;
- *   - one to the platform operator, so they can reach the customer before the
- *     block lands.
+ *   - an in-app notification to the account owner and every admin, so the
+ *     alert is visible even when email is not configured at all;
+ *   - an email to the account owner carrying the date the payment has to be
+ *     settled by;
+ *   - a copy to the platform operator, so they can reach the customer before
+ *     the block lands.
  *
- * Both go through the company's own SMTP configuration, which is the only mail
- * transport this system has. A company with no SMTP configured therefore sends
- * nothing, and the in-app banner is what still warns it.
+ * Every one of them reports its outcome back to the caller, which records it
+ * on the failed transaction. "The customer was emailed" is a claim the billing
+ * page has to be able to *show*, not one it should be believed on - a company
+ * with no SMTP configuration sends nothing at all, and that has to be visible
+ * rather than assumed away.
  */
+
+/** How one delivery attempt ended. */
+export type NoticeChannelStatus = 'sent' | 'skipped' | 'failed' | 'no_recipient';
+
+export interface NoticeDelivery {
+  /** Who the owner warning was addressed to (may include the company mailbox). */
+  ownerEmail: string | null;
+  ownerStatus: NoticeChannelStatus;
+  ownerError: string | null;
+  /** The operator copy. Null status when no operator address is configured. */
+  copyTo: string | null;
+  copyStatus: NoticeChannelStatus | null;
+  /** How many people the in-app notification reached. */
+  inAppCount: number;
+  sentAt: Date;
+}
 
 /** Where the platform operator wants to be copied. Comma-separated. */
 function operatorRecipients(): string[] {
@@ -45,11 +66,19 @@ function formatMoney(cents: number | null | undefined, currency: string): string
   return currency === 'EUR' ? `€${amount}` : `${currency} ${amount}`;
 }
 
-interface FailureRecipients {
+/** Turns the mailer's result into the status stored on the transaction. */
+function statusOf(result: EmailSendResult): NoticeChannelStatus {
+  if (result.ok) return 'sent';
+  return result.status === 'skipped' ? 'skipped' : 'failed';
+}
+
+export interface FailureRecipients {
   /** The account owner - the person the warning is addressed to. */
-  owner: { email: string; name: string } | null;
+  owner: { userId: number; email: string; name: string } | null;
   /** The company's generic mailbox, when it is a different address. */
   companyEmail: string | null;
+  /** Everyone who should see the in-app alert: the owner and every admin. */
+  inAppUserIds: number[];
 }
 
 /**
@@ -60,20 +89,25 @@ interface FailureRecipients {
  * oldest active admin is the closest equivalent and is used instead, because
  * warning the wrong administrator beats warning nobody. The generic company
  * address is only ever a copy, never a replacement.
+ *
+ * The in-app alert goes wider than the email on purpose: it costs nothing, it
+ * cannot bounce, and an admin who logs in is the person most likely to act.
  */
 export async function resolveFailureRecipients(companyId: number): Promise<FailureRecipients> {
   const res = await pool.query(
     `SELECT c.company_email,
+            o.id      AS owner_id,
             o.email   AS owner_email,
             o.name    AS owner_name,
             o.surname AS owner_surname,
+            a.id      AS admin_id,
             a.email   AS admin_email,
             a.name    AS admin_name,
             a.surname AS admin_surname
        FROM companies c
        LEFT JOIN users o ON o.id = c.owner_user_id AND o.status = 'active'
        LEFT JOIN LATERAL (
-            SELECT u.email, u.name, u.surname
+            SELECT u.id, u.email, u.name, u.surname
               FROM users u
              WHERE u.company_id = c.id
                AND u.role = 'admin'
@@ -85,17 +119,33 @@ export async function resolveFailureRecipients(companyId: number): Promise<Failu
     [companyId]
   );
 
-  if (!res.rowCount) return { owner: null, companyEmail: null };
+  if (!res.rowCount) return { owner: null, companyEmail: null, inAppUserIds: [] };
 
   const row = res.rows[0];
+  const usingOwner = !!row.owner_email;
   const email = row.owner_email || row.admin_email || null;
-  const name = row.owner_email
+  const userId = usingOwner ? row.owner_id : row.admin_id;
+  const name = usingOwner
     ? [row.owner_name, row.owner_surname].filter(Boolean).join(' ')
     : [row.admin_name, row.admin_surname].filter(Boolean).join(' ');
 
+  const admins = await pool.query(
+    `SELECT id FROM users
+      WHERE company_id = $1 AND role = 'admin' AND status = 'active'`,
+    [companyId]
+  );
+
+  const inAppUserIds = Array.from(
+    new Set<number>([
+      ...(row.owner_id ? [row.owner_id as number] : []),
+      ...admins.rows.map((r: any) => r.id as number),
+    ])
+  );
+
   return {
-    owner: email ? { email, name: name || email } : null,
+    owner: email && userId ? { userId, email, name: name || email } : null,
     companyEmail: row.company_email || null,
+    inAppUserIds,
   };
 }
 
@@ -109,104 +159,322 @@ export interface PaymentFailedNotice {
   gracePeriodEndsAt: Date;
   graceDays: number;
   failureMessage?: string | null;
+  /**
+   * A rehearsal: identical recipients, wording and transport, marked as a test
+   * so nobody mistakes it for a real dunning notice. Used by the "send a test"
+   * button so the whole path can be proved before a live customer depends on it.
+   */
+  isTest?: boolean;
 }
 
 /**
- * Sends the failed-payment warning to the account owner and the operator copy.
+ * Sends the failed-payment alert on every channel and reports what happened.
  *
  * Never throws: a mail server being unreachable must not fail the webhook that
  * recorded the failure, or the provider retries the whole event and the
  * subscription state is written twice.
  */
-export async function sendPaymentFailedNotices(notice: PaymentFailedNotice): Promise<void> {
+export async function sendPaymentFailedNotices(
+  notice: PaymentFailedNotice
+): Promise<NoticeDelivery> {
   const deadline = formatDateIt(notice.gracePeriodEndsAt);
   const billingUrl = `${appBaseUrl()}/impostazioni/fatturazione`;
   const amount = formatMoney(notice.amountCents, notice.currency);
   const amountLine = notice.amountCents ? ` (importo: ${amount})` : '';
+  const testTag = notice.isTest ? '[TEST] ' : '';
+  const testNoteHtml = notice.isTest
+    ? `<p style="padding:8px;background:#fef3c7;border:1px solid #f59e0b">
+         <strong>Questo &egrave; un messaggio di prova.</strong> Nessun pagamento &egrave;
+         stato rifiutato e nessun accesso sar&agrave; sospeso.
+       </p>`
+    : '';
+  const testNoteText = notice.isTest
+    ? "ATTENZIONE: questo e' un messaggio di prova. Nessun pagamento e' stato rifiutato.\n\n"
+    : '';
 
+  const delivery: NoticeDelivery = {
+    ownerEmail: null,
+    ownerStatus: 'no_recipient',
+    ownerError: null,
+    copyTo: null,
+    copyStatus: null,
+    inAppCount: 0,
+    sentAt: new Date(),
+  };
+
+  let recipients: FailureRecipients = { owner: null, companyEmail: null, inAppUserIds: [] };
   try {
-    const { owner, companyEmail } = await resolveFailureRecipients(notice.companyId);
+    recipients = await resolveFailureRecipients(notice.companyId);
+  } catch (err: any) {
+    delivery.ownerError = `Could not resolve recipients: ${err?.message || err}`;
+    console.error(`[Billing] ${delivery.ownerError}`);
+    return delivery;
+  }
 
-    if (owner) {
-      const html =
-        `<p>Gentile ${owner.name},</p>` +
-        `<p>Il rinnovo automatico dell'abbonamento VeylOHR per <strong>${notice.companyName}</strong> ` +
-        `non &egrave; andato a buon fine${notice.amountCents ? ` (importo: <strong>${amount}</strong>)` : ''}.</p>` +
-        `<p>Per non interrompere il servizio &egrave; necessario regolarizzare il pagamento ` +
-        `<strong>entro il ${deadline}</strong>. Dopo tale data l'accesso alla piattaforma sar&agrave; sospeso.</p>` +
-        `<p>Puoi aggiornare il metodo di pagamento e completare il pagamento da qui:<br>` +
-        `<a href="${billingUrl}">${billingUrl}</a></p>` +
-        `<p>Se il pagamento &egrave; gi&agrave; stato effettuato puoi ignorare questo messaggio.</p>` +
-        `<p>Cordiali saluti,<br>Team VeylOHR</p>`;
+  // ---------------------------------------------------------------------
+  // 1. In-app alert. First, because it is the channel that cannot bounce.
+  // ---------------------------------------------------------------------
+  const inAppTitle = notice.isTest
+    ? 'Prova: avviso di pagamento non riuscito'
+    : 'Pagamento non riuscito';
+  const inAppMessage = notice.isTest
+    ? `Messaggio di prova. In un caso reale l'accesso verrebbe sospeso il ${deadline}.`
+    : `Il rinnovo dell'abbonamento non è andato a buon fine. Regolarizza il pagamento entro il ${deadline} per non perdere l'accesso.`;
 
-      const text =
-        `Gentile ${owner.name},\n\n` +
-        `Il rinnovo automatico dell'abbonamento VeylOHR per ${notice.companyName} non e' andato a buon fine${amountLine}.\n\n` +
-        `Per non interrompere il servizio e' necessario regolarizzare il pagamento entro il ${deadline}. ` +
-        `Dopo tale data l'accesso alla piattaforma sara' sospeso.\n\n` +
-        `Aggiorna il metodo di pagamento qui: ${billingUrl}\n\n` +
-        `Se il pagamento e' gia' stato effettuato puoi ignorare questo messaggio.\n\n` +
-        `Cordiali saluti,\nTeam VeylOHR`;
+  for (const userId of recipients.inAppUserIds) {
+    try {
+      await sendNotification({
+        companyId: notice.companyId,
+        userId,
+        type: 'billing.payment_failed',
+        title: inAppTitle,
+        message: inAppMessage,
+        priority: 'urgent',
+        // In-app only: the email below is written for this specific purpose and
+        // addressed to the owner, so routing it through the generic notification
+        // mailer as well would send two different emails about one failure.
+        channels: ['in_app'],
+        // A company must not be able to switch off the warning that its service
+        // is about to stop.
+        skipSettingsCheck: true,
+        metadata: {
+          link: '/impostazioni/fatturazione',
+          gracePeriodEndsAt: notice.gracePeriodEndsAt.toISOString(),
+          amountCents: notice.amountCents ?? null,
+          currency: notice.currency,
+          provider: notice.provider,
+          isTest: notice.isTest === true,
+        },
+      });
+      delivery.inAppCount++;
+    } catch (err: any) {
+      // sendNotification already swallows its own errors; this is belt and
+      // braces so one bad recipient cannot stop the others being told.
+      console.error(
+        `[Billing] In-app payment-failure alert failed for user ${userId}:`,
+        err?.message || err
+      );
+    }
+  }
 
-      // The owner is the addressee; the generic company mailbox is copied only
-      // when it is a different address, so nobody receives the same mail twice.
-      const to =
-        companyEmail && companyEmail.toLowerCase() !== owner.email.toLowerCase()
-          ? `${owner.email}, ${companyEmail}`
-          : owner.email;
+  // ---------------------------------------------------------------------
+  // 2. The owner's email, with the settle-by date.
+  // ---------------------------------------------------------------------
+  const { owner, companyEmail } = recipients;
 
-      await sendEmailForCompany(notice.companyId, {
+  if (!owner) {
+    delivery.ownerError = 'No account owner or active admin with an email address.';
+    console.warn(
+      `[Billing] Payment failed for company ${notice.companyId} but no owner or admin address could be resolved.`
+    );
+  } else {
+    const html =
+      testNoteHtml +
+      `<p>Gentile ${owner.name},</p>` +
+      `<p>Il rinnovo automatico dell'abbonamento VeylOHR per <strong>${notice.companyName}</strong> ` +
+      `non &egrave; andato a buon fine${notice.amountCents ? ` (importo: <strong>${amount}</strong>)` : ''}.</p>` +
+      `<p>Per non interrompere il servizio &egrave; necessario regolarizzare il pagamento ` +
+      `<strong>entro il ${deadline}</strong>. Dopo tale data l'accesso alla piattaforma sar&agrave; sospeso.</p>` +
+      `<p>Puoi aggiornare il metodo di pagamento e completare il pagamento da qui:<br>` +
+      `<a href="${billingUrl}">${billingUrl}</a></p>` +
+      `<p>Se il pagamento &egrave; gi&agrave; stato effettuato puoi ignorare questo messaggio.</p>` +
+      `<p>Cordiali saluti,<br>Team VeylOHR</p>`;
+
+    const text =
+      testNoteText +
+      `Gentile ${owner.name},\n\n` +
+      `Il rinnovo automatico dell'abbonamento VeylOHR per ${notice.companyName} non e' andato a buon fine${amountLine}.\n\n` +
+      `Per non interrompere il servizio e' necessario regolarizzare il pagamento entro il ${deadline}. ` +
+      `Dopo tale data l'accesso alla piattaforma sara' sospeso.\n\n` +
+      `Aggiorna il metodo di pagamento qui: ${billingUrl}\n\n` +
+      `Se il pagamento e' gia' stato effettuato puoi ignorare questo messaggio.\n\n` +
+      `Cordiali saluti,\nTeam VeylOHR`;
+
+    // The owner is the addressee; the generic company mailbox is copied only
+    // when it is a different address, so nobody receives the same mail twice.
+    const to =
+      companyEmail && companyEmail.toLowerCase() !== owner.email.toLowerCase()
+        ? `${owner.email}, ${companyEmail}`
+        : owner.email;
+
+    delivery.ownerEmail = to;
+
+    try {
+      const result = await sendEmailForCompany(notice.companyId, {
         to,
-        subject: `Pagamento non riuscito - azione richiesta entro il ${deadline} (${notice.companyName})`,
+        subject: `${testTag}Pagamento non riuscito - azione richiesta entro il ${deadline} (${notice.companyName})`,
         html,
         text,
       });
-    } else {
-      console.warn(
-        `[Billing] Payment failed for company ${notice.companyId} but no owner or admin address could be resolved.`
-      );
+      delivery.ownerStatus = statusOf(result);
+      delivery.ownerError = result.ok ? null : result.message ?? null;
+      if (!result.ok) {
+        console.warn(
+          `[Billing] Payment-failure email to ${to} was not sent (${result.status}): ${result.message}`
+        );
+      }
+    } catch (err: any) {
+      delivery.ownerStatus = 'failed';
+      delivery.ownerError = err?.message || String(err);
+      console.error('[Billing] Payment-failure email threw:', delivery.ownerError);
     }
-  } catch (err: any) {
-    console.error(
-      `[Billing] Could not send the payment-failure notice for company ${notice.companyId}:`,
-      err?.message || err
-    );
   }
 
+  // ---------------------------------------------------------------------
+  // 3. The operator copy. Tracked separately: a customer who was warned
+  //    successfully must not be shown as unwarned because an internal copy
+  //    bounced.
+  // ---------------------------------------------------------------------
   const operators = operatorRecipients();
-  if (operators.length === 0) return;
+  if (operators.length === 0) return delivery;
+
+  delivery.copyTo = operators.join(', ');
 
   try {
     const reasonHtml = notice.failureMessage
       ? `<p>Motivo riportato dal gateway: ${notice.failureMessage}</p>`
       : '';
+    const ownerLine = owner
+      ? `Il titolare (${owner.email}) &egrave; stato avvisato via email (${delivery.ownerStatus}).`
+      : 'ATTENZIONE: nessun indirizzo del titolare trovato, il cliente NON &egrave; stato avvisato via email.';
 
-    await sendEmailForCompany(notice.companyId, {
-      to: operators.join(', '),
-      subject: `[VeylOHR] Pagamento fallito - ${notice.companyName} (blocco il ${deadline})`,
+    const result = await sendEmailForCompany(notice.companyId, {
+      to: delivery.copyTo,
+      subject: `${testTag}[VeylOHR] Pagamento fallito - ${notice.companyName} (blocco il ${deadline})`,
       html:
+        testNoteHtml +
         `<p>Il pagamento ricorrente di <strong>${notice.companyName}</strong> non &egrave; andato a buon fine.</p>` +
         `<ul>` +
         `<li>Provider: ${notice.provider}</li>` +
         `<li>Importo: ${amount}</li>` +
         `<li>Periodo di tolleranza: ${notice.graceDays} giorni</li>` +
         `<li>Accesso sospeso a partire dal: <strong>${deadline}</strong></li>` +
+        `<li>Notifiche in-app inviate: ${delivery.inAppCount}</li>` +
         `</ul>` +
         reasonHtml +
-        `<p>Il titolare dell'account &egrave; stato avvisato via email.</p>`,
+        `<p>${ownerLine}</p>`,
       text:
+        testNoteText +
         `Il pagamento ricorrente di ${notice.companyName} non e' andato a buon fine.\n` +
         `Provider: ${notice.provider}\n` +
         `Importo: ${amount}\n` +
         `Periodo di tolleranza: ${notice.graceDays} giorni\n` +
         `Accesso sospeso a partire dal: ${deadline}\n` +
+        `Notifiche in-app inviate: ${delivery.inAppCount}\n` +
         (notice.failureMessage ? `Motivo: ${notice.failureMessage}\n` : '') +
-        `\nIl titolare dell'account e' stato avvisato via email.`,
+        `\n${owner ? `Titolare avvisato: ${owner.email} (${delivery.ownerStatus})` : 'ATTENZIONE: titolare NON avvisato via email.'}`,
     });
+    delivery.copyStatus = statusOf(result);
   } catch (err: any) {
+    delivery.copyStatus = 'failed';
     console.error(
       '[Billing] Could not send the operator copy of a payment failure:',
       err?.message || err
     );
   }
+
+  return delivery;
+}
+
+/**
+ * Writes the outcome of the warnings onto the failed transaction they belong to.
+ *
+ * Separate from sending so the send path stays free of storage concerns, and so
+ * a test notice - which belongs to no transaction - simply does not call this.
+ * Never throws: the warning has already gone out, and losing the audit line is
+ * not worth failing a webhook over.
+ */
+export async function recordNoticeDelivery(
+  transactionId: number | undefined,
+  delivery: NoticeDelivery
+): Promise<void> {
+  if (!transactionId) return;
+  try {
+    await pool.query(
+      `UPDATE billing_transactions
+          SET notice_email_to     = $1,
+              notice_email_status = $2,
+              notice_email_error  = $3,
+              notice_email_at     = $4,
+              notice_copy_to      = $5,
+              notice_copy_status  = $6,
+              notice_in_app_count = $7
+        WHERE id = $8`,
+      [
+        delivery.ownerEmail,
+        delivery.ownerStatus,
+        delivery.ownerError,
+        delivery.sentAt,
+        delivery.copyTo,
+        delivery.copyStatus,
+        delivery.inAppCount,
+        transactionId,
+      ]
+    );
+  } catch (err: any) {
+    console.error(
+      `[Billing] Could not record notice delivery for transaction ${transactionId}:`,
+      err?.message || err
+    );
+  }
+}
+
+/**
+ * Rehearses the whole alert for a company, without touching its subscription.
+ *
+ * Every part of the real path runs - the same recipients, the same SMTP
+ * configuration, the same in-app notification - so a deployment can be proved
+ * before a live customer's renewal depends on it. The deadline is a plausible
+ * date in the future rather than a real one, and everything is labelled as a
+ * test.
+ */
+export async function sendPaymentFailedTestNotice(params: {
+  companyId: number;
+  graceDays?: number;
+}): Promise<NoticeDelivery & { companyName: string }> {
+  const res = await pool.query(
+    `SELECT c.name,
+            c.currency,
+            COALESCE(c.grace_period_days, 3) AS grace_period_days,
+            s.provider,
+            s.seat_quantity, s.device_quantity,
+            s.unit_price_employee, s.unit_price_device
+       FROM companies c
+       LEFT JOIN LATERAL (
+            SELECT * FROM subscriptions
+             WHERE company_id = c.id
+             ORDER BY CASE status WHEN 'active' THEN 1 WHEN 'past_due' THEN 2 ELSE 3 END, id DESC
+             LIMIT 1
+       ) s ON true
+      WHERE c.id = $1`,
+    [params.companyId]
+  );
+
+  if (!res.rowCount) throw new Error(`Company not found: ${params.companyId}`);
+  const row = res.rows[0];
+
+  const graceDays = params.graceDays ?? row.grace_period_days ?? 3;
+  // A realistic amount when there is a subscription, so the test mail reads
+  // like the real one rather than showing a placeholder figure.
+  const amountCents = row.seat_quantity
+    ? Math.round(
+        (row.seat_quantity * parseFloat(row.unit_price_employee ?? '0') +
+          row.device_quantity * parseFloat(row.unit_price_device ?? '0')) *
+          100
+      )
+    : null;
+
+  const delivery = await sendPaymentFailedNotices({
+    companyId: params.companyId,
+    companyName: row.name,
+    provider: row.provider || 'stripe',
+    amountCents,
+    currency: row.currency || 'EUR',
+    gracePeriodEndsAt: new Date(Date.now() + graceDays * 24 * 60 * 60 * 1000),
+    graceDays,
+    failureMessage: 'Test notice requested from the billing page',
+    isTest: true,
+  });
+
+  return { ...delivery, companyName: row.name };
 }

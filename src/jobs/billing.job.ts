@@ -2,7 +2,8 @@ import cron from 'node-cron';
 import { pool } from '../config/database';
 import { getPaymentGateway } from '../modules/billing/gateway.factory';
 import { sendEmailForCompany } from '../services/email.service';
-import { getTaxConfig, taxCentsOnLines, verifyTaxConfiguration } from '../modules/billing/tax';
+import { getTaxConfig, taxCentsOnLines } from '../modules/billing/tax';
+import { syncBillingTaxRate } from '../modules/billing/tax.sync';
 import {
   subscriptionService,
   announceBillingChange,
@@ -308,15 +309,6 @@ export async function processSubscriptionPricingDrift() {
 
 
 export function startBillingCron() {
-  // Two settings describe one tax rate and only Stripe's is charged, so a
-  // disagreement between them quotes customers a total they are not billed.
-  // Checking once at boot turns that into a log line instead of a discrepancy
-  // somebody finds on an invoice.
-  void verifyTaxConfiguration(async (id) => {
-    const gateway = getPaymentGateway('stripe') as any;
-    return gateway.describeTaxRate ? gateway.describeTaxRate(id) : null;
-  });
-
   cron.schedule('0 2 * * *', async () => {
     console.log('[BillingJob] Running daily billing jobs...');
     await processStuckLicenseUpgrades();
@@ -325,11 +317,18 @@ export function startBillingCron() {
     await processBillingRenewalReconciliations();
     await processBillingReminders();
     await processBillingGracePeriodExpirations();
+    await syncBillingTaxRate();
   });
 
   // A deployment is exactly when a period may already be wrong from an
   // earlier build, so check once on boot instead of waiting until 02:00.
   // Delayed a little to stay clear of startup.
+  // The rate is needed before the first price is rendered, so this one is not
+  // delayed: every total shown until it lands comes from configuration alone.
+  syncBillingTaxRate().catch((err) =>
+    console.error('[BillingJob] Startup tax sync failed:', err)
+  );
+
   setTimeout(() => {
     processSubscriptionPeriodDrift().catch((err) =>
       console.error('[BillingJob] Startup period check failed:', err)

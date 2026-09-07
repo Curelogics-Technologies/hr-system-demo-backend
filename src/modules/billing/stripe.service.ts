@@ -758,15 +758,29 @@ export class StripeGateway implements IPaymentGateway {
   }
 
   /**
-   * The Tax Rate behind STRIPE_TAX_RATE_ID, for the startup consistency check.
-   * Null when the id names nothing on this account.
+   * The Tax Rate behind STRIPE_TAX_RATE_ID, as the app mirrors it locally.
+   *
+   * Returns null when the id names nothing on this account - a typo in the
+   * configuration, or a rate belonging to the other Stripe mode. Any other
+   * error is rethrown, because "Stripe is unreachable" and "that rate does not
+   * exist" call for different messages on screen.
    */
-  async describeTaxRate(
-    taxRateId: string
-  ): Promise<{ percentage: number; inclusive: boolean } | null> {
+  async describeTaxRate(taxRateId: string): Promise<{
+    percentage: number;
+    inclusive: boolean;
+    active: boolean;
+    displayName: string | null;
+    jurisdiction: string | null;
+  } | null> {
     try {
       const rate = await this.stripe.taxRates.retrieve(taxRateId);
-      return { percentage: rate.percentage, inclusive: rate.inclusive };
+      return {
+        percentage: rate.percentage,
+        inclusive: rate.inclusive,
+        active: rate.active !== false,
+        displayName: rate.display_name || null,
+        jurisdiction: rate.jurisdiction || rate.country || null,
+      };
     } catch (err: any) {
       if (err?.statusCode === 404 || err?.code === 'resource_missing') return null;
       throw err;

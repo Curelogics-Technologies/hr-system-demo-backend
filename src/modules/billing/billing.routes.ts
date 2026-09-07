@@ -83,6 +83,29 @@ router.get(
   (req, res) => billingController.getStatus(req, res)
 );
 
+// The tax rate behind every total on the billing page. Readable by any billing
+// admin; only a super admin may refresh it, because the rate is platform-wide.
+router.get(
+  '/tax',
+  requireRole('admin'),
+  (req, res) => billingController.getTax(req, res)
+);
+
+router.post(
+  '/tax/sync',
+  requireSuperAdmin,
+  (req, res) => billingController.syncTax(req, res)
+);
+
+// Rehearse the failed-payment alert. Super admin only: it sends real email to
+// a real customer's owner, so it is not something a company admin should be
+// able to fire at itself repeatedly.
+router.post(
+  '/notices/test',
+  requireSuperAdmin,
+  (req, res) => billingController.sendTestNotice(req, res)
+);
+
 router.get(
   '/headcount-history',
   requireRole('admin'),

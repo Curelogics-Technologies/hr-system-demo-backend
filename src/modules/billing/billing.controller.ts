@@ -5,6 +5,9 @@ import { pool } from '../../config/database';
 import { getHeadcountHistory } from './headcount.service';
 import { getLicenseSnapshot, isBillingEnforced } from './license.service';
 import { resolveAllowedCompanyIds } from '../../utils/companyScope';
+import { describeTaxConfig, getTaxConfig, loadTaxConfig } from './tax';
+import { syncBillingTaxRate } from './tax.sync';
+import { sendPaymentFailedTestNotice } from './billing.notifications';
 
 /**
  * Reads the license quantities from a request body.
@@ -427,6 +430,81 @@ export class BillingController {
       console.error('[BillingController] getStatus error:', err);
       // Never let this endpoint break the app shell.
       return res.json({ isBlocked: false, restricted: false });
+    }
+  }
+
+  /**
+   * GET /api/billing/tax
+   *
+   * The tax rate as the platform currently knows it: the figure every total on
+   * screen is built from, where it came from, and when it was last confirmed
+   * against Stripe. Readable by any billing admin, because it explains the tax
+   * line on their own invoice.
+   */
+  async getTax(_req: Request, res: Response) {
+    try {
+      // Read through storage rather than trusting this process's copy: another
+      // instance may have synced since this one booted.
+      const cfg = await loadTaxConfig();
+      return res.json(describeTaxConfig(cfg));
+    } catch (err: any) {
+      console.error('[BillingController] getTax error:', err);
+      // Never break the billing page over the tax panel: fall back to whatever
+      // this process already holds.
+      return res.json(describeTaxConfig(getTaxConfig()));
+    }
+  }
+
+  /**
+   * POST /api/billing/tax/sync
+   *
+   * Pulls the rate from Stripe again. Stripe owns the rate; this only refreshes
+   * the local mirror, so it is safe to press at any time and changes nothing at
+   * the provider. Super admin only - it is a platform-wide setting, not a
+   * company one.
+   */
+  async syncTax(_req: Request, res: Response) {
+    try {
+      await syncBillingTaxRate();
+      const cfg = getTaxConfig();
+      const described = describeTaxConfig(cfg);
+
+      // A sync that reached Stripe but found nothing usable is not an error the
+      // caller should see as a failure - the answer is on the row.
+      return res.json({
+        ...described,
+        ok: cfg.source === 'stripe' && !cfg.syncError,
+      });
+    } catch (err: any) {
+      console.error('[BillingController] syncTax error:', err);
+      return res
+        .status(502)
+        .json({ error: err.message || 'Could not read the tax rate from Stripe' });
+    }
+  }
+
+  /**
+   * POST /api/billing/notices/test
+   *
+   * Rehearses the failed-payment alert for a company: the same recipients, the
+   * same SMTP configuration, the same in-app notification, everything labelled
+   * as a test. Nothing about the subscription changes.
+   *
+   * This exists because the alternative way to prove the alert works is to let
+   * a real customer's renewal fail.
+   */
+  async sendTestNotice(req: Request, res: Response) {
+    try {
+      const companyId = await this.getEffectiveCompanyId(req);
+      if (!companyId) {
+        return res.status(400).json({ error: 'Company ID is required' });
+      }
+
+      const delivery = await sendPaymentFailedTestNotice({ companyId });
+      return res.json(delivery);
+    } catch (err: any) {
+      console.error('[BillingController] sendTestNotice error:', err);
+      return res.status(500).json({ error: err.message || 'Could not send the test notice' });
     }
   }
 
