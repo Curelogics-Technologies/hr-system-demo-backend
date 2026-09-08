@@ -83,6 +83,48 @@ router.get(
   (req, res) => billingController.getStatus(req, res)
 );
 
+// The tax rate is a platform-wide setting owned by the operator, not by any
+// tenant. A company admin sees the resulting tax lines on their own invoice -
+// that is their money - but the configuration panel itself is super admin only.
+router.get(
+  '/tax',
+  requireSuperAdmin,
+  (req, res) => billingController.getTax(req, res)
+);
+
+router.get(
+  '/tax/available',
+  requireSuperAdmin,
+  (req, res) => billingController.listAvailableTaxRates(req, res)
+);
+
+router.put(
+  '/tax',
+  requireSuperAdmin,
+  (req, res) => billingController.setTax(req, res)
+);
+
+router.post(
+  '/tax/sync',
+  requireSuperAdmin,
+  (req, res) => billingController.syncTax(req, res)
+);
+
+// Rehearse the failed-payment alert. Super admin only: it sends real email to
+// a real customer's owner, so it is not something a company admin should be
+// able to fire at itself repeatedly.
+router.get(
+  '/notices/recipients',
+  requireSuperAdmin,
+  (req, res) => billingController.getNoticeRecipients(req, res)
+);
+
+router.post(
+  '/notices/test',
+  requireSuperAdmin,
+  (req, res) => billingController.sendTestNotice(req, res)
+);
+
 router.get(
   '/headcount-history',
   requireRole('admin'),

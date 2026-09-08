@@ -2,6 +2,8 @@ import cron from 'node-cron';
 import { pool } from '../config/database';
 import { getPaymentGateway } from '../modules/billing/gateway.factory';
 import { sendEmailForCompany } from '../services/email.service';
+import { getTaxConfig, taxCentsOnLines } from '../modules/billing/tax';
+import { realignSubscriptionTaxRates, syncBillingTaxRate } from '../modules/billing/tax.sync';
 import {
   subscriptionService,
   announceBillingChange,
@@ -128,18 +130,27 @@ export async function processBillingReminders() {
 
     for (const sub of subRes.rows) {
       if (sub.company_email) {
-        const nextTotal = (
-          sub.seat_quantity * parseFloat(sub.unit_price_employee) +
-          sub.device_quantity * parseFloat(sub.unit_price_device)
-        ).toFixed(2);
+        // The reminder has to quote what will actually be taken, so it states
+        // the same subtotal / tax / total the provider will charge rather than
+        // the net figure alone.
+        const seatCents = Math.round(sub.seat_quantity * parseFloat(sub.unit_price_employee) * 100);
+        const deviceCents = Math.round(sub.device_quantity * parseFloat(sub.unit_price_device) * 100);
+        const taxCents = taxCentsOnLines([seatCents, deviceCents]);
+        const taxPercent = getTaxConfig().percent;
+        const nextSubtotal = ((seatCents + deviceCents) / 100).toFixed(2);
+        const nextTotal = ((seatCents + deviceCents + taxCents) / 100).toFixed(2);
+        const taxLine =
+          taxCents > 0
+            ? ` (imponibile €${nextSubtotal} + IVA ${taxPercent}% €${(taxCents / 100).toFixed(2)})`
+            : '';
 
         const renewalDate = new Date(sub.current_period_end).toLocaleDateString('it-IT');
 
         await sendEmailForCompany(sub.company_id, {
           to: sub.company_email,
           subject: `Promemoria rinnovo abbonamento VeylOHR - ${sub.company_name}`,
-          html: `<p>Gentile Cliente,</p><p>Ti informiamo che il tuo abbonamento mensile VeylOHR per <strong>${sub.company_name}</strong> si rinnoverà il <strong>${renewalDate}</strong>.</p><p>Importo previsto: <strong>€${nextTotal}</strong> (${sub.seat_quantity} dipendenti attivi, ${sub.device_quantity} terminali).</p><p>Cordiali saluti,<br>Team VeylOHR</p>`,
-          text: `Gentile Cliente,\n\nTi informiamo che il tuo abbonamento mensile VeylOHR per ${sub.company_name} si rinnoverà il ${renewalDate}.\n\nImporto previsto: €${nextTotal} (${sub.seat_quantity} dipendenti attivi, ${sub.device_quantity} terminali).\n\nCordiali saluti,\nTeam VeylOHR`,
+          html: `<p>Gentile Cliente,</p><p>Ti informiamo che il tuo abbonamento mensile VeylOHR per <strong>${sub.company_name}</strong> si rinnoverà il <strong>${renewalDate}</strong>.</p><p>Importo previsto: <strong>€${nextTotal}</strong>${taxLine} (${sub.seat_quantity} dipendenti attivi, ${sub.device_quantity} terminali).</p><p>Cordiali saluti,<br>Team VeylOHR</p>`,
+          text: `Gentile Cliente,\n\nTi informiamo che il tuo abbonamento mensile VeylOHR per ${sub.company_name} si rinnoverà il ${renewalDate}.\n\nImporto previsto: €${nextTotal}${taxLine} (${sub.seat_quantity} dipendenti attivi, ${sub.device_quantity} terminali).\n\nCordiali saluti,\nTeam VeylOHR`,
         })
           .then(async () => {
             // Stamp only on success, so a transient mail failure is retried on
@@ -306,11 +317,21 @@ export function startBillingCron() {
     await processBillingRenewalReconciliations();
     await processBillingReminders();
     await processBillingGracePeriodExpirations();
+    await syncBillingTaxRate();
+    // After the rate is refreshed, not before: realignment attaches whatever
+    // the mirror now says, so it has to read the corrected value.
+    await realignSubscriptionTaxRates();
   });
 
   // A deployment is exactly when a period may already be wrong from an
   // earlier build, so check once on boot instead of waiting until 02:00.
   // Delayed a little to stay clear of startup.
+  // The rate is needed before the first price is rendered, so this one is not
+  // delayed: every total shown until it lands comes from configuration alone.
+  syncBillingTaxRate().catch((err) =>
+    console.error('[BillingJob] Startup tax sync failed:', err)
+  );
+
   setTimeout(() => {
     processSubscriptionPeriodDrift().catch((err) =>
       console.error('[BillingJob] Startup period check failed:', err)

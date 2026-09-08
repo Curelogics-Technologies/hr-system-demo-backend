@@ -4,8 +4,172 @@ import { authenticate, requireRole, requireSuperAdmin } from '../../middleware/a
 import { asyncHandler } from '../../utils/asyncHandler';
 import { badRequest, ok, notFound } from '../../utils/response';
 import { query, queryOne } from '../../config/database';
+import {
+  getPlatformSmtpConfig,
+  isPlatformSmtpConfigured,
+  savePlatformSmtpConfig,
+  sendPlatformEmail,
+  verifyPlatformSmtp,
+} from '../../services/platformEmail.service';
 
 const router = Router();
+
+// ---------------------------------------------------------------------------
+// Platform mailbox
+//
+// Separate from the per-company configuration above, and deliberately so. A
+// company's SMTP sends that company's own mail. This one sends the platform's:
+// billing warnings to a customer's account owner, and the operator copy. Those
+// must not depend on the customer having configured their own mail server -
+// the failed-payment warning is exactly the message that must arrive when the
+// customer's own setup is missing or broken.
+//
+// Super admin only, on every route: these are the platform's credentials, not
+// any one tenant's.
+// ---------------------------------------------------------------------------
+
+/** The password is never returned; the client shows whether one is stored. */
+function publicPlatformConfig(cfg: Awaited<ReturnType<typeof getPlatformSmtpConfig>>) {
+  return {
+    smtpHost: cfg.smtpHost,
+    smtpPort: cfg.smtpPort,
+    smtpUser: cfg.smtpUser,
+    smtpFrom: cfg.smtpFrom,
+    billingAlertEmail: cfg.billingAlertEmail,
+    hasPassword: cfg.smtpPass !== '',
+    configured: isPlatformSmtpConfigured(cfg),
+    verifiedAt: cfg.verifiedAt,
+    lastError: cfg.lastError,
+    updatedAt: cfg.updatedAt,
+    /**
+     * Whether an operator copy address is set. Shown separately because a
+     * perfectly working mailbox with no alert address still means Francesco
+     * never hears about a failed payment.
+     */
+    hasAlertEmail: cfg.billingAlertEmail.trim() !== '',
+  };
+}
+
+router.get(
+  '/platform-config',
+  authenticate,
+  requireSuperAdmin,
+  asyncHandler(async (_req, res) => {
+    ok(res, publicPlatformConfig(await getPlatformSmtpConfig()));
+  })
+);
+
+router.put(
+  '/platform-config',
+  authenticate,
+  requireSuperAdmin,
+  asyncHandler(async (req, res) => {
+    const body = req.body as any;
+    const smtpHost = String(body.smtp_host ?? body.smtpHost ?? '').trim();
+    const smtpUser = String(body.smtp_user ?? body.smtpUser ?? '').trim();
+    const smtpFrom = String(body.smtp_from ?? body.smtpFrom ?? '').trim();
+    const billingAlertEmail = String(
+      body.billing_alert_email ?? body.billingAlertEmail ?? ''
+    ).trim();
+    const rawPass = body.smtp_pass ?? body.smtpPass;
+    const rawPort = body.smtp_port ?? body.smtpPort;
+
+    if (!smtpHost) {
+      badRequest(res, 'smtp_host is required', 'VALIDATION_ERROR');
+      return;
+    }
+    if (!smtpUser) {
+      badRequest(res, 'smtp_user is required', 'VALIDATION_ERROR');
+      return;
+    }
+
+    const port = Number.parseInt(String(rawPort ?? '587'), 10);
+    if (!Number.isFinite(port) || port <= 0 || port > 65535) {
+      badRequest(res, 'smtp_port must be a valid port number', 'VALIDATION_ERROR');
+      return;
+    }
+
+    // An empty password field means "leave the stored one alone", so an admin
+    // can correct the From address without retyping a secret they cannot read
+    // back. A first save with no password is rejected instead, because that
+    // would store a mailbox that cannot send.
+    const existing = await getPlatformSmtpConfig();
+    const smtpPass =
+      typeof rawPass === 'string' && rawPass !== '' ? rawPass : existing.smtpPass;
+    if (!smtpPass) {
+      badRequest(res, 'smtp_pass is required', 'VALIDATION_ERROR');
+      return;
+    }
+
+    const saved = await savePlatformSmtpConfig({
+      smtpHost,
+      smtpPort: port,
+      smtpUser,
+      smtpPass,
+      smtpFrom,
+      billingAlertEmail,
+    });
+
+    ok(res, publicPlatformConfig(saved), 'Platform SMTP configuration saved');
+  })
+);
+
+/** Proves the credentials work, and records that it was proved. */
+router.post(
+  '/platform-verify',
+  authenticate,
+  requireSuperAdmin,
+  asyncHandler(async (_req, res) => {
+    const result = await verifyPlatformSmtp();
+    ok(res, { ...result, config: publicPlatformConfig(await getPlatformSmtpConfig()) });
+  })
+);
+
+/**
+ * Sends a real message through the platform mailbox.
+ *
+ * Verifying only proves the server accepts the credentials; it does not prove
+ * a message arrives, which is the thing an operator actually needs to know
+ * before a customer's dunning notice depends on it.
+ */
+router.post(
+  '/platform-test',
+  authenticate,
+  requireSuperAdmin,
+  asyncHandler(async (req, res) => {
+    const to = String((req.body as any)?.to ?? '').trim();
+    if (!to) {
+      badRequest(res, 'Campo "to" obbligatorio', 'VALIDATION_ERROR');
+      return;
+    }
+
+    const result = await sendPlatformEmail(
+      {
+        to,
+        subject: '[TEST] VeylOHR - configurazione email piattaforma',
+        html:
+          '<p>Questa &egrave; una email di prova inviata dalla casella della piattaforma VeylOHR.</p>' +
+          '<p>Se la stai leggendo, la configurazione SMTP della piattaforma funziona e gli avvisi ' +
+          'di pagamento non riuscito verranno recapitati.</p>',
+        text:
+          "Questa e' una email di prova inviata dalla casella della piattaforma VeylOHR.\n\n" +
+          "Se la stai leggendo, la configurazione SMTP della piattaforma funziona e gli avvisi " +
+          'di pagamento non riuscito verranno recapitati.',
+      },
+      // No company fallback: this test exists to prove the platform mailbox
+      // specifically, and a success delivered by someone else's server would
+      // be a false pass.
+      null
+    );
+
+    ok(res, {
+      sent: result.ok,
+      status: result.status,
+      transport: result.transport,
+      error: result.ok ? null : result.message ?? null,
+    });
+  })
+);
 
 // ---------------------------------------------------------------------------
 // Health check (legacy — uses .env SMTP)

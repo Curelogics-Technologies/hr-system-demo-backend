@@ -5,6 +5,11 @@ import { pool } from '../../config/database';
 import { getHeadcountHistory } from './headcount.service';
 import { getLicenseSnapshot, isBillingEnforced } from './license.service';
 import { resolveAllowedCompanyIds } from '../../utils/companyScope';
+import { describeTaxConfig, getTaxConfig, loadTaxConfig, setStripeTaxRateId } from './tax';
+import { realignSubscriptionTaxRates, syncBillingTaxRate } from './tax.sync';
+import { getPaymentGateway } from './gateway.factory';
+import { sendPaymentFailedTestNotice, resolveFailureRecipients } from './billing.notifications';
+import { getPlatformSmtpConfig, isPlatformSmtpConfigured } from '../../services/platformEmail.service';
 
 /**
  * Reads the license quantities from a request body.
@@ -137,6 +142,17 @@ export class BillingController {
       }
 
       const overview = await subscriptionService.getCompanyBillingOverview(companyId);
+
+      // `taxPercent` stays for everyone: it labels the tax line on the
+      // customer's own invoice, which is their money and their right to see.
+      // The `tax` block is the platform's configuration - which Stripe rate
+      // object, when it was last synced, what went wrong - and belongs to the
+      // operator alone.
+      const isOperator = !!(req.user?.is_super_admin || req.user?.role === 'system_admin');
+      if (!isOperator) {
+        delete (overview as any).tax;
+      }
+
       return res.json(overview);
     } catch (err: any) {
       console.error('[BillingController] getOverview error:', err);
@@ -427,6 +443,196 @@ export class BillingController {
       console.error('[BillingController] getStatus error:', err);
       // Never let this endpoint break the app shell.
       return res.json({ isBlocked: false, restricted: false });
+    }
+  }
+
+  /**
+   * GET /api/billing/tax
+   *
+   * The tax rate as the platform currently knows it: the figure every total on
+   * screen is built from, where it came from, and when it was last confirmed
+   * against Stripe. Readable by any billing admin, because it explains the tax
+   * line on their own invoice.
+   */
+  async getTax(_req: Request, res: Response) {
+    try {
+      // Read through storage rather than trusting this process's copy: another
+      // instance may have synced since this one booted.
+      const cfg = await loadTaxConfig();
+      return res.json(describeTaxConfig(cfg));
+    } catch (err: any) {
+      console.error('[BillingController] getTax error:', err);
+      // Never break the billing page over the tax panel: fall back to whatever
+      // this process already holds.
+      return res.json(describeTaxConfig(getTaxConfig()));
+    }
+  }
+
+  /**
+   * GET /api/billing/tax/available
+   *
+   * The tax rates that exist on this Stripe account, so the operator picks one
+   * instead of copying an id between browser tabs.
+   */
+  async listAvailableTaxRates(_req: Request, res: Response) {
+    try {
+      const gateway = getPaymentGateway('stripe') as any;
+      if (!gateway.listTaxRates) return res.json({ rates: [] });
+      const rates = await gateway.listTaxRates();
+      return res.json({ rates });
+    } catch (err: any) {
+      console.error('[BillingController] listAvailableTaxRates error:', err);
+      // Not fatal: the page still lets an id be typed in by hand, so a Stripe
+      // outage costs convenience rather than the ability to configure at all.
+      return res.status(200).json({
+        rates: [],
+        error: err.message || 'Could not read the tax rates from Stripe',
+      });
+    }
+  }
+
+  /**
+   * PUT /api/billing/tax
+   *
+   * Chooses which Stripe Tax Rate this platform charges, then reads it back
+   * from Stripe immediately so the caller sees the real percentage rather than
+   * the id they just typed. The rate itself is still created and owned in the
+   * Stripe dashboard - only the choice of which one to use lives here.
+   */
+  async setTax(req: Request, res: Response) {
+    try {
+      const body = (req.body || {}) as Record<string, unknown>;
+      const raw = body.stripeTaxRateId ?? body.stripe_tax_rate_id ?? '';
+      const rateId = String(raw ?? '').trim();
+
+      // Cheap shape check, so an obvious paste error is rejected here with a
+      // clear message instead of coming back as "Stripe has no tax rate ..."
+      // after a network round trip.
+      if (rateId && !/^txr_[A-Za-z0-9]+$/.test(rateId)) {
+        return res.status(400).json({
+          error:
+            'A Stripe tax rate id looks like txr_1AbC… — copy it from Stripe > Product catalogue > Tax rates.',
+        });
+      }
+
+      await setStripeTaxRateId(rateId || null);
+      await syncBillingTaxRate();
+
+      // Existing subscriptions point at the previous Stripe Tax Rate object -
+      // they are immutable, so a new percentage is a new object - and would
+      // otherwise keep renewing at the old rate forever. Correct them now
+      // rather than waiting for tonight's job, because the operator is
+      // standing in front of the screen expecting the change to have happened.
+      const realignment = await realignSubscriptionTaxRates();
+
+      const cfg = getTaxConfig();
+      return res.json({
+        ...describeTaxConfig(cfg),
+        realignment,
+        ok: rateId === '' || (cfg.source === 'stripe' && !cfg.syncError),
+      });
+    } catch (err: any) {
+      console.error('[BillingController] setTax error:', err);
+      return res.status(500).json({ error: err.message || 'Could not save the tax rate' });
+    }
+  }
+
+  /**
+   * POST /api/billing/tax/sync
+   *
+   * Pulls the rate from Stripe again. Stripe owns the rate; this only refreshes
+   * the local mirror, so it is safe to press at any time and changes nothing at
+   * the provider. Super admin only - it is a platform-wide setting, not a
+   * company one.
+   */
+  async syncTax(_req: Request, res: Response) {
+    try {
+      await syncBillingTaxRate();
+      const realignment = await realignSubscriptionTaxRates();
+      const cfg = getTaxConfig();
+      const described = describeTaxConfig(cfg);
+
+      // A sync that reached Stripe but found nothing usable is not an error the
+      // caller should see as a failure - the answer is on the row.
+      return res.json({
+        ...described,
+        realignment,
+        ok: cfg.source === 'stripe' && !cfg.syncError,
+      });
+    } catch (err: any) {
+      console.error('[BillingController] syncTax error:', err);
+      return res
+        .status(502)
+        .json({ error: err.message || 'Could not read the tax rate from Stripe' });
+    }
+  }
+
+  /**
+   * GET /api/billing/notices/recipients
+   *
+   * Who a failed-payment warning for this company would actually reach, and
+   * which mailbox would carry it.
+   *
+   * This is the question the email settings page needs to answer on screen -
+   * "VeylOHR <billing@…> writes to Mario <mario@…>" - because the alternative
+   * is an operator saving credentials and hoping. It resolves the recipients
+   * exactly as the real alert does, so what is drawn is what would happen.
+   */
+  async getNoticeRecipients(req: Request, res: Response) {
+    try {
+      const companyId = await this.getEffectiveCompanyId(req);
+      if (!companyId) {
+        return res.status(400).json({ error: 'Company ID is required' });
+      }
+
+      const [recipients, platform] = await Promise.all([
+        resolveFailureRecipients(companyId),
+        getPlatformSmtpConfig(),
+      ]);
+
+      const company = await pool.query(`SELECT name FROM companies WHERE id = $1`, [companyId]);
+
+      return res.json({
+        companyId,
+        companyName: company.rows[0]?.name ?? null,
+        ownerEmail: recipients.owner?.email ?? null,
+        ownerName: recipients.owner?.name ?? null,
+        companyEmail: recipients.companyEmail,
+        inAppRecipients: recipients.inAppUserIds.length,
+        platform: {
+          configured: isPlatformSmtpConfigured(platform),
+          from: platform.smtpFrom || platform.smtpUser || null,
+          alertEmail: platform.billingAlertEmail || process.env.BILLING_ALERT_EMAIL || null,
+        },
+      });
+    } catch (err: any) {
+      console.error('[BillingController] getNoticeRecipients error:', err);
+      return res.status(500).json({ error: err.message || 'Could not resolve the recipients' });
+    }
+  }
+
+  /**
+   * POST /api/billing/notices/test
+   *
+   * Rehearses the failed-payment alert for a company: the same recipients, the
+   * same SMTP configuration, the same in-app notification, everything labelled
+   * as a test. Nothing about the subscription changes.
+   *
+   * This exists because the alternative way to prove the alert works is to let
+   * a real customer's renewal fail.
+   */
+  async sendTestNotice(req: Request, res: Response) {
+    try {
+      const companyId = await this.getEffectiveCompanyId(req);
+      if (!companyId) {
+        return res.status(400).json({ error: 'Company ID is required' });
+      }
+
+      const delivery = await sendPaymentFailedTestNotice({ companyId });
+      return res.json(delivery);
+    } catch (err: any) {
+      console.error('[BillingController] sendTestNotice error:', err);
+      return res.status(500).json({ error: err.message || 'Could not send the test notice' });
     }
   }
 

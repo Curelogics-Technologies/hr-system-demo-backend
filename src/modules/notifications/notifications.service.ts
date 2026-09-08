@@ -34,6 +34,8 @@ export type NotificationEventType =
   | 'ats.outcome'
   | 'onboarding.welcome'
   | 'onboarding.task_reminder'
+  /** A renewal charge was declined and the grace period has started. */
+  | 'billing.payment_failed'
   | 'manager.alert';
 
 export type NotificationCategory =
@@ -44,6 +46,7 @@ export type NotificationCategory =
   | 'documents'
   | 'ats'
   | 'onboarding'
+  | 'billing'
   | 'manager';
 
 /**
@@ -58,6 +61,7 @@ function deriveCategory(eventType: NotificationEventType): NotificationCategory 
   if (eventType.startsWith('document.')) return 'documents';
   if (eventType.startsWith('ats.')) return 'ats';
   if (eventType.startsWith('onboarding.')) return 'onboarding';
+  if (eventType.startsWith('billing.')) return 'billing';
   if (eventType.startsWith('manager.')) return 'manager';
   
   // Fallback for unknown types

@@ -8,6 +8,37 @@ import {
   UpdateQuantitiesParams,
   UpdateQuantitiesResult,
 } from './gateway.interface';
+import { getTaxConfig } from './tax';
+
+/**
+ * The provider has no record of a subscription we hold an id for.
+ *
+ * A PayPal subscription id belongs to the merchant account that created it, so
+ * changing the client id and secret - or moving between sandbox and live -
+ * leaves every earlier subscription unreachable: PayPal answers
+ * RESOURCE_NOT_FOUND rather than saying the credentials changed. It cannot be
+ * revised, cancelled or reactivated, and no retry will help, so it is worth a
+ * distinct type that callers can turn into an explanation.
+ */
+export class ProviderSubscriptionMissingError extends Error {
+  readonly code = 'PROVIDER_SUBSCRIPTION_MISSING';
+  constructor(
+    readonly providerSubscriptionId: string,
+    readonly providerDetail: string
+  ) {
+    super(
+      `PayPal does not recognise subscription ${providerSubscriptionId}. ` +
+        `It was most likely created under different PayPal credentials.`
+    );
+  }
+}
+
+/** True when a PayPal error body says the resource id is unknown. */
+function isMissingResource(body: string): boolean {
+  return (
+    body.includes('RESOURCE_NOT_FOUND') || body.includes('INVALID_RESOURCE_ID')
+  );
+}
 
 export class PayPalGateway implements IPaymentGateway {
   readonly provider: PaymentProvider = 'paypal';
@@ -93,6 +124,7 @@ export class PayPalGateway implements IPaymentGateway {
   async createCheckoutSession(params: CheckoutParams): Promise<CheckoutResult> {
     const token = await this.getAccessToken();
     const productId = await this.ensureProduct(token);
+    const taxPercent = getTaxConfig().percent;
 
     const currency = (params.currency || 'EUR').toUpperCase();
     // Charge the exact agreed formula. Flooring this at 1 would bill a
@@ -141,6 +173,13 @@ export class PayPalGateway implements IPaymentGateway {
           setup_fee_failure_action: 'CONTINUE',
           payment_failure_threshold: 3,
         },
+        // PayPal's equivalent of the Stripe tax rate: a percentage stated on
+        // the plan, charged on top of the fixed price. PayPal then shows the
+        // subscriber a subtotal, a tax line and the total it collects, so both
+        // providers bill the same figure for the same licences.
+        ...(taxPercent > 0
+          ? { taxes: { percentage: taxPercent.toFixed(2), inclusive: false } }
+          : {}),
       }),
     });
 
@@ -204,6 +243,7 @@ export class PayPalGateway implements IPaymentGateway {
   ): Promise<UpdateQuantitiesResult> {
     const token = await this.getAccessToken();
     const productId = await this.ensureProduct(token);
+    const taxPercent = getTaxConfig().percent;
     const currency = (params.currency || 'EUR').toUpperCase();
     const newMonthlyTotal = Math.max(
       1,
@@ -244,6 +284,11 @@ export class PayPalGateway implements IPaymentGateway {
           auto_bill_outstanding: true,
           payment_failure_threshold: 3,
         },
+        // The revised plan has to carry the tax too, or adding licences
+        // mid-period would quietly drop the tax from every renewal after it.
+        ...(taxPercent > 0
+          ? { taxes: { percentage: taxPercent.toFixed(2), inclusive: false } }
+          : {}),
       }),
     });
 
@@ -271,6 +316,9 @@ export class PayPalGateway implements IPaymentGateway {
 
     if (!reviseRes.ok) {
       const err = await reviseRes.text();
+      if (isMissingResource(err)) {
+        throw new ProviderSubscriptionMissingError(params.providerSubscriptionId, err);
+      }
       throw new Error(`Failed to revise PayPal subscription: ${err}`);
     }
 
@@ -334,6 +382,9 @@ export class PayPalGateway implements IPaymentGateway {
 
     if (!res.ok && res.status !== 204) {
       const err = await res.text();
+      if (isMissingResource(err)) {
+        throw new ProviderSubscriptionMissingError(providerSubId, err);
+      }
       throw new Error(`Failed to cancel PayPal subscription: ${err}`);
     }
   }
@@ -356,6 +407,9 @@ export class PayPalGateway implements IPaymentGateway {
 
     if (!res.ok && res.status !== 204) {
       const err = await res.text();
+      if (isMissingResource(err)) {
+        throw new ProviderSubscriptionMissingError(providerSubId, err);
+      }
       throw new Error(`Failed to activate PayPal subscription: ${err}`);
     }
   }
@@ -462,6 +516,16 @@ export class PayPalGateway implements IPaymentGateway {
         if (resource.amount?.total) {
           parsed.amountCents = Math.round(parseFloat(resource.amount.total) * 100);
           parsed.currency = resource.amount.currency;
+          // PayPal breaks the sale down for us when the plan carries a tax
+          // percentage. Read its figures rather than deriving them: the sale
+          // is what was charged, and a derived split could disagree with it.
+          const details = resource.amount.details;
+          if (details?.tax !== undefined) {
+            parsed.taxCents = Math.round(parseFloat(details.tax) * 100);
+          }
+          if (details?.subtotal !== undefined) {
+            parsed.subtotalCents = Math.round(parseFloat(details.subtotal) * 100);
+          }
         }
         break;
       }
