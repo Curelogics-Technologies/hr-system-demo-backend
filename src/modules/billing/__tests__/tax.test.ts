@@ -128,6 +128,24 @@ describe('billing tax configuration', () => {
     });
   });
 
+  /**
+   * These are the same cases asserted in the frontend's `taxMath.test.ts`.
+   * If either side is changed alone, one of the two suites fails - which is
+   * the point: the estimate a customer approves on screen must equal the
+   * amount the provider charges.
+   */
+  it('agrees with the figures shown on screen', () => {
+    withTax('22', undefined, () => {
+      // 12 employee licences at EUR 4.00 and 2 terminals at EUR 4.00.
+      expect(taxCentsOnLines([4800, 800])).toBe(1232);
+      expect(taxCentsOn(4800)).toBe(1056);
+      expect(taxCentsOn(800)).toBe(176);
+
+      // 7 x EUR 3.33 = EUR 23.31; 22% of that is EUR 5.1282 -> EUR 5.13.
+      expect(taxCentsOn(2331)).toBe(513);
+    });
+  });
+
   it('splits an amount into subtotal, tax and total', () => {
     withTax('22', undefined, () => {
       expect(taxed(10_000)).toEqual({
