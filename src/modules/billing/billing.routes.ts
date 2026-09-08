@@ -92,6 +92,12 @@ router.get(
   (req, res) => billingController.getTax(req, res)
 );
 
+router.get(
+  '/tax/available',
+  requireSuperAdmin,
+  (req, res) => billingController.listAvailableTaxRates(req, res)
+);
+
 router.put(
   '/tax',
   requireSuperAdmin,

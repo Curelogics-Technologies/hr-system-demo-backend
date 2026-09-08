@@ -217,8 +217,11 @@ export async function syncTaxRateFromStripe(
   const usableId = rateId && !rateId.includes('...') ? rateId : null;
 
   if (!usableId) {
+    // Worded for the person reading it on the billing page, not for whoever
+    // wrote the environment file. Naming an environment variable here sent an
+    // operator looking for a setting that is no longer the way to configure it.
     const message =
-      'STRIPE_TAX_RATE_ID is not set, so there is no rate to mirror from Stripe.';
+      'No Stripe tax rate is linked yet. Choose one under Impostazioni > Fatturazione > Aliquota fiscale.';
     await recordSyncFailure(null, message);
     cached = envTaxConfig();
     cached.syncError = message;

@@ -7,6 +7,7 @@ import { getLicenseSnapshot, isBillingEnforced } from './license.service';
 import { resolveAllowedCompanyIds } from '../../utils/companyScope';
 import { describeTaxConfig, getTaxConfig, loadTaxConfig, setStripeTaxRateId } from './tax';
 import { realignSubscriptionTaxRates, syncBillingTaxRate } from './tax.sync';
+import { getPaymentGateway } from './gateway.factory';
 import { sendPaymentFailedTestNotice, resolveFailureRecipients } from './billing.notifications';
 import { getPlatformSmtpConfig, isPlatformSmtpConfigured } from '../../services/platformEmail.service';
 
@@ -464,6 +465,29 @@ export class BillingController {
       // Never break the billing page over the tax panel: fall back to whatever
       // this process already holds.
       return res.json(describeTaxConfig(getTaxConfig()));
+    }
+  }
+
+  /**
+   * GET /api/billing/tax/available
+   *
+   * The tax rates that exist on this Stripe account, so the operator picks one
+   * instead of copying an id between browser tabs.
+   */
+  async listAvailableTaxRates(_req: Request, res: Response) {
+    try {
+      const gateway = getPaymentGateway('stripe') as any;
+      if (!gateway.listTaxRates) return res.json({ rates: [] });
+      const rates = await gateway.listTaxRates();
+      return res.json({ rates });
+    } catch (err: any) {
+      console.error('[BillingController] listAvailableTaxRates error:', err);
+      // Not fatal: the page still lets an id be typed in by hand, so a Stripe
+      // outage costs convenience rather than the ability to configure at all.
+      return res.status(200).json({
+        rates: [],
+        error: err.message || 'Could not read the tax rates from Stripe',
+      });
     }
   }
 

@@ -806,6 +806,39 @@ export class StripeGateway implements IPaymentGateway {
   }
 
   /**
+   * Every tax rate on this Stripe account.
+   *
+   * So the operator picks one from a list instead of copying a `txr_…` string
+   * between two browser tabs. The id is machine-readable and nothing else -
+   * there is no reason a person should ever have to type it, and every reason
+   * a typo should be impossible.
+   *
+   * Archived rates are included and flagged rather than hidden: seeing a
+   * greyed-out rate explains why it is not selectable, whereas an empty list
+   * explains nothing.
+   */
+  async listTaxRates(): Promise<
+    Array<{
+      id: string;
+      percentage: number;
+      inclusive: boolean;
+      active: boolean;
+      displayName: string | null;
+      jurisdiction: string | null;
+    }>
+  > {
+    const res = await this.stripe.taxRates.list({ limit: 100 });
+    return res.data.map((r) => ({
+      id: r.id,
+      percentage: r.percentage,
+      inclusive: r.inclusive,
+      active: r.active !== false,
+      displayName: r.display_name || null,
+      jurisdiction: r.jurisdiction || r.country || null,
+    }));
+  }
+
+  /**
    * The Tax Rate behind STRIPE_TAX_RATE_ID, as the app mirrors it locally.
    *
    * Returns null when the id names nothing on this account - a typo in the
