@@ -118,7 +118,7 @@ export async function syncSubscriptionPricing(
 }
 
 import { priceLicenseChange, getLicenseSnapshot } from './license.service';
-import { describeTaxConfig, getTaxConfig, taxCentsOnLines } from './tax';
+import { describeTaxConfig, getTaxConfig, loadTaxConfig, taxCentsOnLines } from './tax';
 import { sendPaymentFailedNotices, recordNoticeDelivery } from './billing.notifications';
 import { resolveIsoCurrency, UnsupportedCurrencyError } from './currency';
 
@@ -1154,6 +1154,12 @@ export class SubscriptionService {
       [companyId]
     );
 
+    // Re-read the tax mirror from storage rather than trusting this process's
+    // copy. With more than one backend instance running, a sync performed on
+    // one of them would otherwise leave the others quoting yesterday's rate
+    // until their next nightly refresh.
+    await loadTaxConfig();
+
     // The price a company pays is its list price less any active discount, and
     // every screen must quote that same figure - the summary card, the licence
     // modal and the invoice alike.
@@ -1309,6 +1315,7 @@ export class SubscriptionService {
               copyTo: tx.notice_copy_to,
               copyStatus: tx.notice_copy_status,
               inAppCount: tx.notice_in_app_count ?? 0,
+              transport: tx.notice_email_transport ?? null,
             }
           : null,
         invoiceUrl: tx.invoice_url,
@@ -1392,6 +1399,10 @@ export class SubscriptionService {
         409
       );
     }
+
+    // The charge below is built from this quote, so it must be priced against
+    // the rate that is stored now - not the one this process booted with.
+    await loadTaxConfig();
 
     const quote = priceLicenseChange({
       currentEmployees: sub.seat_quantity,
@@ -1817,6 +1828,10 @@ export class SubscriptionService {
     );
 
     const sub = subRes.rowCount ? subRes.rows[0] : null;
+
+    // Same reason as the overview: the quote the admin approves has to use the
+    // rate that is stored now, not the one this process happened to boot with.
+    await loadTaxConfig();
 
     // Price the change against what the company costs today, not against the
     // figures captured when the subscription was opened. The subscription is

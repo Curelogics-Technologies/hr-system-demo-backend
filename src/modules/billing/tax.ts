@@ -130,7 +130,19 @@ export async function loadTaxConfig(): Promise<TaxConfig> {
     );
     if (res.rowCount) {
       const stored = rowToConfig(res.rows[0]);
-      cached = stored.source === 'stripe' ? stored : envTaxConfig();
+      if (stored.source === 'stripe') {
+        cached = stored;
+      } else {
+        // Not yet synced, so the percentage still comes from configuration -
+        // but a rate id chosen in the UI has to survive, or the next sync
+        // would go looking for the environment's id instead of the one the
+        // operator just picked.
+        cached = {
+          ...envTaxConfig(),
+          stripeTaxRateId: stored.stripeTaxRateId ?? envTaxConfig().stripeTaxRateId,
+          syncError: stored.syncError,
+        };
+      }
       return cached;
     }
   } catch (err: any) {
@@ -145,6 +157,34 @@ export async function loadTaxConfig(): Promise<TaxConfig> {
 /** Test seam: drops the in-memory mirror so the next read re-derives it. */
 export function resetTaxConfigCache(): void {
   cached = null;
+}
+
+/**
+ * Points the platform at a different Stripe Tax Rate.
+ *
+ * The rate itself is still created and owned in the Stripe dashboard - this
+ * only records *which* of them this platform charges, which is the one part of
+ * the arrangement that is genuinely a local decision. Everything else about
+ * the rate is read back from Stripe by the sync that follows.
+ *
+ * Clearing the id (empty string) turns tax off after the next sync.
+ */
+export async function setStripeTaxRateId(rateId: string | null): Promise<void> {
+  const clean = (rateId || '').trim();
+  await pool.query(
+    `UPDATE billing_tax_settings
+        SET stripe_tax_rate_id = $1,
+            -- The stored percentage described the previous rate. Marking the
+            -- row unsynced stops it being quoted as though it described the
+            -- new one, until Stripe has actually been asked.
+            source     = 'env',
+            sync_error = NULL,
+            synced_at  = NULL,
+            updated_at = NOW()
+      WHERE id = 1`,
+    [clean || null]
+  );
+  cached = { ...envTaxConfig(), stripeTaxRateId: clean || null };
 }
 
 export interface StripeTaxRateDescription {
@@ -169,7 +209,11 @@ export interface StripeTaxRateDescription {
 export async function syncTaxRateFromStripe(
   describe: (id: string) => Promise<StripeTaxRateDescription | null>
 ): Promise<TaxConfig> {
-  const rateId = (process.env.STRIPE_TAX_RATE_ID || '').trim();
+  // The id chosen in the UI wins over the environment: it is the more recent,
+  // more deliberate statement of which Stripe rate this platform charges.
+  const stored = (cached?.stripeTaxRateId || '').trim();
+  const fromEnv = (process.env.STRIPE_TAX_RATE_ID || '').trim();
+  const rateId = stored || fromEnv;
   const usableId = rateId && !rateId.includes('...') ? rateId : null;
 
   if (!usableId) {

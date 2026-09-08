@@ -1,5 +1,10 @@
 import { pool } from '../../config/database';
-import { sendEmailForCompany, EmailSendResult } from '../../services/email.service';
+import { EmailSendResult } from '../../services/email.service';
+import {
+  getPlatformSmtpConfig,
+  sendPlatformEmail,
+  PlatformEmailResult,
+} from '../../services/platformEmail.service';
 import { sendNotification } from '../notifications/notifications.service';
 
 /**
@@ -31,6 +36,12 @@ export interface NoticeDelivery {
   ownerEmail: string | null;
   ownerStatus: NoticeChannelStatus;
   ownerError: string | null;
+  /**
+   * Which mailbox carried it: the platform's own, or a fallback through the
+   * customer's SMTP server. Only meaningful once both exist, and worth showing
+   * because "sent" from the wrong address is its own kind of wrong.
+   */
+  ownerTransport: 'platform' | 'company' | 'none' | null;
   /** The operator copy. Null status when no operator address is configured. */
   copyTo: string | null;
   copyStatus: NoticeChannelStatus | null;
@@ -39,9 +50,22 @@ export interface NoticeDelivery {
   sentAt: Date;
 }
 
-/** Where the platform operator wants to be copied. Comma-separated. */
-function operatorRecipients(): string[] {
-  return (process.env.BILLING_ALERT_EMAIL || '')
+/**
+ * Where the platform operator wants to be copied.
+ *
+ * Configured in Impostazioni > Email > Piattaforma so it can be changed without
+ * a redeploy; `BILLING_ALERT_EMAIL` stays as a fallback for deployments that
+ * set it before the settings page existed.
+ */
+async function operatorRecipients(): Promise<string[]> {
+  let configured = '';
+  try {
+    configured = (await getPlatformSmtpConfig()).billingAlertEmail;
+  } catch {
+    // The env fallback below is the whole point of not throwing here.
+  }
+  const raw = configured.trim() || process.env.BILLING_ALERT_EMAIL || '';
+  return raw
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);
@@ -70,6 +94,24 @@ function formatMoney(cents: number | null | undefined, currency: string): string
 function statusOf(result: EmailSendResult): NoticeChannelStatus {
   if (result.ok) return 'sent';
   return result.status === 'skipped' ? 'skipped' : 'failed';
+}
+
+/**
+ * A human sentence for why nothing was sent.
+ *
+ * "skipped" on its own reads as though the system chose not to bother. The
+ * operator needs to know which mailbox is missing, because that is the thing
+ * they have to go and fill in.
+ */
+function explain(result: PlatformEmailResult): string | null {
+  if (result.ok) return null;
+  if (result.transport === 'none') {
+    return 'Platform SMTP is not configured (Impostazioni > Email > Piattaforma).';
+  }
+  if (result.status === 'skipped') {
+    return result.message ?? 'No SMTP configuration available for this company.';
+  }
+  return result.message ?? 'The mail server refused the message.';
 }
 
 export interface FailureRecipients {
@@ -196,6 +238,7 @@ export async function sendPaymentFailedNotices(
     ownerEmail: null,
     ownerStatus: 'no_recipient',
     ownerError: null,
+    ownerTransport: null,
     copyTo: null,
     copyStatus: null,
     inAppCount: 0,
@@ -300,17 +343,24 @@ export async function sendPaymentFailedNotices(
     delivery.ownerEmail = to;
 
     try {
-      const result = await sendEmailForCompany(notice.companyId, {
-        to,
-        subject: `${testTag}Pagamento non riuscito - azione richiesta entro il ${deadline} (${notice.companyName})`,
-        html,
-        text,
-      });
+      // Sent as the platform, because that is who is writing. The customer's
+      // own SMTP server is accepted as a fallback so a deployment that has not
+      // filled in the platform mailbox yet still warns its customers.
+      const result = await sendPlatformEmail(
+        {
+          to,
+          subject: `${testTag}Pagamento non riuscito - azione richiesta entro il ${deadline} (${notice.companyName})`,
+          html,
+          text,
+        },
+        notice.companyId
+      );
       delivery.ownerStatus = statusOf(result);
-      delivery.ownerError = result.ok ? null : result.message ?? null;
+      delivery.ownerError = explain(result);
+      delivery.ownerTransport = result.transport;
       if (!result.ok) {
         console.warn(
-          `[Billing] Payment-failure email to ${to} was not sent (${result.status}): ${result.message}`
+          `[Billing] Payment-failure email to ${to} was not sent (${result.status}): ${delivery.ownerError}`
         );
       }
     } catch (err: any) {
@@ -325,7 +375,7 @@ export async function sendPaymentFailedNotices(
   //    successfully must not be shown as unwarned because an internal copy
   //    bounced.
   // ---------------------------------------------------------------------
-  const operators = operatorRecipients();
+  const operators = await operatorRecipients();
   if (operators.length === 0) return delivery;
 
   delivery.copyTo = operators.join(', ');
@@ -338,7 +388,12 @@ export async function sendPaymentFailedNotices(
       ? `Il titolare (${owner.email}) &egrave; stato avvisato via email (${delivery.ownerStatus}).`
       : 'ATTENZIONE: nessun indirizzo del titolare trovato, il cliente NON &egrave; stato avvisato via email.';
 
-    const result = await sendEmailForCompany(notice.companyId, {
+    // No company fallback here, deliberately. This message names a customer
+    // and their failed payment; pushing it through that same customer's mail
+    // server would put the platform's own business into their mail logs. When
+    // the platform mailbox is not configured the copy is reported as not sent,
+    // which is the thing the operator needs to know anyway.
+    const result = await sendPlatformEmail({
       to: delivery.copyTo,
       subject: `${testTag}[VeylOHR] Pagamento fallito - ${notice.companyName} (blocco il ${deadline})`,
       html:
@@ -363,7 +418,7 @@ export async function sendPaymentFailedNotices(
         `Notifiche in-app inviate: ${delivery.inAppCount}\n` +
         (notice.failureMessage ? `Motivo: ${notice.failureMessage}\n` : '') +
         `\n${owner ? `Titolare avvisato: ${owner.email} (${delivery.ownerStatus})` : 'ATTENZIONE: titolare NON avvisato via email.'}`,
-    });
+    }, null);
     delivery.copyStatus = statusOf(result);
   } catch (err: any) {
     delivery.copyStatus = 'failed';
@@ -398,8 +453,9 @@ export async function recordNoticeDelivery(
               notice_email_at     = $4,
               notice_copy_to      = $5,
               notice_copy_status  = $6,
-              notice_in_app_count = $7
-        WHERE id = $8`,
+              notice_in_app_count = $7,
+              notice_email_transport = $8
+        WHERE id = $9`,
       [
         delivery.ownerEmail,
         delivery.ownerStatus,
@@ -408,6 +464,7 @@ export async function recordNoticeDelivery(
         delivery.copyTo,
         delivery.copyStatus,
         delivery.inAppCount,
+        delivery.ownerTransport,
         transactionId,
       ]
     );

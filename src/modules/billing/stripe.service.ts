@@ -23,7 +23,21 @@ export class StripeGateway implements IPaymentGateway {
   }
 
   async createCheckoutSession(params: CheckoutParams): Promise<CheckoutResult> {
-    const taxRateId = getTaxConfig().stripeTaxRateId;
+    const taxConfig = getTaxConfig();
+    const taxRateId = taxConfig.stripeTaxRateId;
+
+    // Stripe refuses an archived tax rate on a new subscription, and its own
+    // error names an id nobody outside this codebase recognises. Fail here
+    // with a sentence that says what to do. Not silently dropping the rate:
+    // that would open a subscription that never charges tax, which is worse
+    // than a checkout the operator has to fix.
+    if (taxRateId && taxConfig.source === 'stripe' && !taxConfig.active) {
+      throw new Error(
+        `The configured Stripe tax rate (${taxRateId}) is archived. Create a new tax rate in ` +
+          'the Stripe dashboard and link it under Impostazioni > Fatturazione > Aliquota fiscale.'
+      );
+    }
+
     const currency = (params.currency || 'EUR').toLowerCase();
     const currencyLabel = currency.toUpperCase();
     const lineItems: Stripe.Checkout.SessionCreateParams.LineItem[] = [];
@@ -755,6 +769,40 @@ export class StripeGateway implements IPaymentGateway {
     }
 
     return parsed;
+  }
+
+  /**
+   * Makes an existing subscription carry the given tax rate.
+   *
+   * Stripe Tax Rate objects are immutable: changing the percentage means
+   * creating a new one and pointing subscriptions at it. Without this, a
+   * subscription opened before the rate existed - or before it was changed -
+   * would keep renewing at the old rate (or at none) indefinitely, and the
+   * figures the app shows would not be the figures Stripe charges.
+   *
+   * Attaching a default tax rate does not prorate, does not need customer
+   * approval, and is a no-op when the rate is already attached.
+   *
+   * Returns true when something actually changed.
+   */
+  async setSubscriptionTaxRate(
+    providerSubscriptionId: string,
+    taxRateId: string | null
+  ): Promise<boolean> {
+    const sub = await this.stripe.subscriptions.retrieve(providerSubscriptionId);
+    const attached = (((sub as any).default_tax_rates || []) as any[]).map((r) =>
+      typeof r === 'string' ? r : r?.id
+    );
+
+    const wanted = taxRateId ? [taxRateId] : [];
+    const same =
+      attached.length === wanted.length && wanted.every((id) => attached.includes(id));
+    if (same) return false;
+
+    await this.stripe.subscriptions.update(providerSubscriptionId, {
+      default_tax_rates: wanted,
+    } as any);
+    return true;
   }
 
   /**

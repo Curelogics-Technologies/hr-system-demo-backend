@@ -3,7 +3,7 @@ import { pool } from '../config/database';
 import { getPaymentGateway } from '../modules/billing/gateway.factory';
 import { sendEmailForCompany } from '../services/email.service';
 import { getTaxConfig, taxCentsOnLines } from '../modules/billing/tax';
-import { syncBillingTaxRate } from '../modules/billing/tax.sync';
+import { realignSubscriptionTaxRates, syncBillingTaxRate } from '../modules/billing/tax.sync';
 import {
   subscriptionService,
   announceBillingChange,
@@ -318,6 +318,9 @@ export function startBillingCron() {
     await processBillingReminders();
     await processBillingGracePeriodExpirations();
     await syncBillingTaxRate();
+    // After the rate is refreshed, not before: realignment attaches whatever
+    // the mirror now says, so it has to read the corrected value.
+    await realignSubscriptionTaxRates();
   });
 
   // A deployment is exactly when a period may already be wrong from an

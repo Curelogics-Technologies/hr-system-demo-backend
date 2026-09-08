@@ -1,5 +1,8 @@
 import { pool } from '../../../config/database';
-import { sendEmailForCompany } from '../../../services/email.service';
+import {
+  getPlatformSmtpConfig,
+  sendPlatformEmail,
+} from '../../../services/platformEmail.service';
 import { sendNotification } from '../../notifications/notifications.service';
 import { sendPaymentFailedNotices, resolveFailureRecipients } from '../billing.notifications';
 
@@ -8,16 +11,36 @@ jest.mock('../../../config/database', () => ({
   query: jest.fn(),
   queryOne: jest.fn(),
 }));
-jest.mock('../../../services/email.service', () => ({
-  sendEmailForCompany: jest.fn(),
+jest.mock('../../../services/platformEmail.service', () => ({
+  sendPlatformEmail: jest.fn(),
+  getPlatformSmtpConfig: jest.fn(),
 }));
 jest.mock('../../notifications/notifications.service', () => ({
   sendNotification: jest.fn(),
 }));
 
 const mockQuery = pool.query as unknown as jest.Mock;
-const mockEmail = sendEmailForCompany as unknown as jest.Mock;
+const mockEmail = sendPlatformEmail as unknown as jest.Mock;
+const mockPlatformCfg = getPlatformSmtpConfig as unknown as jest.Mock;
 const mockNotify = sendNotification as unknown as jest.Mock;
+
+/**
+ * The operator copy address lives in the platform settings row now, with the
+ * environment variable kept only as a fallback for older deployments.
+ */
+function mockPlatformConfig(billingAlertEmail = '') {
+  mockPlatformCfg.mockResolvedValue({
+    smtpHost: 'smtp.veylo.it',
+    smtpPort: 587,
+    smtpUser: 'billing@veylo.it',
+    smtpPass: 'secret',
+    smtpFrom: 'VeylOHR <billing@veylo.it>',
+    billingAlertEmail,
+    verifiedAt: null,
+    lastError: null,
+    updatedAt: null,
+  });
+}
 
 /** The two queries `resolveFailureRecipients` makes, in order. */
 function mockRecipients(opts: {
@@ -63,7 +86,9 @@ beforeEach(() => {
   mockQuery.mockReset();
   mockEmail.mockReset();
   mockNotify.mockReset();
+  mockPlatformCfg.mockReset();
   mockNotify.mockResolvedValue(undefined);
+  mockPlatformConfig('');
   delete process.env.BILLING_ALERT_EMAIL;
 });
 
@@ -110,12 +135,14 @@ describe('sendPaymentFailedNotices', () => {
       owner: { id: 3, email: 'owner@fusaro.it', name: 'Francesca' },
       adminIds: [3, 9],
     });
-    mockEmail.mockResolvedValue({ ok: true, status: 'sent' });
+    mockEmail.mockResolvedValue({ ok: true, status: 'sent', transport: 'platform' });
 
     const delivery = await sendPaymentFailedNotices(baseNotice);
 
     expect(delivery.ownerStatus).toBe('sent');
     expect(delivery.ownerEmail).toBe('owner@fusaro.it');
+    // Which mailbox carried it, so "sent" is never ambiguous about by whom.
+    expect(delivery.ownerTransport).toBe('platform');
     expect(delivery.inAppCount).toBe(2);
     expect(mockNotify).toHaveBeenCalledTimes(2);
 
@@ -128,12 +155,30 @@ describe('sendPaymentFailedNotices', () => {
     });
 
     // The settle-by date is the point of the email, so it has to be in it.
-    const [, options] = mockEmail.mock.calls[0];
+    const [options] = mockEmail.mock.calls[0];
     expect(options.subject).toContain('11/09/2026');
     expect(options.text).toContain('11/09/2026');
   });
 
-  it('distinguishes "no SMTP configured" from "sent"', async () => {
+  it('falls back to the company mailbox when the platform one is unset', async () => {
+    mockRecipients({
+      owner: { id: 3, email: 'owner@fusaro.it', name: 'Francesca' },
+      adminIds: [3],
+    });
+    mockEmail.mockResolvedValue({ ok: true, status: 'sent', transport: 'company' });
+
+    const delivery = await sendPaymentFailedNotices(baseNotice);
+
+    // Still delivered, but the page can say it went out as the customer
+    // rather than as the platform.
+    expect(delivery.ownerStatus).toBe('sent');
+    expect(delivery.ownerTransport).toBe('company');
+    // The owner warning may use the company transport; the second argument is
+    // the company id that makes that fallback possible.
+    expect(mockEmail.mock.calls[0][1]).toBe(7);
+  });
+
+  it('distinguishes "no mailbox configured" from "sent"', async () => {
     mockRecipients({
       owner: { id: 3, email: 'owner@fusaro.it', name: 'Francesca' },
       adminIds: [3],
@@ -142,6 +187,7 @@ describe('sendPaymentFailedNotices', () => {
       ok: false,
       status: 'skipped',
       message: 'SMTP configuration missing or incomplete',
+      transport: 'company',
     });
 
     const delivery = await sendPaymentFailedNotices(baseNotice);
@@ -149,22 +195,45 @@ describe('sendPaymentFailedNotices', () => {
     // This is the failure mode that looks like success: nothing errored, and
     // the customer was never told. It has to be visible on the billing page.
     expect(delivery.ownerStatus).toBe('skipped');
-    expect(delivery.ownerError).toMatch(/SMTP/);
+    expect(delivery.ownerError).toMatch(/SMTP/i);
     // The in-app alert still went out, which is why it is sent first.
     expect(delivery.inAppCount).toBe(1);
   });
 
-  it('reports a refused send as failed, with the server’s reason', async () => {
+  it('names the platform mailbox when that is the one that is missing', async () => {
     mockRecipients({
       owner: { id: 3, email: 'owner@fusaro.it', name: 'Francesca' },
       adminIds: [3],
     });
-    mockEmail.mockResolvedValue({ ok: false, status: 'failed', message: 'Mailbox unavailable' });
+    mockEmail.mockResolvedValue({
+      ok: false,
+      status: 'skipped',
+      message: 'Platform SMTP is not configured.',
+      transport: 'none',
+    });
+
+    const delivery = await sendPaymentFailedNotices(baseNotice);
+
+    // The operator has to be told *which* mailbox to go and fill in.
+    expect(delivery.ownerError).toMatch(/Piattaforma|Platform/i);
+  });
+
+  it('reports a refused send as failed, with the server reason', async () => {
+    mockRecipients({
+      owner: { id: 3, email: 'owner@fusaro.it', name: 'Francesca' },
+      adminIds: [3],
+    });
+    mockEmail.mockResolvedValue({
+      ok: false,
+      status: 'failed',
+      message: 'Invalid login: 535 5.7.0 Invalid credentials',
+      transport: 'platform',
+    });
 
     const delivery = await sendPaymentFailedNotices(baseNotice);
 
     expect(delivery.ownerStatus).toBe('failed');
-    expect(delivery.ownerError).toBe('Mailbox unavailable');
+    expect(delivery.ownerError).toBe('Invalid login: 535 5.7.0 Invalid credentials');
   });
 
   it('copies the company mailbox only when it differs from the owner', async () => {
@@ -173,7 +242,7 @@ describe('sendPaymentFailedNotices', () => {
       owner: { id: 3, email: 'owner@fusaro.it', name: 'Francesca' },
       adminIds: [3],
     });
-    mockEmail.mockResolvedValue({ ok: true, status: 'sent' });
+    mockEmail.mockResolvedValue({ ok: true, status: 'sent', transport: 'platform' });
 
     const delivery = await sendPaymentFailedNotices(baseNotice);
     expect(delivery.ownerEmail).toBe('owner@fusaro.it, info@fusaro.it');
@@ -192,14 +261,19 @@ describe('sendPaymentFailedNotices', () => {
   });
 
   it('tracks the operator copy separately from the customer warning', async () => {
-    process.env.BILLING_ALERT_EMAIL = 'francesco@veylo.it, ops@veylo.it';
+    mockPlatformConfig('francesco@veylo.it, ops@veylo.it');
     mockRecipients({
       owner: { id: 3, email: 'owner@fusaro.it', name: 'Francesca' },
       adminIds: [3],
     });
     mockEmail
-      .mockResolvedValueOnce({ ok: true, status: 'sent' })
-      .mockResolvedValueOnce({ ok: false, status: 'failed', message: 'relay denied' });
+      .mockResolvedValueOnce({ ok: true, status: 'sent', transport: 'platform' })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 'failed',
+        message: 'relay denied',
+        transport: 'platform',
+      });
 
     const delivery = await sendPaymentFailedNotices(baseNotice);
 
@@ -208,6 +282,23 @@ describe('sendPaymentFailedNotices', () => {
     expect(delivery.ownerStatus).toBe('sent');
     expect(delivery.copyTo).toBe('francesco@veylo.it, ops@veylo.it');
     expect(delivery.copyStatus).toBe('failed');
+
+    // The copy passes no company id: it names a customer and their failed
+    // payment, so it must never go out through that customer's mail server.
+    expect(mockEmail.mock.calls[1][1]).toBeNull();
+  });
+
+  it('still reads the operator address from the environment when unset in settings', async () => {
+    mockPlatformConfig('');
+    process.env.BILLING_ALERT_EMAIL = 'legacy@veylo.it';
+    mockRecipients({
+      owner: { id: 3, email: 'owner@fusaro.it', name: 'Francesca' },
+      adminIds: [3],
+    });
+    mockEmail.mockResolvedValue({ ok: true, status: 'sent', transport: 'platform' });
+
+    const delivery = await sendPaymentFailedNotices(baseNotice);
+    expect(delivery.copyTo).toBe('legacy@veylo.it');
   });
 
   it('still alerts in-app when there is nobody to email', async () => {
@@ -240,11 +331,11 @@ describe('sendPaymentFailedNotices', () => {
       owner: { id: 3, email: 'owner@fusaro.it', name: 'Francesca' },
       adminIds: [3],
     });
-    mockEmail.mockResolvedValue({ ok: true, status: 'sent' });
+    mockEmail.mockResolvedValue({ ok: true, status: 'sent', transport: 'platform' });
 
     await sendPaymentFailedNotices({ ...baseNotice, isTest: true });
 
-    const [, options] = mockEmail.mock.calls[0];
+    const [options] = mockEmail.mock.calls[0];
     expect(options.subject).toContain('[TEST]');
     expect(options.text).toContain('prova');
     expect(mockNotify.mock.calls[0][0].metadata.isTest).toBe(true);
